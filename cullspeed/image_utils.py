@@ -1,18 +1,37 @@
 import os
 import rawpy
-from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QByteArray, QBuffer, QIODevice, Qt
+from PyQt6.QtGui import QImage, QImageReader, QPixmap
 
 
 class ImageUtils:
     """Helper utilities for loading scaled thumbnails."""
 
     @staticmethod
+    def _read_image_with_orientation(source):
+        reader = QImageReader(source)
+        reader.setAutoTransform(True)
+        image = reader.read()
+        if image.isNull():
+            return None
+        return image
+
+    @staticmethod
+    def _read_image_from_bytes(data):
+        byte_array = QByteArray(data)
+        buffer = QBuffer(byte_array)
+        buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        try:
+            return ImageUtils._read_image_with_orientation(buffer)
+        finally:
+            buffer.close()
+
+    @staticmethod
     def load_thumbnail(file_path, target_size=200):
         """Return a QPixmap thumbnail for the given file if possible."""
         try:
             ext = os.path.splitext(file_path)[1].lower()
-            image = QImage()
+            image = None
 
             # RAW handling uses embedded thumbnails for speed.
             if ext in ('.arw', '.cr2', '.nef', '.dng', '.orf', '.raf', '.rw2'):
@@ -23,13 +42,13 @@ class ImageUtils:
                         return None
 
                     if thumb.format == rawpy.ThumbFormat.JPEG:
-                        image.loadFromData(thumb.data)
+                        image = ImageUtils._read_image_from_bytes(thumb.data)
                     else:
                         return None
             else:
-                image.load(file_path)
+                image = ImageUtils._read_image_with_orientation(file_path)
 
-            if image.isNull():
+            if image is None or image.isNull():
                 return None
 
             return QPixmap.fromImage(

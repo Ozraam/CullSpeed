@@ -48,8 +48,7 @@ class ImageLoaderThread(QThread):
 
                         if thumb:
                             if thumb.format == rawpy.ThumbFormat.JPEG:
-                                image = QImage()
-                                image.loadFromData(thumb.data)
+                                image = ImageUtils._read_image_from_bytes(thumb.data)
                             else:
                                 image = QImage()
                         else:
@@ -69,7 +68,9 @@ class ImageLoaderThread(QThread):
                     self.image_loaded.emit(QPixmap(), f"RAW Error: {exc}")
                     return
             else:
-                pixmap = QPixmap(self.file_path)
+                image = ImageUtils._read_image_with_orientation(self.file_path)
+                if image is not None and not image.isNull():
+                    pixmap = QPixmap.fromImage(image)
 
             if pixmap and not pixmap.isNull():
                 if pixmap.width() > 3000 or pixmap.height() > 3000:
