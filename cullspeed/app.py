@@ -3,7 +3,7 @@ import os
 import threading
 from html import escape
 
-from PyQt6.QtCore import QEventLoop, QItemSelectionModel, QSettings, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEventLoop, QItemSelectionModel, QSettings, QStandardPaths, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -21,11 +21,12 @@ from .constants import (
     PREFETCH_AHEAD,
     PREFETCH_BEHIND,
     REJECT,
+    SESSION_FILENAME,
     UNDO_LIMIT,
 )
 from .fileops import execute_moves, plan_moves
 from .loader import ImageLoader
-from .models import PhotoModel, StatusFilterProxy, save_session, scan_folder
+from .models import PhotoModel, StatusFilterProxy, relative_key, save_session, scan_folder
 from .widgets import (
     GalleryToolbar,
     HeaderBar,
@@ -72,6 +73,11 @@ class CullSpeedApp(QMainWindow):
         self.setAcceptDrops(True)
 
         self.settings = QSettings()
+        # Where marks go when a photo folder is read-only.
+        self.session_fallback_dir = os.path.join(
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation), "sessions"
+        )
+        self.session_warning = None  # last session problem shown, so it is shown once
         self.folder = ""
         self.current_row = -1
         self.undo_stack = []
@@ -130,7 +136,7 @@ class CullSpeedApp(QMainWindow):
         self.gallery_toolbar.size_changed.connect(self._on_grid_size_changed)
         self.grid_delegate = ThumbnailDelegate(grid_size, show_names=True, parent=self)
         self.grid = make_thumbnail_view(self.proxy, self.grid_delegate, horizontal=False)
-        self.grid.clicked.connect(self._on_grid_clicked)
+        self.grid.selectionModel().currentChanged.connect(self._on_grid_current_changed)
         self.grid.activated.connect(self._on_grid_activated)  # double-click / Enter
 
         gallery_page = QWidget()
@@ -197,18 +203,20 @@ class CullSpeedApp(QMainWindow):
         if folder:
             self.load_folder(folder)
 
-    def load_folder(self, folder, select_name=None):
+    def load_folder(self, folder, select=None):
+        """Open `folder`; `select` is a photo's path relative to it (or, from older versions, its name)."""
         if self.moving:
             return
         self.save_session()
         try:
-            photos = scan_folder(folder)
+            photos = scan_folder(folder, self.session_fallback_dir)
         except OSError as exc:
             inform(self, "Cannot open folder", escape(f"{folder}: {exc}"))
             return
 
         self.loader.reset()
         self.folder = folder
+        self.session_warning = None
         self.undo_stack.clear()
         self.current_row = -1
         self.model.set_photos(photos)
@@ -220,8 +228,12 @@ class CullSpeedApp(QMainWindow):
             self.header.set_counter("")
             return
 
+        keys = [relative_key(folder, photo.path) for photo in photos]
         names = [photo.name for photo in photos]
-        self.go_to(names.index(select_name) if select_name in names else 0)
+        if select in keys:
+            self.go_to(keys.index(select))
+        else:
+            self.go_to(names.index(select) if select in names else 0)
 
     def _restore_last_folder(self):
         folder = self.settings.value("last_folder", "")
@@ -229,7 +241,7 @@ class CullSpeedApp(QMainWindow):
         if not folder:
             folder, last_file = self._legacy_global_state()
         if folder and os.path.isdir(folder):
-            self.load_folder(folder, select_name=last_file)
+            self.load_folder(folder, select=last_file)
 
     @staticmethod
     def _legacy_global_state():
@@ -246,9 +258,20 @@ class CullSpeedApp(QMainWindow):
         if not self.folder or not self.model.photos:
             return
         try:
-            save_session(self.folder, self.model.photos)
+            path = save_session(self.folder, self.model.photos, self.session_fallback_dir)
         except OSError as exc:
-            self.toast.show_message(f"Could not save marks: {exc}", 4000)
+            self._session_problem("failed", f"Could not save marks: {exc.strerror or exc}")
+            return
+        if path != os.path.join(self.folder, SESSION_FILENAME):
+            self._session_problem("fallback", "This folder is read-only: marks are saved in CullSpeed's data folder")
+        else:
+            self.session_warning = None
+
+    def _session_problem(self, kind, message):
+        # Saving runs after every mark: say it once, not on every keystroke.
+        if self.session_warning != kind:
+            self.session_warning = kind
+            self.toast.show_message(message, 5000)
 
     # -- navigation --------------------------------------------------------
 
@@ -266,12 +289,13 @@ class CullSpeedApp(QMainWindow):
         )
         self.filmstrip.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
-        self._show_current()
+        # Request first: a photo that failed before is retried, and shows "Loading…".
         count = self.model.rowCount()
         nearby = [*range(row + 1, row + 1 + PREFETCH_AHEAD), *range(row - 1, row - 1 - PREFETCH_BEHIND, -1)]
         self.loader.ensure_previews(
             photo.path, [self.model.photo(r).path for r in nearby if 0 <= r < count]
         )
+        self._show_current()
 
     def next_unmarked(self):
         count = self.model.rowCount()
@@ -352,7 +376,17 @@ class CullSpeedApp(QMainWindow):
         if in_gallery:
             self._select_after_filtering(first_visible)
         elif status is not None:
-            self.go_to(self.current_row + 1)
+            if self.current_row + 1 < self.model.rowCount():
+                self.go_to(self.current_row + 1)
+            else:
+                self._report_end()
+
+    def _report_end(self):
+        unmarked = self.model.counts()[2]
+        if unmarked:
+            self.toast.show_message(f"Last photo · {unmarked} still unmarked (N to jump)", 3000)
+        else:
+            self.toast.show_message("Last photo · every photo is marked", 3000)
 
     def _select_after_filtering(self, proxy_row):
         """Marked photos may drop out of a filtered gallery: select the one now in their place."""
@@ -399,9 +433,15 @@ class CullSpeedApp(QMainWindow):
             self.image_view.reset_zoom()
             self.setFocus()
 
-    def _on_grid_clicked(self, proxy_index):
-        if len(self.grid.selectionModel().selectedIndexes()) <= 1:
-            self.go_to(self.proxy.mapToSource(proxy_index).row())
+    def _on_grid_current_changed(self, proxy_index, _previous):
+        # Clicks and arrow keys both move the current photo, so G opens that one.
+        # Only while the gallery is shown: marking in the Cull view can also
+        # move the grid's current item, when the filter hides the marked photo.
+        if self.tabs.currentIndex() != GALLERY_TAB or not proxy_index.isValid():
+            return
+        row = self.proxy.mapToSource(proxy_index).row()
+        if row != self.current_row:
+            self.go_to(row)
 
     def _on_grid_activated(self, proxy_index):
         self.go_to(self.proxy.mapToSource(proxy_index).row())
@@ -494,7 +534,7 @@ class CullSpeedApp(QMainWindow):
         self.save_session()
         self.settings.setValue("geometry", self.saveGeometry())
         if self.current_row >= 0:
-            self.settings.setValue("last_file", self.model.photo(self.current_row).name)
+            self.settings.setValue("last_file", relative_key(self.folder, self.model.photo(self.current_row).path))
         self.loader.shutdown()
         super().closeEvent(event)
 

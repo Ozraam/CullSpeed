@@ -90,6 +90,63 @@ def test_session_drops_unknown_statuses(tmp_path):
     assert load_session(str(tmp_path)) == {"a.jpg": KEEP}
 
 
+def read_only(path):
+    os.chmod(path, 0o555)
+    return path
+
+
+@pytest.fixture
+def locked_folder(tmp_path):
+    folder = tmp_path / "card"
+    touch(folder / "a.jpg")
+    read_only(folder)
+    yield str(folder)
+    os.chmod(folder, 0o755)
+
+
+def test_read_only_folder_saves_to_fallback(locked_folder, tmp_path):
+    fallback = str(tmp_path / "fallback")
+    photos = [Photo(f"{locked_folder}/a.jpg", KEEP)]
+
+    path = save_session(locked_folder, photos, fallback)
+
+    assert os.path.dirname(path) == fallback
+    assert not os.path.exists(os.path.join(locked_folder, SESSION_FILENAME))
+    assert load_session(locked_folder, fallback) == {"a.jpg": KEEP}
+    assert [p.status for p in scan_folder(locked_folder, fallback)] == [KEEP]
+
+
+def test_without_fallback_a_read_only_folder_raises(locked_folder):
+    with pytest.raises(OSError):
+        save_session(locked_folder, [Photo(f"{locked_folder}/a.jpg", KEEP)])
+
+
+def test_saving_in_the_folder_removes_the_stale_fallback(tmp_path):
+    folder, fallback = str(tmp_path / "f"), str(tmp_path / "fallback")
+    touch(tmp_path / "f" / "a.jpg")
+    os.chmod(folder, 0o555)
+    old = save_session(folder, [Photo(f"{folder}/a.jpg", REJECT)], fallback)
+    os.chmod(folder, 0o755)
+
+    path = save_session(folder, [Photo(f"{folder}/a.jpg", KEEP)], fallback)
+
+    assert path == os.path.join(folder, SESSION_FILENAME)
+    assert not os.path.exists(old)
+    assert load_session(folder, fallback) == {"a.jpg": KEEP}
+
+
+def test_newest_session_wins(tmp_path):
+    folder, fallback = str(tmp_path / "f"), str(tmp_path / "fallback")
+    touch(tmp_path / "f" / "a.jpg")
+    write_session(folder, {"a.jpg": KEEP})
+    os.chmod(folder, 0o555)
+    newer = save_session(folder, [Photo(f"{folder}/a.jpg", REJECT)], fallback)
+    os.chmod(folder, 0o755)
+    os.utime(newer, (2_000_000_000, 2_000_000_000))
+
+    assert load_session(folder, fallback) == {"a.jpg": REJECT}
+
+
 # -- PhotoModel counters -----------------------------------------------------
 
 
@@ -100,9 +157,13 @@ class _Signal:
 
 class _Loader:
     thumbnail_loaded = _Signal()
+    thumbnail_failed = _Signal()
 
     def thumbnail(self, _path):
         return None
+
+    def thumbnail_error(self, _path):
+        return False
 
 
 @pytest.fixture

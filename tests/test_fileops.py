@@ -109,6 +109,20 @@ def test_renamed_photo_takes_its_sidecars_along(tmp_path):
     assert listing(folder, KEEP_DIR) == ["IMG (1).CR2", "IMG (1).CR2.xmp", "IMG (1).xmp", "IMG.CR2"]
 
 
+def test_photo_is_renamed_when_only_its_sidecar_name_is_taken(tmp_path):
+    folder = str(tmp_path)
+    touch(tmp_path / KEEP_DIR / "IMG.xmp", "someone else's")
+    raw = touch(tmp_path / "IMG.CR2")
+    touch(tmp_path / "IMG.xmp", "mine")
+
+    result = process(folder, [Photo(raw, KEEP)])
+
+    # IMG.CR2 alone would be free, but then its sidecar would not match it.
+    assert result.moved[raw].endswith("IMG (1).CR2")
+    assert read(os.path.join(folder, KEEP_DIR, "IMG (1).xmp")) == "mine"
+    assert read(os.path.join(folder, KEEP_DIR, "IMG.xmp")) == "someone else's"
+
+
 def test_stop_from_progress_callback(tmp_path):
     folder = str(tmp_path)
     photos = [Photo(touch(tmp_path / f"{i}.jpg"), KEEP) for i in range(5)]

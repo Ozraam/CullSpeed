@@ -20,8 +20,10 @@ PREVIEW_CACHE_SIZE = 8
 PREFETCH_AHEAD = 3
 PREFETCH_BEHIND = 1
 
-# How many thumbnails to keep in memory (~150 KB each at THUMBNAIL_MAX_SIZE).
-THUMBNAIL_CACHE_SIZE = 1000
+# Memory for cached thumbnails. They are decoded at THUMBNAIL_MAX_SIZE times
+# the screen's pixel ratio (~600 KB each on Retina), so this holds a full
+# screen of the smallest grid size on large displays.
+THUMBNAIL_CACHE_BYTES = 384 * 2**20
 
 UNDO_LIMIT = 500
 

@@ -4,14 +4,15 @@ Workers only decode QImages; results come back to the GUI thread through
 queued signals on this long-lived QObject, where they become QPixmaps.
 Superseded requests are skipped rather than terminated.
 """
+import math
 from collections import OrderedDict
 from contextlib import suppress
 from itertools import count
 
 from PyQt6.QtCore import QObject, QThread, QThreadPool, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QGuiApplication, QImage, QPixmap
 
-from .constants import PREVIEW_CACHE_SIZE, PREVIEW_MAX_SIZE, THUMBNAIL_CACHE_SIZE, THUMBNAIL_MAX_SIZE
+from .constants import PREVIEW_CACHE_SIZE, PREVIEW_MAX_SIZE, THUMBNAIL_CACHE_BYTES, THUMBNAIL_MAX_SIZE
 from .imaging import load_image
 
 _CANCELLED = "\0cancelled"
@@ -20,6 +21,17 @@ _CANCELLED = "\0cancelled"
 def _emit(signal, *args):
     with suppress(RuntimeError):  # loader already destroyed during shutdown
         signal.emit(*args)
+
+
+def _pixmap_bytes(pixmap):
+    return pixmap.width() * pixmap.height() * pixmap.depth() // 8
+
+
+def _thumbnail_decode_size():
+    """THUMBNAIL_MAX_SIZE in device pixels, so thumbnails stay sharp on HiDPI screens."""
+    app = QGuiApplication.instance()
+    ratio = app.devicePixelRatio() if app is not None else 1.0
+    return math.ceil(THUMBNAIL_MAX_SIZE * ratio)
 
 
 def _decode(path, max_size):
@@ -33,6 +45,7 @@ class ImageLoader(QObject):
     preview_loaded = pyqtSignal(str)
     preview_failed = pyqtSignal(str, str)
     thumbnail_loaded = pyqtSignal(str)
+    thumbnail_failed = pyqtSignal(str)
     full_loaded = pyqtSignal(str)
     full_failed = pyqtSignal(str, str)
 
@@ -61,6 +74,7 @@ class ImageLoader(QObject):
         self._full_pixmap = None
 
         self._thumbnails = OrderedDict()  # path -> QPixmap, LRU order
+        self._thumbnail_bytes = 0
         self._thumbnail_failed = set()
         self._thumbnail_pending = set()
 
@@ -81,6 +95,7 @@ class ImageLoader(QObject):
         self._wanted_previews = set()
         self._release_full()
         self._thumbnails.clear()
+        self._thumbnail_bytes = 0
         self._thumbnail_failed.clear()
         self._thumbnail_pending.clear()
 
@@ -116,6 +131,9 @@ class ImageLoader(QObject):
     def ensure_previews(self, current, neighbors):
         """Load `current` first, then prefetch `neighbors`; drop other queued work."""
         self._wanted_previews = {current, *neighbors}
+        # Coming back to a photo retries it: the error may have been transient
+        # (file still copying, network share hiccup). Neighbours are not retried.
+        self._preview_errors.pop(current, None)
         if current != self._full_path:
             self._release_full()
         self._request_preview(current, urgent=True)
@@ -208,14 +226,18 @@ class ImageLoader(QObject):
             self._request_thumbnail(path)
         return pixmap
 
+    def thumbnail_error(self, path):
+        return path in self._thumbnail_failed
+
     def _request_thumbnail(self, path):
         self._thumbnail_pending.add(path)
         generation = self._generation
+        size = _thumbnail_decode_size()
 
         def job():
             if generation != self._generation:
                 return
-            image, _error = _decode(path, THUMBNAIL_MAX_SIZE)
+            image, _error = _decode(path, size)
             _emit(self._thumbnail_done, generation, path, image)
 
         # Most recently requested first, so whatever is on screen now wins.
@@ -227,8 +249,12 @@ class ImageLoader(QObject):
         self._thumbnail_pending.discard(path)
         if image.isNull():
             self._thumbnail_failed.add(path)
+            self.thumbnail_failed.emit(path)
             return
-        self._thumbnails[path] = QPixmap.fromImage(image)
-        while len(self._thumbnails) > THUMBNAIL_CACHE_SIZE:
-            self._thumbnails.popitem(last=False)  # reloaded on demand if scrolled back to
+        pixmap = QPixmap.fromImage(image)
+        self._thumbnails[path] = pixmap
+        self._thumbnail_bytes += _pixmap_bytes(pixmap)
+        while self._thumbnail_bytes > THUMBNAIL_CACHE_BYTES and len(self._thumbnails) > 1:
+            _old, evicted = self._thumbnails.popitem(last=False)  # reloaded if scrolled back to
+            self._thumbnail_bytes -= _pixmap_bytes(evicted)
         self.thumbnail_loaded.emit(path)

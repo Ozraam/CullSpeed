@@ -51,11 +51,25 @@ def _sidecars(path, dir_listing):
     return found
 
 
-def _free_name(dest_dir, name, taken):
-    """`name`, or `name (1)`, `name (2)`… if something already uses it."""
+def _sidecar_name(photo_name, old_name, stem, sidecar):
+    """`sidecar`'s name once its photo is called `photo_name`."""
+    base = photo_name if stem == old_name else os.path.splitext(photo_name)[0]
+    return base + sidecar[len(stem):]
+
+
+def _free_name(dest_dir, name, taken, companions=None):
+    """`name`, or `name (1)`, `name (2)`… so that it and its companions are all free.
+
+    `companions(candidate)` lists the other names that go with `candidate`
+    (its sidecars), so a photo and its sidecars are always renamed together.
+    """
     base, ext = os.path.splitext(name)
     candidate, n = name, 1
-    while os.path.exists(os.path.join(dest_dir, candidate)) or candidate.lower() in taken:
+
+    def used(names):
+        return any(os.path.exists(os.path.join(dest_dir, c)) or c.lower() in taken for c in names)
+
+    while used([candidate, *(companions(candidate) if companions else [])]):
         candidate = f"{base} ({n}){ext}"
         n += 1
     return candidate
@@ -79,19 +93,27 @@ def execute_moves(moves, progress=None):
             dest_taken = taken.setdefault(move.dest_dir, set())
 
             old_name = os.path.basename(move.src)
-            new_name = _free_name(move.dest_dir, old_name, dest_taken)
+            sidecars = [
+                (stem, sidecar)
+                for stem, sidecar in _sidecars(move.src, listings[src_dir])
+                if os.path.exists(os.path.join(src_dir, sidecar))  # else already moved with a sibling
+            ]
+            new_name = _free_name(
+                move.dest_dir,
+                old_name,
+                dest_taken,
+                lambda candidate, old=old_name, found=sidecars: [
+                    _sidecar_name(candidate, old, stem, sidecar) for stem, sidecar in found
+                ],
+            )
             new_path = os.path.join(move.dest_dir, new_name)
             shutil.move(move.src, new_path)
             dest_taken.add(new_name.lower())
             result.moved[move.src] = new_path
 
-            for stem, sidecar in _sidecars(move.src, listings[src_dir]):
-                sidecar_src = os.path.join(src_dir, sidecar)
-                if not os.path.exists(sidecar_src):
-                    continue  # already moved with a sibling
-                new_stem = new_name if stem == old_name else os.path.splitext(new_name)[0]
-                sidecar_name = _free_name(move.dest_dir, new_stem + sidecar[len(stem):], dest_taken)
-                shutil.move(sidecar_src, os.path.join(move.dest_dir, sidecar_name))
+            for stem, sidecar in sidecars:
+                sidecar_name = _sidecar_name(new_name, old_name, stem, sidecar)
+                shutil.move(os.path.join(src_dir, sidecar), os.path.join(move.dest_dir, sidecar_name))
                 dest_taken.add(sidecar_name.lower())
         except OSError as exc:
             result.errors.append(f"{os.path.basename(move.src)}: {exc.strerror or exc}")

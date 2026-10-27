@@ -1,6 +1,8 @@
+import hashlib
 import json
 import os
 from collections import Counter
+from contextlib import suppress
 from dataclasses import dataclass
 from itertools import groupby
 
@@ -10,6 +12,7 @@ from .constants import KEEP, KEEP_DIR, REJECT, REJECT_DIR, SESSION_FILENAME, SUP
 
 STATUS_ROLE = Qt.ItemDataRole.UserRole + 1
 PATH_ROLE = Qt.ItemDataRole.UserRole + 2
+THUMBNAIL_FAILED_ROLE = Qt.ItemDataRole.UserRole + 3
 
 
 @dataclass
@@ -38,7 +41,7 @@ def _scan_dir(path):
         ]
 
 
-def scan_folder(folder):
+def scan_folder(folder, fallback_dir=None):
     """Photos in `folder`, `_KEEPS` and `_REJECTS`, with their saved marks."""
     photos = [Photo(p) for p in _scan_dir(folder)]
     photos += [Photo(p, KEEP, KEEP) for p in _scan_dir(os.path.join(folder, KEEP_DIR))]
@@ -46,10 +49,10 @@ def scan_folder(folder):
 
     # Saved marks win over folder location, so marks changed after the last
     # "Process Files" are not lost.
-    session = load_session(folder)
+    session = load_session(folder, fallback_dir)
     name_counts = Counter(photo.name for photo in photos)
     for photo in photos:
-        key = _session_key(folder, photo.path)
+        key = relative_key(folder, photo.path)
         if key in session:
             photo.status = session[key]
         elif name_counts[photo.name] == 1 and photo.name in session:
@@ -59,14 +62,33 @@ def scan_folder(folder):
     return photos
 
 
-def _session_key(folder, path):
+def relative_key(folder, path):
     """Path relative to `folder` with "/" separators, e.g. "_KEEPS/IMG_1.CR2"."""
     return os.path.relpath(path, folder).replace(os.sep, "/")
 
 
-def load_session(folder):
+# A folder we cannot write to (locked SD card, read-only share) gets its
+# session in `fallback_dir` instead, under a name derived from its path.
+
+def _fallback_path(folder, fallback_dir):
+    digest = hashlib.sha1(os.path.abspath(folder).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(fallback_dir, f"{digest}.json")
+
+
+def _session_paths(folder, fallback_dir):
+    paths = [os.path.join(folder, SESSION_FILENAME)]
+    if fallback_dir:
+        paths.append(_fallback_path(folder, fallback_dir))
+    return paths
+
+
+def load_session(folder, fallback_dir=None):
+    """Saved marks; the most recently written of the folder and fallback sessions."""
+    existing = [path for path in _session_paths(folder, fallback_dir) if os.path.isfile(path)]
+    if not existing:
+        return {}
     try:
-        with open(os.path.join(folder, SESSION_FILENAME), encoding='utf-8') as file:
+        with open(max(existing, key=os.path.getmtime), encoding='utf-8') as file:
             data = json.load(file)
     except (OSError, ValueError):
         return {}
@@ -75,13 +97,37 @@ def load_session(folder):
     return {name: status for name, status in data.items() if status in (KEEP, REJECT, None)}
 
 
-def save_session(folder, photos):
-    path = os.path.join(folder, SESSION_FILENAME)
+def _write_json(path, data):
     tmp_path = path + ".tmp"
-    data = {_session_key(folder, photo.path): photo.status for photo in photos}
-    with open(tmp_path, 'w', encoding='utf-8') as file:
-        json.dump(data, file, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as file:
+            json.dump(data, file, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except OSError:
+        with suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
+def save_session(folder, photos, fallback_dir=None):
+    """Save marks in `folder`, else in `fallback_dir`; returns the path written.
+
+    Raises OSError when neither can be written.
+    """
+    data = {relative_key(folder, photo.path): photo.status for photo in photos}
+    folder_path, *fallback = _session_paths(folder, fallback_dir)
+    try:
+        _write_json(folder_path, data)
+    except OSError:
+        if not fallback:
+            raise
+        os.makedirs(fallback_dir, exist_ok=True)
+        _write_json(fallback[0], data)
+        return fallback[0]
+    if fallback:
+        with suppress(OSError):
+            os.remove(fallback[0])  # stale now that the folder has the marks
+    return folder_path
 
 
 # -- Qt models -------------------------------------------------------------
@@ -99,6 +145,7 @@ class PhotoModel(QAbstractListModel):
         # Kept up to date on every change so per-keystroke updates stay O(1).
         self._keeps = self._rejects = self._unsorted = 0
         loader.thumbnail_loaded.connect(self._on_thumbnail_loaded)
+        loader.thumbnail_failed.connect(self._on_thumbnail_loaded)
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self._photos)
@@ -117,6 +164,8 @@ class PhotoModel(QAbstractListModel):
             return photo.status
         if role == PATH_ROLE:
             return photo.path
+        if role == THUMBNAIL_FAILED_ROLE:
+            return self._loader.thumbnail_error(photo.path)
         return None
 
     @property
@@ -210,7 +259,7 @@ class PhotoModel(QAbstractListModel):
         row = self.row_of(path)
         if row != -1:
             index = self.index(row)
-            self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
+            self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole, THUMBNAIL_FAILED_ROLE])
 
 
 class StatusFilterProxy(QSortFilterProxyModel):

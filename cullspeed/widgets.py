@@ -1,5 +1,5 @@
 from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap
+from PyQt6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -29,7 +29,7 @@ from .constants import (
     KEEP,
     REJECT,
 )
-from .models import STATUS_ROLE
+from .models import STATUS_ROLE, THUMBNAIL_FAILED_ROLE
 
 STATUS_COLORS = {KEEP: QColor(COLOR_KEEP), REJECT: QColor(COLOR_REJECT)}
 
@@ -116,7 +116,10 @@ class ThumbnailDelegate(QStyledItemDelegate):
         else:
             target = image_box
             painter.setPen(QColor(COLOR_MUTED))
-            painter.drawText(image_box, Qt.AlignmentFlag.AlignCenter, "…")
+            text = "…"
+            if index.data(THUMBNAIL_FAILED_ROLE):
+                text = "⚠\nUnreadable" if image_box.width() >= 80 else "⚠"
+            painter.drawText(image_box, Qt.AlignmentFlag.AlignCenter, text)
 
         if self.show_names:
             text_rect = QRect(
@@ -440,7 +443,8 @@ class StatsBar(QFrame):
         self.lbl_unmarked = QLabel()
         self.lbl_unmarked.setObjectName("Muted")
 
-        hint = QLabel("P keep · X reject · U unmark · ←/→ navigate · N next unmarked · Z zoom · G gallery · ⌘Z undo")
+        undo = QKeySequence(QKeySequence.StandardKey.Undo).toString(QKeySequence.SequenceFormat.NativeText)
+        hint = QLabel(f"P keep · X reject · U unmark · ←/→ navigate · N next unmarked · Z zoom · G gallery · {undo} undo")
         hint.setObjectName("Muted")
 
         layout = QHBoxLayout(self)

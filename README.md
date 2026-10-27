@@ -42,6 +42,8 @@ In the Cull view, marking a photo as keep or reject moves on to the next one. In
 ## Sessions
 `cullspeed_session.json` stores marks keyed by path relative to the photo folder (e.g. `_KEEPS/IMG_1.CR2`), so the folder can be moved or renamed without losing decisions. Older sessions keyed by filename are still read.
 
+If the photo folder is read-only (locked SD card, read-only share), marks are saved in CullSpeed's own data folder instead and reloaded from there when the folder is reopened.
+
 ## Code Layout
 | Module | Role |
 | --- | --- |
