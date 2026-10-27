@@ -24,6 +24,9 @@ cullspeed = "cullspeed.main:main"
 [tool.setuptools]
 packages = ["cullspeed"]
 
+[tool.setuptools.package-data]
+cullspeed = ["resources/*.svg"]
+
 [tool.ruff]
 line-length = 132
 target-version = "py310"

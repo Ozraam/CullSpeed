@@ -4,6 +4,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+icon_args=()
+if [[ "$(uname)" == "Darwin" ]]; then
+    python scripts/make_icns.py build/CullSpeed.icns
+    icon_args=(--icon build/CullSpeed.icns)
+fi
+
 python -m PyInstaller \
     --name CullSpeed \
     --windowed \
@@ -11,4 +17,6 @@ python -m PyInstaller \
     --clean \
     --osx-bundle-identifier io.github.ozraam.cullspeed \
     --collect-binaries rawpy \
+    --add-data cullspeed/resources:cullspeed/resources \
+    ${icon_args[@]+"${icon_args[@]}"} \
     CullSpeed.py

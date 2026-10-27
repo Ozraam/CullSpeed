@@ -1,6 +1,8 @@
 import faulthandler
 import sys
+from pathlib import Path
 
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 from .app import CullSpeedApp
@@ -14,6 +16,7 @@ def main():
     app = QApplication(sys.argv)
     app.setOrganizationName("CullSpeed")
     app.setApplicationName("CullSpeed")
+    app.setWindowIcon(QIcon(str(Path(__file__).parent / "resources" / "icon.svg")))
     apply_theme(app)
 
     window = CullSpeedApp()
