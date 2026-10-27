@@ -3,31 +3,47 @@ import os
 import threading
 from html import escape
 
-from PyQt6.QtCore import QEventLoop, QItemSelectionModel, QSettings, QStandardPaths, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QEventLoop,
+    QFileSystemWatcher,
+    QItemSelectionModel,
+    QSettings,
+    QStandardPaths,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
     QMainWindow,
     QProgressDialog,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from . import xmp
 from .constants import (
     KEEP,
+    KEEP_DIR,
     LEGACY_GLOBAL_CONFIG_FILENAME,
     PREFETCH_AHEAD,
     PREFETCH_BEHIND,
     REJECT,
+    REJECT_DIR,
     SESSION_FILENAME,
     UNDO_LIMIT,
 )
+from .exif import summary
 from .fileops import execute_moves, plan_moves
 from .loader import ImageLoader
-from .models import PhotoModel, StatusFilterProxy, relative_key, save_session, scan_folder
+from .models import PhotoModel, StatusFilterProxy, photo_files, relative_key, save_session, scan_folder
 from .widgets import (
+    CompareView,
     GalleryToolbar,
     HeaderBar,
     ImageView,
@@ -41,6 +57,7 @@ from .widgets import (
 
 CULL_TAB, GALLERY_TAB = 0, 1
 FILMSTRIP_THUMB_SIZE = 64
+COMPARE_MAX = 4
 
 
 class MoveThread(QThread):
@@ -78,19 +95,24 @@ class CullSpeedApp(QMainWindow):
             QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation), "sessions"
         )
         self.session_warning = None  # last session problem shown, so it is shown once
+        self.xmp_warned = False
+        self.xmp_dirty = set()  # photos whose rating/label still has to be written to XMP
         self.folder = ""
         self.current_row = -1
+        self.compare_rows = []  # rows shown side by side; empty outside Compare
+        self.show_info = self.settings.value("show_info", True, type=bool)
         self.undo_stack = []
         self.moving = False
 
         self.loader = ImageLoader(self)
-        self.loader.preview_loaded.connect(self._on_preview_ready)
-        self.loader.preview_failed.connect(lambda path, _error: self._on_preview_ready(path))
-        self.loader.full_loaded.connect(self._on_full_ready)
+        self.loader.preview_loaded.connect(self._on_image_ready)
+        self.loader.preview_failed.connect(lambda path, _error: self._on_image_ready(path))
+        self.loader.full_loaded.connect(self._on_image_ready)
         self.loader.full_failed.connect(self._on_full_failed)
 
         self.model = PhotoModel(self.loader, self)
         self.model.statuses_changed.connect(self._on_statuses_changed)
+        self.model.ratings_changed.connect(lambda paths: self.xmp_dirty.update(paths))
         self.proxy = StatusFilterProxy(self)
         self.proxy.setSourceModel(self.model)
 
@@ -98,6 +120,14 @@ class CullSpeedApp(QMainWindow):
         self.session_timer.setSingleShot(True)
         self.session_timer.setInterval(400)
         self.session_timer.timeout.connect(self.save_session)
+
+        # New files (an import or a tethered shot landing in the folder) show up by themselves.
+        self.watcher = QFileSystemWatcher(self)
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.setSingleShot(True)
+        self.refresh_timer.setInterval(800)
+        self.refresh_timer.timeout.connect(lambda: self.refresh(auto=True))
+        self.watcher.directoryChanged.connect(lambda _path: self.refresh_timer.start())
 
         self._build_ui()
         self._build_shortcuts()
@@ -109,12 +139,20 @@ class CullSpeedApp(QMainWindow):
     def _build_ui(self):
         self.header = HeaderBar()
         self.header.open_folder_requested.connect(self.choose_folder)
+        self.header.refresh_requested.connect(self.refresh)
         self.header.process_requested.connect(self.process_files)
 
-        # Cull tab: large image + filmstrip
+        # Cull tab: large image (or Compare) + filmstrip
         self.image_view = ImageView()
         self.image_view.zoom_changed.connect(self._on_zoom_changed)
         self.image_view.set_image(None, "Open a folder of photos to start\n(or drop one onto this window)")
+        self.compare_view = CompareView()
+        self.compare_view.zoom_changed.connect(self._on_zoom_changed)
+        self.compare_view.activated.connect(lambda index: self.go_to(self.compare_rows[index]))
+        self.cull_stack = QStackedWidget()
+        self.cull_stack.addWidget(self.image_view)
+        self.cull_stack.addWidget(self.compare_view)
+
         self.filmstrip = make_thumbnail_view(
             self.model, ThumbnailDelegate(FILMSTRIP_THUMB_SIZE, show_names=False, parent=self), horizontal=True
         )
@@ -126,7 +164,7 @@ class CullSpeedApp(QMainWindow):
         cull_layout = QVBoxLayout(cull_page)
         cull_layout.setContentsMargins(0, 0, 0, 0)
         cull_layout.setSpacing(0)
-        cull_layout.addWidget(self.image_view, 1)
+        cull_layout.addWidget(self.cull_stack, 1)
         cull_layout.addWidget(self.filmstrip)
 
         # Gallery tab: filter chips + grid
@@ -179,20 +217,29 @@ class CullSpeedApp(QMainWindow):
         bind(["P", "1"], lambda: self.mark(KEEP))
         bind(["X", "3"], lambda: self.mark(REJECT))
         bind(["U", "2", "Backspace"], lambda: self.mark(None))
+        # Stars and colour labels follow Lightroom's 0–5 and 6–9, with ⌘/Ctrl
+        # since the bare digits already keep, unmark and reject.
+        for stars in range(6):
+            bind([f"Ctrl+{stars}"], lambda stars=stars: self.rate(stars))
+        for key, label in zip("6789", xmp.LABELS, strict=False):
+            bind([f"Ctrl+{key}"], lambda label=label: self.set_label(label))
         bind([QKeySequence.StandardKey.Undo], self.undo)
         bind([QKeySequence.StandardKey.Open], self.choose_folder)
+        bind(["Ctrl+R", "F5"], self.refresh)
         bind(["G"], self.toggle_tab)
+        bind(["C"], self.toggle_compare)
+        bind(["I"], self.toggle_info)
 
         # In the gallery the arrow keys move through the grid instead.
         bind(["Up"], lambda: self.mark(KEEP), cull_only=True)
         bind(["Down"], lambda: self.mark(REJECT), cull_only=True)
-        bind(["Right", "L", "Space"], lambda: self.go_to(self.current_row + 1), cull_only=True)
-        bind(["Left", "H"], lambda: self.go_to(self.current_row - 1), cull_only=True)
+        bind(["Right", "L", "Space"], lambda: self.step(1), cull_only=True)
+        bind(["Left", "H"], lambda: self.step(-1), cull_only=True)
         bind(["Home"], lambda: self.go_to(0), cull_only=True)
         bind(["End"], lambda: self.go_to(self.model.rowCount() - 1), cull_only=True)
         bind(["N"], self.next_unmarked, cull_only=True)
-        bind(["Z"], self.image_view.toggle_zoom, cull_only=True)
-        bind(["Escape"], self.image_view.reset_zoom, cull_only=True)
+        bind(["Z"], self.toggle_zoom, cull_only=True)
+        bind(["Escape"], self.escape, cull_only=True)
 
     # -- folder ------------------------------------------------------------
 
@@ -203,8 +250,11 @@ class CullSpeedApp(QMainWindow):
         if folder:
             self.load_folder(folder)
 
-    def load_folder(self, folder, select=None):
-        """Open `folder`; `select` is a photo's path relative to it (or, from older versions, its name)."""
+    def load_folder(self, folder, select=None, keep_state=False):
+        """Open `folder`; `select` is a photo's path relative to it (or, from older versions, its name).
+
+        `keep_state` (refreshing the open folder) keeps cached images and undo.
+        """
         if self.moving:
             return
         self.save_session()
@@ -214,14 +264,18 @@ class CullSpeedApp(QMainWindow):
             inform(self, "Cannot open folder", escape(f"{folder}: {exc}"))
             return
 
-        self.loader.reset()
+        if not (keep_state and folder == self.folder):
+            self.loader.reset()
+            self.session_warning = None
+            self.xmp_warned = False
+            self.undo_stack.clear()
+        self._end_compare(show=False)
         self.folder = folder
-        self.session_warning = None
-        self.undo_stack.clear()
         self.current_row = -1
         self.model.set_photos(photos)
         self.settings.setValue("last_folder", folder)
         self.header.set_folder(folder)
+        self._watch(folder)
 
         if not photos:
             self.image_view.set_image(None, "No photos in this folder")
@@ -234,6 +288,32 @@ class CullSpeedApp(QMainWindow):
             self.go_to(keys.index(select))
         else:
             self.go_to(names.index(select) if select in names else 0)
+
+    def refresh(self, auto=False):
+        """Pick up photos added to or removed from the folder, keeping marks and the current photo."""
+        if not self.folder or self.moving:
+            return
+        try:
+            files = photo_files(self.folder)
+        except OSError:
+            return
+        known = {path for photo in self.model.photos for path in photo.files}
+        if files == known:
+            if not auto:
+                self.toast.show_message("No new photos")
+            return
+        added, removed = len(files - known), len(known - files)
+        current = self.model.photo(self.current_row).path if self.current_row >= 0 else None
+        self.load_folder(self.folder, select=current and relative_key(self.folder, current), keep_state=True)
+        changes = [f"{added} new file(s)" if added else "", f"{removed} gone" if removed else ""]
+        self.toast.show_message("Folder updated · " + ", ".join(c for c in changes if c))
+
+    def _watch(self, folder):
+        if self.watcher.directories():
+            self.watcher.removePaths(self.watcher.directories())
+        directories = [d for d in (folder, os.path.join(folder, KEEP_DIR), os.path.join(folder, REJECT_DIR)) if os.path.isdir(d)]
+        if directories:
+            self.watcher.addPaths(directories)
 
     def _restore_last_folder(self):
         folder = self.settings.value("last_folder", "")
@@ -257,6 +337,7 @@ class CullSpeedApp(QMainWindow):
         self.session_timer.stop()
         if not self.folder or not self.model.photos:
             return
+        self._write_xmp()
         try:
             path = save_session(self.folder, self.model.photos, self.session_fallback_dir)
         except OSError as exc:
@@ -273,15 +354,38 @@ class CullSpeedApp(QMainWindow):
             self.session_warning = kind
             self.toast.show_message(message, 5000)
 
+    def _write_xmp(self):
+        """Write pending ratings and labels to the photos' XMP sidecars."""
+        dirty, self.xmp_dirty = self.xmp_dirty, set()
+        listings = {}
+        for path in dirty:
+            row = self.model.row_of(path)
+            if row == -1:
+                continue
+            photo = self.model.photo(row)
+            directory = os.path.dirname(photo.path)
+            try:
+                if directory not in listings:
+                    listings[directory] = {name.lower(): name for name in os.listdir(directory)}
+                xmp.write(photo.files, photo.rating, photo.label, listings[directory])
+            except OSError as exc:
+                if not self.xmp_warned:
+                    self.xmp_warned = True
+                    self.toast.show_message(
+                        f"Could not write XMP sidecars ({exc.strerror or exc}): ratings stay in CullSpeed only", 5000
+                    )
+
     # -- navigation --------------------------------------------------------
 
     def go_to(self, row):
         if not 0 <= row < self.model.rowCount():
             return
+        if self.compare_rows and row not in self.compare_rows:
+            self._end_compare(show=False)
         self.current_row = row
         photo = self.model.photo(row)
         self.header.set_counter(f"{row + 1} / {self.model.rowCount()}")
-        self.header.set_folder(self.folder, photo.name)
+        self.header.set_folder(self.folder, photo.display_name)
 
         index = self.model.index(row)
         self.filmstrip.selectionModel().setCurrentIndex(
@@ -292,10 +396,18 @@ class CullSpeedApp(QMainWindow):
         # Request first: a photo that failed before is retried, and shows "Loading…".
         count = self.model.rowCount()
         nearby = [*range(row + 1, row + 1 + PREFETCH_AHEAD), *range(row - 1, row - 1 - PREFETCH_BEHIND, -1)]
-        self.loader.ensure_previews(
-            photo.path, [self.model.photo(r).path for r in nearby if 0 <= r < count]
-        )
-        self._show_current()
+        others = [r for r in self._shown_rows() if r != row] + [r for r in nearby if 0 <= r < count]
+        self.loader.ensure_previews(photo.path, [self.model.photo(r).path for r in dict.fromkeys(others)])
+        self._refresh_view()
+
+    def step(self, delta):
+        """Next / previous photo, or the next / previous one being compared."""
+        if self.compare_rows:
+            i = self.compare_rows.index(self.current_row) + delta
+            if 0 <= i < len(self.compare_rows):
+                self.go_to(self.compare_rows[i])
+            return
+        self.go_to(self.current_row + delta)
 
     def next_unmarked(self):
         count = self.model.rowCount()
@@ -309,47 +421,115 @@ class CullSpeedApp(QMainWindow):
     def toggle_tab(self):
         self.tabs.setCurrentIndex(GALLERY_TAB if self.tabs.currentIndex() == CULL_TAB else CULL_TAB)
 
-    def _show_current(self):
+    # -- showing photos ----------------------------------------------------
+
+    def _shown_rows(self):
+        if self.compare_rows:
+            return list(self.compare_rows)
+        return [self.current_row] if self.current_row >= 0 else []
+
+    def _zoomed(self):
+        return self.compare_view.zoomed if self.compare_rows else self.image_view.zoomed
+
+    def _refresh_view(self):
+        """Show the current photo, or the compared ones, with their marks, info and zoom."""
         if self.current_row < 0:
             return
-        photo = self.model.photo(self.current_row)
+        if self.compare_rows:
+            shown = list(zip(self.compare_view.views, self.compare_rows, strict=True))
+        else:
+            shown = [(self.image_view, self.current_row)]
+        zoomed = self._zoomed()
+        # Previews are downscaled, so while zoomed the photos load at full resolution.
+        self.loader.ensure_full([self.model.photo(row).path for _, row in shown], load=zoomed)
+        for view, row in shown:
+            self._show_in(view, row, zoomed)
+
+    def _show_in(self, view, row, zoomed):
+        photo = self.model.photo(row)
         pixmap = self.loader.preview(photo.path)
         if pixmap is not None:
-            self.image_view.set_image(pixmap)
+            view.set_image(pixmap, native_size=self.loader.native_size(photo.path), keep_zoom=True)
         else:
             error = self.loader.preview_error(photo.path)
-            self.image_view.set_image(None, f"Could not load {photo.name}\n\n{error}" if error else "Loading…")
-        self.image_view.set_status(photo.status)
+            view.set_image(None, f"Could not load {photo.name}\n\n{error}" if error else "Loading…", keep_zoom=True)
+        view.set_status(photo.status)
+        view.set_rating(photo.rating, photo.label)
+        view.set_info(summary(self.loader.info(photo.path)) if self.show_info else [])
+        view.set_active(bool(self.compare_rows) and row == self.current_row)
+        if zoomed and pixmap is not None:
+            full = self.loader.full_pixmap(photo.path)
+            if full is not None:
+                view.set_full_image(full)
+            else:
+                view.set_full_loading(self.loader.full_error(photo.path) is None)
 
-    def _is_current(self, path):
-        return self.current_row >= 0 and self.model.photo(self.current_row).path == path
+    def _is_shown(self, path):
+        return any(self.model.photo(row).path == path for row in self._shown_rows())
 
-    def _on_preview_ready(self, path):
-        if self._is_current(path):
-            self._show_current()
-
-    # -- 1:1 zoom ----------------------------------------------------------
-    # Previews are downscaled, so zooming loads the photo at full resolution.
-
-    def _on_zoom_changed(self, zoomed):
-        if not zoomed or self.current_row < 0:
-            return
-        path = self.model.photo(self.current_row).path
-        pixmap = self.loader.full_pixmap(path)
-        if pixmap is not None:
-            self.image_view.set_full_image(pixmap)
-        else:
-            self.image_view.set_full_loading(True)
-            self.loader.ensure_full(path)
-
-    def _on_full_ready(self, path):
-        if self._is_current(path) and self.image_view.zoomed:
-            self.image_view.set_full_image(self.loader.full_pixmap(path))
+    def _on_image_ready(self, path):
+        if self._is_shown(path):
+            self._refresh_view()
 
     def _on_full_failed(self, path, error):
-        if self._is_current(path):
-            self.image_view.set_full_loading(False)
+        if self._is_shown(path):
+            self._refresh_view()
             self.toast.show_message(f"Full resolution unavailable: {error}", 4000)
+
+    def _on_zoom_changed(self, _zoomed):
+        self._refresh_view()
+
+    def toggle_zoom(self):
+        if self.compare_rows:
+            self.compare_view.toggle_zoom(self.compare_rows.index(self.current_row))
+        else:
+            self.image_view.toggle_zoom()
+
+    def escape(self):
+        if self.compare_rows and self.compare_view.zoomed:
+            self.compare_view.reset_zoom()
+        elif self.compare_rows:
+            self._end_compare()
+        else:
+            self.image_view.reset_zoom()
+
+    def toggle_info(self):
+        self.show_info = not self.show_info
+        self.settings.setValue("show_info", self.show_info)
+        self._refresh_view()
+
+    # -- compare -----------------------------------------------------------
+
+    def toggle_compare(self):
+        """Gallery: compare the selected photos. Cull: the current photo and the next one."""
+        if self.compare_rows:
+            self._end_compare()
+            return
+        if self.tabs.currentIndex() == GALLERY_TAB:
+            rows = sorted(self.proxy.mapToSource(i).row() for i in self.grid.selectionModel().selectedIndexes())
+            if not 2 <= len(rows) <= COMPARE_MAX:
+                self.toast.show_message(f"Select 2 to {COMPARE_MAX} photos to compare")
+                return
+        elif self.current_row + 1 < self.model.rowCount() and self.current_row >= 0:
+            rows = [self.current_row, self.current_row + 1]
+        else:
+            self.toast.show_message("No next photo to compare with")
+            return
+
+        self.compare_rows = rows
+        self.compare_view.set_count(len(rows))
+        self.cull_stack.setCurrentWidget(self.compare_view)
+        self.tabs.setCurrentIndex(CULL_TAB)
+        self.go_to(self.current_row if self.current_row in rows else rows[0])
+
+    def _end_compare(self, show=True):
+        if not self.compare_rows:
+            return
+        self.compare_rows = []
+        self.compare_view.reset_zoom()
+        self.cull_stack.setCurrentWidget(self.image_view)
+        if show:
+            self.go_to(self.current_row)
 
     # -- marking -----------------------------------------------------------
 
@@ -363,23 +543,39 @@ class CullSpeedApp(QMainWindow):
                 return []
         return [self.current_row] if self.current_row >= 0 else []
 
+    def _push_undo(self, changes):
+        if changes:
+            self.undo_stack.append(changes)
+            del self.undo_stack[:-UNDO_LIMIT]
+
     def mark(self, status):
         rows = self._target_rows()
         if not rows:
             return
         in_gallery = self.tabs.currentIndex() == GALLERY_TAB
         first_visible = min(self.proxy.mapFromSource(self.model.index(row)).row() for row in rows)
-        changes = self.model.set_status(rows, status)
-        if changes:
-            self.undo_stack.append(changes)
-            del self.undo_stack[:-UNDO_LIMIT]
+        self._push_undo(self.model.set_status(rows, status))
         if in_gallery:
             self._select_after_filtering(first_visible)
-        elif status is not None:
+        elif status is not None and not self.compare_rows:
             if self.current_row + 1 < self.model.rowCount():
                 self.go_to(self.current_row + 1)
             else:
                 self._report_end()
+
+    def rate(self, stars):
+        rows = self._target_rows()
+        if rows:
+            self._push_undo(self.model.set_field(rows, "rating", stars))
+
+    def set_label(self, label):
+        """Give `label` to the target photos, or remove it if they all have it already."""
+        rows = self._target_rows()
+        if not rows:
+            return
+        if all(self.model.photo(row).label == label for row in rows):
+            label = None
+        self._push_undo(self.model.set_field(rows, "label", label))
 
     def _report_end(self):
         unmarked = self.model.counts()[2]
@@ -403,7 +599,7 @@ class CullSpeedApp(QMainWindow):
             return
         changes = self.undo_stack.pop()
         rows = self.model.restore(changes)
-        if rows and self.tabs.currentIndex() == CULL_TAB:
+        if rows and self.tabs.currentIndex() == CULL_TAB and self.current_row not in rows:
             self.go_to(rows[0])
         self.toast.show_message("Undone" if len(changes) == 1 else f"Undone ({len(changes)} photos)")
 
@@ -412,8 +608,8 @@ class CullSpeedApp(QMainWindow):
         self.stats.update_counts(keeps, rejects, unmarked)
         self.gallery_toolbar.update_counts(self.model.rowCount(), keeps, rejects, unmarked)
         self.header.set_can_process(bool(self.folder) and self.model.has_unsorted())
-        if self.current_row in rows:
-            self.image_view.set_status(self.model.photo(self.current_row).status)
+        if set(rows) & set(self._shown_rows()):
+            self._refresh_view()
         self.session_timer.start()
 
     # -- gallery -----------------------------------------------------------
@@ -421,16 +617,17 @@ class CullSpeedApp(QMainWindow):
     def _on_tab_changed(self, index):
         for shortcut in self.cull_shortcuts:
             shortcut.setEnabled(index == CULL_TAB)
-        if index == GALLERY_TAB and self.current_row >= 0:
-            proxy_index = self.proxy.mapFromSource(self.model.index(self.current_row))
-            if proxy_index.isValid():
-                self.grid.selectionModel().setCurrentIndex(
-                    proxy_index, QItemSelectionModel.SelectionFlag.ClearAndSelect
-                )
-                self.grid.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
+        if index == GALLERY_TAB:
+            self._end_compare(show=False)
+            if self.current_row >= 0:
+                proxy_index = self.proxy.mapFromSource(self.model.index(self.current_row))
+                if proxy_index.isValid():
+                    self.grid.selectionModel().setCurrentIndex(
+                        proxy_index, QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    )
+                    self.grid.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
             self.grid.setFocus()
         else:
-            self.image_view.reset_zoom()
             self.setFocus()
 
     def _on_grid_current_changed(self, proxy_index, _previous):
@@ -457,6 +654,7 @@ class CullSpeedApp(QMainWindow):
     def process_files(self):
         if not self.folder:
             return
+        self._end_compare()
         self.save_session()
         moves = plan_moves(self.folder, self.model.photos)
         if not moves:
@@ -466,14 +664,16 @@ class CullSpeedApp(QMainWindow):
         keeps = sum(1 for m in moves if m.status == KEEP)
         rejects = sum(1 for m in moves if m.status == REJECT)
         unmarked = len(moves) - keeps - rejects
-        lines = [f"<b>{len(moves)}</b> file(s) will be moved:"]
+        lines = [f"<b>{len(moves)}</b> photo(s) will be moved:"]
         if keeps:
             lines.append(f"&nbsp;&nbsp;• {keeps} → <b>_KEEPS</b>")
         if rejects:
             lines.append(f"&nbsp;&nbsp;• {rejects} → <b>_REJECTS</b>")
         if unmarked:
             lines.append(f"&nbsp;&nbsp;• {unmarked} → folder root (unmarked)")
-        lines.append("<br>XMP sidecars move with their photo. Existing files are never overwritten.")
+        lines.append(
+            "<br>RAW+JPEG pairs and XMP sidecars move together. Existing files are never overwritten."
+        )
         if not ask(self, "Process files", "<br>".join(lines), "Move Files"):
             return
 
@@ -499,26 +699,28 @@ class CullSpeedApp(QMainWindow):
 
         # Locations come from the plan: once Stop is pressed the window is
         # usable again while the last file finishes, so marks may have changed.
-        locations = {move.src: move.status for move in moves}
+        locations = {path: move.status for move in moves for path in (move.src, *move.companions)}
         self.model.apply_moves({old: (new, locations[old]) for old, new in result.moved.items()})
         self.loader.rename_paths(result.moved)
         self.undo_stack.clear()  # undo entries refer to the old paths
         self.save_session()
         self._on_statuses_changed([])
+        self._watch(self.folder)  # _KEEPS / _REJECTS may have just been created
         if self.current_row >= 0:
-            self.header.set_folder(self.folder, self.model.photo(self.current_row).name)
+            self.header.set_folder(self.folder, self.model.photo(self.current_row).display_name)
 
+        moved = sum(1 for move in moves if move.src in result.moved)
         if result.errors:
             inform(
                 self,
                 "Some files were not moved",
-                f"Moved {len(result.moved)} of {len(moves)} file(s). These failed:",
+                f"Moved {moved} of {len(moves)} photo(s). These failed:",
                 details=result.errors,
             )
         elif result.cancelled:
-            self.toast.show_message(f"Stopped after moving {len(result.moved)} file(s)")
+            self.toast.show_message(f"Stopped after moving {moved} photo(s)")
         else:
-            self.toast.show_message(f"Moved {len(result.moved)} file(s)")
+            self.toast.show_message(f"Moved {moved} photo(s)")
 
     # -- window ------------------------------------------------------------
 

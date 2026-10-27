@@ -1,4 +1,6 @@
-from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
+from functools import partial
+
+from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -6,11 +8,13 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QListView,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QStyle,
     QStyledItemDelegate,
@@ -25,11 +29,13 @@ from .constants import (
     COLOR_KEEP,
     COLOR_MUTED,
     COLOR_REJECT,
+    COLOR_STAR,
     COLOR_TEXT,
     KEEP,
+    LABEL_COLORS,
     REJECT,
 )
-from .models import STATUS_ROLE, THUMBNAIL_FAILED_ROLE
+from .models import LABEL_ROLE, RATING_ROLE, STATUS_ROLE, THUMBNAIL_FAILED_ROLE
 
 STATUS_COLORS = {KEEP: QColor(COLOR_KEEP), REJECT: QColor(COLOR_REJECT)}
 
@@ -146,6 +152,24 @@ class ThumbnailDelegate(QStyledItemDelegate):
         draw_status_badge(
             painter, QPointF(target.right() - radius - 2, target.top() + radius + 2), radius, status
         )
+
+        label = index.data(LABEL_ROLE)
+        if label:
+            painter.setPen(QPen(QColor(0, 0, 0, 160), 1.5))
+            painter.setBrush(QColor(LABEL_COLORS.get(label, COLOR_MUTED)))
+            painter.drawEllipse(QPointF(target.left() + radius + 2, target.top() + radius + 2), radius * 0.7, radius * 0.7)
+        rating = index.data(RATING_ROLE) or 0
+        if rating:
+            font = painter.font()
+            font.setPointSizeF(max(7.0, font.pointSizeF() * (0.8 if self.thumb_size < 100 else 0.95)))
+            painter.setFont(font)
+            metrics = QFontMetrics(font)
+            text = "★" * rating
+            strip = QRectF(0, 0, metrics.horizontalAdvance(text) + 10, metrics.height() + 2)
+            strip.moveCenter(QPointF(target.center().x(), target.bottom() - strip.height() / 2 - 3))
+            _fill_pill(painter, strip, QColor(0, 0, 0, 150))
+            painter.setPen(QColor(COLOR_STAR))
+            painter.drawText(strip, Qt.AlignmentFlag.AlignCenter, text)
         painter.restore()
 
 
@@ -176,32 +200,62 @@ def make_thumbnail_view(model, delegate, horizontal):
 
 # -- main image ------------------------------------------------------------
 
+def _fill_pill(painter, rect, color=None):
+    path = QPainterPath()
+    path.addRoundedRect(rect, rect.height() / 2, rect.height() / 2)
+    painter.fillPath(path, color or QColor(0, 0, 0, 170))
+
+
+def stars_text(rating):
+    return "★" * rating + "☆" * (5 - rating)
+
+
 class ImageView(QWidget):
-    """Shows the current photo fitted to the window, or at 1:1 with panning."""
+    """Shows a photo fitted to the window, or at 1:1 with panning.
+
+    Zoom survives a change of photo (`set_image(..., keep_zoom=True)`), so a
+    burst can be checked for focus at the same spot, photo after photo.
+    """
 
     MARGIN = 16
 
     zoom_changed = pyqtSignal(bool)
+    view_changed = pyqtSignal(bool, QPointF)  # zoomed, center: the user zoomed or panned
+    clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmap = None
-        self._full_loading = False
+        self._source_key = None  # cacheKey() of the pixmap last given to set_image()
+        self._native = None  # size of the photo itself, which a preview is smaller than
         self._scaled = None
         self._message = ""
         self._status = None
+        self._rating = 0
+        self._label = None
+        self._info = []
+        self._active = False
+        self._full_loading = False
         self._zoomed = False
         self._center = QPointF(0.5, 0.5)  # zoom focus, relative to the image
         self._drag_from = None
-        self.setMinimumSize(200, 200)
+        self.setMinimumSize(120, 120)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-    def set_image(self, pixmap, message=""):
+    def set_image(self, pixmap, message="", native_size=None, keep_zoom=False):
+        if keep_zoom and pixmap is not None and pixmap.cacheKey() == self._source_key:
+            return  # same photo: keep whatever is shown, including a full-resolution swap
+        self._source_key = pixmap.cacheKey() if pixmap is not None else None
         self._pixmap = pixmap if pixmap is not None and not pixmap.isNull() else None
+        if native_size is not None and native_size.isValid():
+            self._native = QSize(native_size)
+        else:
+            self._native = self._pixmap.size() if self._pixmap is not None else None
         self._scaled = None
         self._message = message
-        self._zoomed = False
         self._full_loading = False
+        if not keep_zoom:
+            self._zoomed = False
         self._update_cursor()
         self.update()
 
@@ -210,6 +264,7 @@ class ImageView(QWidget):
         self._full_loading = False
         if pixmap is not None and not pixmap.isNull() and self._pixmap is not None:
             self._pixmap = pixmap
+            self._native = pixmap.size()
             self._scaled = None
         self.update()
 
@@ -218,14 +273,29 @@ class ImageView(QWidget):
             self._full_loading = loading
             self.update()
 
-    @property
-    def zoomed(self):
-        return self._zoomed
-
     def set_status(self, status):
         if status != self._status:
             self._status = status
             self.update()
+
+    def set_rating(self, rating, label):
+        if (rating, label) != (self._rating, self._label):
+            self._rating, self._label = rating, label
+            self.update()
+
+    def set_info(self, lines):
+        if lines != self._info:
+            self._info = list(lines)
+            self.update()
+
+    def set_active(self, active):
+        if active != self._active:
+            self._active = active
+            self.update()
+
+    @property
+    def zoomed(self):
+        return self._zoomed
 
     def toggle_zoom(self, at=None):
         if self._pixmap is None:
@@ -242,10 +312,18 @@ class ImageView(QWidget):
         self._update_cursor()
         self.update()
         self.zoom_changed.emit(self._zoomed)
+        self.view_changed.emit(self._zoomed, self._center)
 
     def reset_zoom(self):
         if self._zoomed:
             self.toggle_zoom()
+
+    def set_view(self, zoomed, center):
+        """Follow another view's zoom and pan (Compare), without emitting signals."""
+        self._zoomed = zoomed
+        self._center = QPointF(center)
+        self._update_cursor()
+        self.update()
 
     # geometry
 
@@ -254,7 +332,8 @@ class ImageView(QWidget):
         return fit_rect(self._pixmap.size(), bounds)
 
     def _zoom_rect(self):
-        size = self._pixmap.size() / self._pixmap.devicePixelRatio() / self.devicePixelRatioF()
+        # At the photo's own size, whatever the size of the pixmap shown so far.
+        size = QSizeF(self._native or self._pixmap.size()) / self.devicePixelRatioF()
         x = self.width() / 2 - self._center.x() * size.width()
         y = self.height() / 2 - self._center.y() * size.height()
         # Keep the image on screen; center it on any axis where it is smaller.
@@ -263,7 +342,7 @@ class ImageView(QWidget):
         return QRectF(x, y, size.width(), size.height())
 
     def _update_cursor(self):
-        if self._zoomed:
+        if self._zoomed and self._pixmap is not None:
             self.setCursor(Qt.CursorShape.ClosedHandCursor if self._drag_from else Qt.CursorShape.OpenHandCursor)
         else:
             self.unsetCursor()
@@ -278,7 +357,8 @@ class ImageView(QWidget):
         self.toggle_zoom(event.position().toPoint())
 
     def mousePressEvent(self, event):
-        if self._zoomed and event.button() == Qt.MouseButton.LeftButton:
+        self.clicked.emit()
+        if self._zoomed and self._pixmap is not None and event.button() == Qt.MouseButton.LeftButton:
             self._drag_from = event.position()
             self._update_cursor()
 
@@ -293,6 +373,7 @@ class ImageView(QWidget):
             min(1.0, max(0.0, self._center.y() - delta.y() / rect.height())),
         )
         self.update()
+        self.view_changed.emit(True, self._center)
 
     def mouseReleaseEvent(self, event):
         self._drag_from = None
@@ -306,6 +387,7 @@ class ImageView(QWidget):
         if self._pixmap is None:
             painter.setPen(QColor(COLOR_MUTED))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._message)
+            self._draw_active(painter)
             return
 
         if self._zoomed:
@@ -325,28 +407,23 @@ class ImageView(QWidget):
             painter.drawPixmap(fit.topLeft(), self._scaled)
             target = QRectF(fit)
 
+        visible = target.intersected(QRectF(self.rect()))
         color = STATUS_COLORS.get(self._status)
         if color is not None:
-            visible = target.intersected(QRectF(self.rect()))
             painter.setPen(QPen(color, 4))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(visible.adjusted(2, 2, -2, -2))
             self._draw_status_pill(painter, visible, color)
-
+        if self._rating or self._label:
+            self._draw_rating_pill(painter, visible)
+        if self._info:
+            self._draw_info(painter, visible)
         if self._zoomed and self._full_loading:
             self._draw_loading_note(painter)
-
-    def _draw_loading_note(self, painter):
-        text = "Loading full resolution…"
-        metrics = QFontMetrics(painter.font())
-        note = QRectF(14, self.height() - metrics.height() - 24, metrics.horizontalAdvance(text) + 20, metrics.height() + 10)
-        path = QPainterPath()
-        path.addRoundedRect(note, note.height() / 2, note.height() / 2)
-        painter.fillPath(path, QColor(0, 0, 0, 170))
-        painter.setPen(QColor(COLOR_TEXT))
-        painter.drawText(note, Qt.AlignmentFlag.AlignCenter, text)
+        self._draw_active(painter)
 
     def _draw_status_pill(self, painter, rect, color):
+        painter.save()
         label = "KEEP" if self._status == KEEP else "REJECT"
         font = painter.font()
         font.setBold(True)
@@ -355,21 +432,142 @@ class ImageView(QWidget):
         height = metrics.height() + 10
         width = metrics.horizontalAdvance(label) + height + 14
         pill = QRectF(rect.left() + 14, rect.top() + 14, width, height)
-        path = QPainterPath()
-        path.addRoundedRect(pill, height / 2, height / 2)
-        painter.fillPath(path, QColor(0, 0, 0, 170))
+        _fill_pill(painter, pill)
         radius = height / 2 - 4
         draw_status_badge(painter, QPointF(pill.left() + height / 2, pill.center().y()), radius, self._status)
         painter.setPen(color)
         painter.drawText(
             pill.adjusted(height, 0, -8, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label
         )
+        painter.restore()
+
+    def _draw_rating_pill(self, painter, rect):
+        painter.save()
+        metrics = QFontMetrics(painter.font())
+        height = metrics.height() + 10
+        stars = stars_text(self._rating) if self._rating else ""
+        dot = height - 14 if self._label else 0
+        gap = 8 if stars and dot else 0
+        width = metrics.horizontalAdvance(stars) + dot + gap + 20
+        pill = QRectF(rect.right() - 14 - width, rect.top() + 14, width, height)
+        _fill_pill(painter, pill)
+        x = pill.left() + 10
+        if dot:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(LABEL_COLORS.get(self._label, COLOR_MUTED)))
+            painter.drawEllipse(QRectF(x, pill.center().y() - dot / 2, dot, dot))
+            x += dot + gap
+        if stars:
+            painter.setPen(QColor(COLOR_STAR))
+            painter.drawText(QRectF(x, pill.top(), pill.right() - x, height), Qt.AlignmentFlag.AlignVCenter, stars)
+        painter.restore()
+
+    def _draw_info(self, painter, rect):
+        painter.save()
+        font = painter.font()
+        font.setPointSizeF(font.pointSizeF() * 0.92)
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        line_height = metrics.height()
+        width = max(metrics.horizontalAdvance(line) for line in self._info) + 24
+        height = line_height * len(self._info) + 12
+        box = QRectF(rect.right() - width - 14, rect.bottom() - height - 14, width, height)
+        path = QPainterPath()
+        path.addRoundedRect(box, 8, 8)
+        painter.fillPath(path, QColor(0, 0, 0, 170))
+        painter.setPen(QColor(COLOR_TEXT))
+        for i, line in enumerate(self._info):
+            painter.drawText(
+                QRectF(box.left() + 12, box.top() + 6 + i * line_height, width - 24, line_height),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                line,
+            )
+        painter.restore()
+
+    def _draw_loading_note(self, painter):
+        text = "Loading full resolution…"
+        metrics = QFontMetrics(painter.font())
+        note = QRectF(14, self.height() - metrics.height() - 24, metrics.horizontalAdvance(text) + 20, metrics.height() + 10)
+        _fill_pill(painter, note)
+        painter.setPen(QColor(COLOR_TEXT))
+        painter.drawText(note, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _draw_active(self, painter):
+        if self._active:
+            painter.setPen(QPen(QColor(COLOR_ACCENT), 3))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5))
+
+
+class CompareView(QWidget):
+    """Two to four photos side by side; zoom and pan are shared between them."""
+
+    activated = pyqtSignal(int)  # index of the view the user clicked
+    zoom_changed = pyqtSignal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._views = []
+        self._zoomed = False
+        self._layout = QGridLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(2)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    @property
+    def views(self):
+        return self._views
+
+    @property
+    def zoomed(self):
+        return self._zoomed
+
+    def set_count(self, count):
+        while len(self._views) < count:
+            view = ImageView()
+            view.MARGIN = 8
+            view.view_changed.connect(partial(self._sync, view))
+            view.clicked.connect(partial(self._on_clicked, view))
+            self._views.append(view)
+        while len(self._views) > count:
+            self._views.pop().deleteLater()
+        for view in self._views:
+            self._layout.removeWidget(view)
+        columns = 2 if count == 4 else max(1, count)
+        for i, view in enumerate(self._views):
+            self._layout.addWidget(view, i // columns, i % columns)
+        self._zoomed = False
+        for view in self._views:
+            view.set_view(False, QPointF(0.5, 0.5))
+
+    def toggle_zoom(self, index):
+        self._views[index].toggle_zoom()
+
+    def reset_zoom(self):
+        for view in self._views:
+            view.set_view(False, QPointF(0.5, 0.5))
+        self._set_zoomed(False)
+
+    def _sync(self, source, zoomed, center):
+        for view in self._views:
+            if view is not source:
+                view.set_view(zoomed, center)
+        self._set_zoomed(zoomed)
+
+    def _set_zoomed(self, zoomed):
+        if zoomed != self._zoomed:
+            self._zoomed = zoomed
+            self.zoom_changed.emit(zoomed)
+
+    def _on_clicked(self, view):
+        self.activated.emit(self._views.index(view))
 
 
 # -- bars ------------------------------------------------------------------
 
 class HeaderBar(QFrame):
     open_folder_requested = pyqtSignal()
+    refresh_requested = pyqtSignal()
     process_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -390,12 +588,17 @@ class HeaderBar(QFrame):
         btn_open = QPushButton("Open Folder…")
         btn_open.clicked.connect(self.open_folder_requested)
 
+        btn_refresh = QPushButton("Refresh")
+        refresh_key = QKeySequence("Ctrl+R").toString(QKeySequence.SequenceFormat.NativeText)
+        btn_refresh.setToolTip(f"Look for new photos in the folder ({refresh_key})")
+        btn_refresh.clicked.connect(self.refresh_requested)
+
         self.btn_process = QPushButton("Process Files…")
         self.btn_process.setObjectName("Primary")
         self.btn_process.setEnabled(False)
         self.btn_process.clicked.connect(self.process_requested)
 
-        for button in (btn_open, self.btn_process):
+        for button in (btn_open, btn_refresh, self.btn_process):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         layout = QHBoxLayout(self)
@@ -405,6 +608,7 @@ class HeaderBar(QFrame):
         layout.addWidget(self.lbl_folder, 1)
         layout.addWidget(self.lbl_counter)
         layout.addWidget(btn_open)
+        layout.addWidget(btn_refresh)
         layout.addWidget(self.btn_process)
         self._folder_text = ""
 
@@ -443,8 +647,17 @@ class StatsBar(QFrame):
         self.lbl_unmarked = QLabel()
         self.lbl_unmarked.setObjectName("Muted")
 
-        undo = QKeySequence(QKeySequence.StandardKey.Undo).toString(QKeySequence.SequenceFormat.NativeText)
-        hint = QLabel(f"P keep · X reject · U unmark · ←/→ navigate · N next unmarked · Z zoom · G gallery · {undo} undo")
+        native = QKeySequence.SequenceFormat.NativeText
+        undo = QKeySequence(QKeySequence.StandardKey.Undo).toString(native)
+        mod = QKeySequence("Ctrl+1").toString(native)[:-1]  # "⌘" on macOS, "Ctrl+" elsewhere
+        hint = QLabel(
+            f"P keep · X reject · U unmark · {mod}1–5 stars · {mod}6–9 label · N next unmarked · "
+            f"C compare · Z zoom · I info · G gallery · {undo} undo"
+        )
+        hint.setToolTip(hint.text())
+        # May be cut off in a narrow window rather than force the window wider.
+        hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         hint.setObjectName("Muted")
 
         layout = QHBoxLayout(self)
@@ -453,8 +666,7 @@ class StatsBar(QFrame):
         layout.addWidget(self.lbl_keep)
         layout.addWidget(self.lbl_reject)
         layout.addWidget(self.lbl_unmarked)
-        layout.addStretch()
-        layout.addWidget(hint)
+        layout.addWidget(hint, 1)
         self.update_counts(0, 0, 0)
 
     def update_counts(self, keeps, rejects, unmarked):

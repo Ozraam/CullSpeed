@@ -9,10 +9,11 @@ from collections import OrderedDict
 from contextlib import suppress
 from itertools import count
 
-from PyQt6.QtCore import QObject, QThread, QThreadPool, pyqtSignal
+from PyQt6.QtCore import QObject, QSize, QThread, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QGuiApplication, QImage, QPixmap
 
 from .constants import PREVIEW_CACHE_SIZE, PREVIEW_MAX_SIZE, THUMBNAIL_CACHE_BYTES, THUMBNAIL_MAX_SIZE
+from .exif import read_info
 from .imaging import load_image
 
 _CANCELLED = "\0cancelled"
@@ -35,10 +36,12 @@ def _thumbnail_decode_size():
 
 
 def _decode(path, max_size):
+    """(image, native size, error message)."""
     try:
-        return load_image(path, max_size), ""
+        image, native = load_image(path, max_size)
+        return image, native, ""
     except Exception as exc:  # decoding must never kill a worker thread
-        return QImage(), str(exc) or type(exc).__name__
+        return QImage(), QSize(), str(exc) or type(exc).__name__
 
 
 class ImageLoader(QObject):
@@ -50,7 +53,7 @@ class ImageLoader(QObject):
     full_failed = pyqtSignal(str, str)
 
     # Internal: emitted from worker threads, delivered on the GUI thread.
-    _preview_done = pyqtSignal(int, str, QImage, str)
+    _preview_done = pyqtSignal(int, str, QImage, QSize, object, str)
     _full_done = pyqtSignal(int, str, QImage, str)
     _thumbnail_done = pyqtSignal(int, str, QImage)
 
@@ -68,10 +71,15 @@ class ImageLoader(QObject):
         self._preview_errors = {}
         self._preview_pending = set()
         self._wanted_previews = set()
+        self._native_sizes = {}  # path -> QSize of the photo itself
+        self._info = {}  # path -> EXIF summary, read alongside the preview
 
-        # Full resolution (for 1:1 zoom) is kept for one photo only: it is huge.
-        self._full_path = None
-        self._full_pixmap = None
+        # Full resolution (for 1:1 zoom) is huge: only kept for the photos on
+        # screen while zoomed (one, or a few side by side in Compare).
+        self._full = {}  # path -> QPixmap
+        self._full_wanted = set()
+        self._full_pending = set()
+        self._full_errors = {}
 
         self._thumbnails = OrderedDict()  # path -> QPixmap, LRU order
         self._thumbnail_bytes = 0
@@ -93,7 +101,12 @@ class ImageLoader(QObject):
         self._preview_errors.clear()
         self._preview_pending.clear()
         self._wanted_previews = set()
-        self._release_full()
+        self._native_sizes.clear()
+        self._info.clear()
+        self._full.clear()
+        self._full_wanted = set()
+        self._full_pending.clear()
+        self._full_errors.clear()
         self._thumbnails.clear()
         self._thumbnail_bytes = 0
         self._thumbnail_failed.clear()
@@ -106,16 +119,17 @@ class ImageLoader(QObject):
 
     def rename_paths(self, mapping):
         """Carry cached images over after files have been moved."""
-        for cache in (self._previews, self._preview_errors, self._thumbnails):
+        caches = (self._previews, self._preview_errors, self._native_sizes, self._info, self._thumbnails,
+                  self._full, self._full_errors)
+        for cache in caches:
             for old, new in mapping.items():
                 if old in cache:
                     cache[new] = cache.pop(old)
-        for old, new in mapping.items():
-            if old in self._thumbnail_failed:
-                self._thumbnail_failed.discard(old)
-                self._thumbnail_failed.add(new)
-        if self._full_path in mapping:
-            self._full_path = mapping[self._full_path]
+        for paths in (self._thumbnail_failed, self._full_wanted):
+            for old, new in mapping.items():
+                if old in paths:
+                    paths.discard(old)
+                    paths.add(new)
 
     # -- previews ----------------------------------------------------------
 
@@ -128,14 +142,18 @@ class ImageLoader(QObject):
     def preview_error(self, path):
         return self._preview_errors.get(path)
 
+    def native_size(self, path):
+        return self._native_sizes.get(path)
+
+    def info(self, path):
+        return self._info.get(path, {})
+
     def ensure_previews(self, current, neighbors):
         """Load `current` first, then prefetch `neighbors`; drop other queued work."""
         self._wanted_previews = {current, *neighbors}
         # Coming back to a photo retries it: the error may have been transient
         # (file still copying, network share hiccup). Neighbours are not retried.
         self._preview_errors.pop(current, None)
-        if current != self._full_path:
-            self._release_full()
         self._request_preview(current, urgent=True)
         for path in neighbors:
             self._request_preview(path, urgent=False)
@@ -148,14 +166,15 @@ class ImageLoader(QObject):
 
         def job():
             if generation != self._generation or path not in self._wanted_previews:
-                _emit(self._preview_done, generation, path, QImage(), _CANCELLED)
+                _emit(self._preview_done, generation, path, QImage(), QSize(), {}, _CANCELLED)
                 return
-            image, error = _decode(path, PREVIEW_MAX_SIZE)
-            _emit(self._preview_done, generation, path, image, error)
+            image, native, error = _decode(path, PREVIEW_MAX_SIZE)
+            info = {} if error else read_info(path)
+            _emit(self._preview_done, generation, path, image, native, info, error)
 
         self._preview_pool.start(job, 1 if urgent else 0)
 
-    def _on_preview_done(self, generation, path, image, error):
+    def _on_preview_done(self, generation, path, image, native, info, error):
         if generation != self._generation:
             return
         self._preview_pending.discard(path)
@@ -169,6 +188,8 @@ class ImageLoader(QObject):
         # Converted here, ahead of time for prefetched photos, so that
         # stepping to a photo does not pay for QPixmap.fromImage().
         self._previews[path] = QPixmap.fromImage(image)
+        self._native_sizes[path] = native
+        self._info[path] = info
         self._trim_previews()
         self.preview_loaded.emit(path)
 
@@ -182,37 +203,50 @@ class ImageLoader(QObject):
     # -- full resolution ---------------------------------------------------
 
     def full_pixmap(self, path):
-        return self._full_pixmap if path == self._full_path else None
+        return self._full.get(path)
 
-    def ensure_full(self, path):
-        """Decode `path` without downscaling; replaces any other full image."""
-        if path == self._full_path:
-            return  # loaded or in flight
-        self._full_path = path
-        self._full_pixmap = None
-        generation = self._generation
+    def full_error(self, path):
+        return self._full_errors.get(path)
 
+    def ensure_full(self, paths, load=True):
+        """Keep full resolution for `paths` only; decode the missing ones if `load`.
+
+        With `load=False` nothing new is decoded, but what is already loaded
+        for `paths` stays, so zooming back in is instant.
+        """
+        self._full_wanted = set(paths)
+        for path in list(self._full):
+            if path not in self._full_wanted:
+                del self._full[path]
+        if not load:
+            return
+        for path in paths:
+            if path in self._full or path in self._full_pending or path in self._full_errors:
+                continue
+            self._full_pending.add(path)
+            self._preview_pool.start(self._full_job(path, self._generation), 2)
+
+    def _full_job(self, path, generation):
         def job():
-            if generation != self._generation or path != self._full_path:
+            if generation != self._generation or path not in self._full_wanted:
                 _emit(self._full_done, generation, path, QImage(), _CANCELLED)
                 return
-            image, error = _decode(path, None)
+            image, _native, error = _decode(path, None)
             _emit(self._full_done, generation, path, image, error)
 
-        self._preview_pool.start(job, 2)
-
-    def _release_full(self):
-        self._full_path = None
-        self._full_pixmap = None
+        return job
 
     def _on_full_done(self, generation, path, image, error):
-        if generation != self._generation or path != self._full_path or error == _CANCELLED:
+        if generation != self._generation:
+            return
+        self._full_pending.discard(path)
+        if error == _CANCELLED or path not in self._full_wanted:
             return
         if error:
-            self._full_path = None  # allow a retry on the next zoom
+            self._full_errors[path] = error
             self.full_failed.emit(path, error)
             return
-        self._full_pixmap = QPixmap.fromImage(image)
+        self._full[path] = QPixmap.fromImage(image)
         self.full_loaded.emit(path)
 
     # -- thumbnails --------------------------------------------------------
@@ -237,7 +271,7 @@ class ImageLoader(QObject):
         def job():
             if generation != self._generation:
                 return
-            image, _error = _decode(path, size)
+            image, _native, _error = _decode(path, size)
             _emit(self._thumbnail_done, generation, path, image)
 
         # Most recently requested first, so whatever is on screen now wins.

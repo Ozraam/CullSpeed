@@ -7,7 +7,7 @@ import os
 
 import numpy as np
 import rawpy
-from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt
 from PyQt6.QtGui import QImage, QImageIOHandler, QImageReader, QTransform
 
 from .constants import RAW_EXTENSIONS
@@ -32,10 +32,13 @@ def is_raw(path):
 def load_image(path, max_size):
     """Decode `path` into a QImage whose longest edge is at most `max_size`.
 
+    Returns `(image, native_size)`: the size of the photo itself, upright,
+    which is what a full-resolution decode of it would give. A downscaled
+    preview can then be shown at true 1:1 scale while zoomed.
     `max_size=None` decodes at full resolution (for 1:1 zoom).
     """
-    image = _load_raw(path, max_size) if is_raw(path) else _read(path, max_size)
-    return _fit(image, max_size)
+    image, native = _load_raw(path, max_size) if is_raw(path) else _read(path, max_size)
+    return _fit(image, max_size), native
 
 
 def _long_edge(size):
@@ -55,6 +58,10 @@ def _fit(image, max_size):
     return image
 
 
+def _quarter_turn(flip):
+    return _FLIP_ROTATION.get(flip) in (90, 270)
+
+
 def _rotate(image, flip):
     angle = _FLIP_ROTATION.get(flip)
     if not angle:
@@ -63,7 +70,7 @@ def _rotate(image, flip):
 
 
 def _read(source, max_size, raw_flip=0):
-    """Read a file path or QIODevice, honouring EXIF orientation.
+    """Read a file path or QIODevice, honouring EXIF orientation; returns (image, native size).
 
     `raw_flip` is the RAW file's own orientation, applied only when the
     embedded preview carries no orientation of its own.
@@ -83,23 +90,34 @@ def _read(source, max_size, raw_flip=0):
     if image.isNull():
         raise ImageLoadError(reader.errorString())
 
-    if raw_flip and reader.transformation() == QImageIOHandler.Transformation.TransformationNone:
+    transform = reader.transformation()
+    rotate_raw = bool(raw_flip) and transform == QImageIOHandler.Transformation.TransformationNone
+    if rotate_raw:
         image = _rotate(image, raw_flip)
-    return image
+
+    if not size.isValid():
+        return image, image.size()  # not downscaled, so already the native size
+    quarter = _quarter_turn(raw_flip) if rotate_raw else bool(transform & QImageIOHandler.Transformation.TransformationRotate90)
+    return image, size.transposed() if quarter else QSize(size)
 
 
 def _load_raw(path, max_size):
     with rawpy.imread(path) as raw:
-        image = _embedded_preview(raw, max_size)
-        if image is not None:
-            sensor_edge = max(raw.sizes.width, raw.sizes.height)
-            if max_size is not None or _long_edge(image) >= sensor_edge * _FULL_PREVIEW_MIN_RATIO:
-                return image
+        sensor = QSize(raw.sizes.width, raw.sizes.height)
+        if _quarter_turn(raw.sizes.flip):
+            sensor = sensor.transposed()
+
+        preview = _embedded_preview(raw, max_size)
+        if preview is not None:
+            image, native = preview
+            if _long_edge(native) >= _long_edge(sensor) * _FULL_PREVIEW_MIN_RATIO:
+                return image, native
+            if max_size is not None:
+                return image, sensor  # fine to look at; full resolution develops the RAW
 
         # No usable embedded preview: develop the RAW (postprocess applies flip itself).
-        return _from_array(
-            raw.postprocess(use_camera_wb=True, half_size=max_size is not None, output_bps=8)
-        )
+        developed = raw.postprocess(use_camera_wb=True, half_size=max_size is not None, output_bps=8)
+        return _from_array(developed), sensor
 
 
 def _embedded_preview(raw, max_size):
@@ -121,7 +139,8 @@ def _embedded_preview(raw, max_size):
             buffer.close()
 
     if thumb.format == rawpy.ThumbFormat.BITMAP:
-        return _rotate(_from_array(thumb.data), flip)
+        image = _rotate(_from_array(thumb.data), flip)
+        return image, image.size()
     return None
 
 

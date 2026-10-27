@@ -13,6 +13,10 @@ def touch(path):
     return str(path)
 
 
+def statuses(session):
+    return {key: entry["status"] for key, entry in session.items()}
+
+
 def write_session(folder, data):
     with open(os.path.join(folder, SESSION_FILENAME), "w") as file:
         json.dump(data, file)
@@ -75,7 +79,7 @@ def test_session_round_trip_uses_relative_keys(tmp_path):
 
     save_session(folder, photos)
 
-    assert load_session(folder) == {"a.jpg": KEEP, f"{KEEP_DIR}/b.jpg": None}
+    assert statuses(load_session(folder)) == {"a.jpg": KEEP, f"{KEEP_DIR}/b.jpg": None}
     assert not os.path.exists(os.path.join(folder, SESSION_FILENAME + ".tmp"))
 
 
@@ -87,7 +91,7 @@ def test_unreadable_session_is_empty(tmp_path, content):
 
 def test_session_drops_unknown_statuses(tmp_path):
     write_session(tmp_path, {"a.jpg": KEEP, "b.jpg": "maybe", "c.jpg": 3})
-    assert load_session(str(tmp_path)) == {"a.jpg": KEEP}
+    assert statuses(load_session(str(tmp_path))) == {"a.jpg": KEEP}
 
 
 def read_only(path):
@@ -112,7 +116,7 @@ def test_read_only_folder_saves_to_fallback(locked_folder, tmp_path):
 
     assert os.path.dirname(path) == fallback
     assert not os.path.exists(os.path.join(locked_folder, SESSION_FILENAME))
-    assert load_session(locked_folder, fallback) == {"a.jpg": KEEP}
+    assert statuses(load_session(locked_folder, fallback)) == {"a.jpg": KEEP}
     assert [p.status for p in scan_folder(locked_folder, fallback)] == [KEEP]
 
 
@@ -132,7 +136,7 @@ def test_saving_in_the_folder_removes_the_stale_fallback(tmp_path):
 
     assert path == os.path.join(folder, SESSION_FILENAME)
     assert not os.path.exists(old)
-    assert load_session(folder, fallback) == {"a.jpg": KEEP}
+    assert statuses(load_session(folder, fallback)) == {"a.jpg": KEEP}
 
 
 def test_newest_session_wins(tmp_path):
@@ -144,7 +148,7 @@ def test_newest_session_wins(tmp_path):
     os.chmod(folder, 0o755)
     os.utime(newer, (2_000_000_000, 2_000_000_000))
 
-    assert load_session(folder, fallback) == {"a.jpg": REJECT}
+    assert statuses(load_session(folder, fallback)) == {"a.jpg": REJECT}
 
 
 # -- PhotoModel counters -----------------------------------------------------
@@ -200,3 +204,72 @@ def test_apply_moves_updates_paths_and_locations(model):
     assert model.row_of(f"/f/{KEEP_DIR}/0.jpg") == 0
     assert model.row_of("/f/0.jpg") == -1
     assert not model.has_unsorted()
+
+
+def test_model_ratings_and_labels_undo(model):
+    seen = []
+    model.ratings_changed.connect(seen.append)
+
+    changes = model.set_field([0, 1], "rating", 4) + model.set_field([1], "label", "Red")
+    assert (model.photo(1).rating, model.photo(1).label) == (4, "Red")
+    assert seen == [["/f/0.jpg", "/f/1.jpg"], ["/f/1.jpg"]]
+
+    model.restore(changes)
+    assert [(p.rating, p.label) for p in model.photos[:2]] == [(0, None), (0, None)]
+    assert model.counts() == (1, 0, 4)  # ratings do not touch the keep/reject counters
+
+
+# -- RAW+JPEG pairs, ratings in sessions and sidecars ------------------------
+
+
+def test_raw_and_jpeg_of_the_same_shot_are_one_photo(tmp_path):
+    touch(tmp_path / "IMG_1.CR2")
+    touch(tmp_path / "IMG_1.JPG")
+    touch(tmp_path / "IMG_2.JPG")
+    touch(tmp_path / "IMG_3.CR2")
+    touch(tmp_path / "IMG_3.NEF")  # two RAWs: ambiguous, kept apart
+    touch(tmp_path / "IMG_3.jpg")
+
+    photos = {p.display_name: [os.path.basename(c) for c in p.companions] for p in scan_folder(str(tmp_path))}
+
+    assert photos == {
+        "IMG_1.CR2 + JPG": ["IMG_1.JPG"],
+        "IMG_2.JPG": [],
+        "IMG_3.CR2": [],
+        "IMG_3.NEF": [],
+        "IMG_3.jpg": [],
+    }
+
+
+def test_pairs_only_form_within_one_folder(tmp_path):
+    touch(tmp_path / "IMG_1.CR2")
+    touch(tmp_path / KEEP_DIR / "IMG_1.JPG")
+
+    assert sorted(p.display_name for p in scan_folder(str(tmp_path))) == ["IMG_1.CR2", "IMG_1.JPG"]
+
+
+def test_session_stores_ratings_and_labels(tmp_path):
+    folder = str(tmp_path)
+    touch(tmp_path / "a.jpg")
+    touch(tmp_path / "b.jpg")
+    save_session(folder, [Photo(f"{folder}/a.jpg", KEEP, rating=3, label="Green"), Photo(f"{folder}/b.jpg", REJECT)])
+
+    data = json.loads((tmp_path / SESSION_FILENAME).read_text())
+    assert data == {"a.jpg": {"status": KEEP, "rating": 3, "label": "Green"}, "b.jpg": REJECT}
+    photos = {p.name: (p.status, p.rating, p.label) for p in scan_folder(folder)}
+    assert photos == {"a.jpg": (KEEP, 3, "Green"), "b.jpg": (REJECT, 0, None)}
+
+
+def test_invalid_ratings_and_labels_are_dropped(tmp_path):
+    write_session(tmp_path, {"a.jpg": {"status": KEEP, "rating": 9, "label": "Mauve"}, "b.jpg": {"status": "x"}})
+    assert load_session(str(tmp_path)) == {"a.jpg": {"status": KEEP, "rating": 0, "label": None}}
+
+
+def test_sidecar_rating_wins_over_session(tmp_path):
+    touch(tmp_path / "IMG.CR2")
+    (tmp_path / "IMG.xmp").write_text('<rdf:Description xmp:Rating="5" xmp:Label="Blue"/>')
+    write_session(tmp_path, {"IMG.CR2": {"status": KEEP, "rating": 2, "label": None}})
+
+    [photo] = scan_folder(str(tmp_path))
+
+    assert (photo.status, photo.rating, photo.label) == (KEEP, 5, "Blue")

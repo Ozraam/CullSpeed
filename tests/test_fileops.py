@@ -143,3 +143,19 @@ def test_errors_are_collected_and_other_moves_continue(tmp_path):
 
     assert len(result.errors) == 1 and result.errors[0].startswith("gone.jpg")
     assert list(result.moved) == [ok]
+
+
+def test_raw_jpeg_pair_moves_and_renames_together(tmp_path):
+    folder = str(tmp_path)
+    touch(tmp_path / KEEP_DIR / "IMG.JPG")  # only the JPEG name is taken
+    raw = touch(tmp_path / "IMG.CR2")
+    jpg = touch(tmp_path / "IMG.JPG")
+    touch(tmp_path / "IMG.xmp")
+
+    result = process(folder, [Photo(raw, KEEP, companions=[jpg])])
+
+    assert listing(folder, KEEP_DIR) == ["IMG (1).CR2", "IMG (1).JPG", "IMG (1).xmp", "IMG.JPG"]
+    assert result.moved == {
+        raw: os.path.join(folder, KEEP_DIR, "IMG (1).CR2"),
+        jpg: os.path.join(folder, KEEP_DIR, "IMG (1).JPG"),
+    }

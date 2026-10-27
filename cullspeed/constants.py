@@ -38,3 +38,13 @@ COLOR_MUTED = "#9ca3af"
 COLOR_ACCENT = "#3b82f6"
 COLOR_KEEP = "#4ade80"
 COLOR_REJECT = "#f87171"
+COLOR_STAR = "#facc15"
+
+# Lightroom's colour labels (xmp:Label values)
+LABEL_COLORS = {
+    "Red": "#ef4444",
+    "Yellow": "#eab308",
+    "Green": "#22c55e",
+    "Blue": "#3b82f6",
+    "Purple": "#a855f7",
+}
