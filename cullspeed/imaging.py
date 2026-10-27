@@ -144,6 +144,35 @@ def _embedded_preview(raw, max_size):
     return None
 
 
+def image_to_array(image):
+    """QImage -> uint16 array h×w×3 (8-bit images are scaled up to 16 bits)."""
+    image = image.convertToFormat(QImage.Format.Format_RGBX64)
+    width, height = image.width(), image.height()
+    pointer = image.constBits()
+    pointer.setsize(image.sizeInBytes())
+    rows = np.frombuffer(pointer, dtype=np.uint16).reshape(height, image.bytesPerLine() // 2)
+    return rows[:, :width * 4].reshape(height, width, 4)[..., :3].copy()
+
+
+def array_to_image(array):
+    """uint8 h×w×3 (or h×w) array -> QImage that owns its pixels."""
+    return _from_array(array)
+
+
+def resize_array(array, max_size):
+    """uint16 h×w×3 array scaled (smoothly, at 16 bits) to fit `max_size`."""
+    height, width = array.shape[:2]
+    if max(height, width) <= max_size:
+        return array
+    rgbx = np.empty((height, width, 4), dtype=np.uint16)
+    rgbx[..., :3] = array
+    rgbx[..., 3] = 65535
+    data = rgbx.tobytes()
+    image = QImage(data, width, height, width * 8, QImage.Format.Format_RGBX64)
+    scaled = image.scaled(max_size, max_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    return image_to_array(scaled)
+
+
 def _from_array(array):
     array = np.ascontiguousarray(array, dtype=np.uint8)
     height, width = array.shape[:2]

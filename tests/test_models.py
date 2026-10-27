@@ -262,7 +262,32 @@ def test_session_stores_ratings_and_labels(tmp_path):
 
 def test_invalid_ratings_and_labels_are_dropped(tmp_path):
     write_session(tmp_path, {"a.jpg": {"status": KEEP, "rating": 9, "label": "Mauve"}, "b.jpg": {"status": "x"}})
-    assert load_session(str(tmp_path)) == {"a.jpg": {"status": KEEP, "rating": 0, "label": None}}
+    assert load_session(str(tmp_path)) == {"a.jpg": {"status": KEEP, "rating": 0, "label": None, "edit": {}}}
+
+
+def test_session_stores_edits(tmp_path):
+    folder = str(tmp_path)
+    touch(tmp_path / "a.jpg")
+    edit = {"exposure": 0.5, "lut": "Fuji/Velvia 50.png"}
+    save_session(folder, [Photo(f"{folder}/a.jpg", edit=edit)])
+
+    assert json.loads((tmp_path / SESSION_FILENAME).read_text())["a.jpg"]["edit"] == edit
+    [photo] = scan_folder(folder)
+    assert photo.edit == edit
+
+
+def test_edits_are_cleaned_when_loaded(tmp_path):
+    write_session(tmp_path, {"a.jpg": {"status": None, "edit": {"exposure": 99, "contrast": 0, "bogus": 1}}})
+    assert load_session(str(tmp_path))["a.jpg"]["edit"] == {"exposure": 5.0}
+
+
+def test_edit_changes_undo_and_do_not_touch_xmp(model):
+    seen = []
+    model.ratings_changed.connect(seen.append)
+    changes = model.set_field([2], "edit", {"exposure": 1.0})
+    assert model.photo(2).edit == {"exposure": 1.0} and seen == []
+    model.restore(changes)
+    assert model.photo(2).edit == {}
 
 
 def test_sidecar_rating_wins_over_session(tmp_path):

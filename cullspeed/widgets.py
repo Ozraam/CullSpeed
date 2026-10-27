@@ -35,7 +35,7 @@ from .constants import (
     LABEL_COLORS,
     REJECT,
 )
-from .models import LABEL_ROLE, RATING_ROLE, STATUS_ROLE, THUMBNAIL_FAILED_ROLE
+from .models import EDITED_ROLE, LABEL_ROLE, RATING_ROLE, STATUS_ROLE, THUMBNAIL_FAILED_ROLE
 
 STATUS_COLORS = {KEEP: QColor(COLOR_KEEP), REJECT: QColor(COLOR_REJECT)}
 
@@ -158,6 +158,17 @@ class ThumbnailDelegate(QStyledItemDelegate):
             painter.setPen(QPen(QColor(0, 0, 0, 160), 1.5))
             painter.setBrush(QColor(LABEL_COLORS.get(label, COLOR_MUTED)))
             painter.drawEllipse(QPointF(target.left() + radius + 2, target.top() + radius + 2), radius * 0.7, radius * 0.7)
+        if index.data(EDITED_ROLE) and isinstance(pixmap, QPixmap):
+            # Edited: a small "half-tone" disc in the bottom-left corner.
+            centre = QPointF(target.left() + radius + 2, target.bottom() - radius - 2)
+            painter.setPen(QPen(QColor(0, 0, 0, 160), 1.5))
+            painter.setBrush(QColor(COLOR_TEXT))
+            painter.drawEllipse(centre, radius * 0.7, radius * 0.7)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#0b0b0b"))
+            disc = QRectF(0, 0, radius * 1.4, radius * 1.4)
+            disc.moveCenter(centre)
+            painter.drawPie(disc, 90 * 16, 180 * 16)  # left half dark
         rating = index.data(RATING_ROLE) or 0
         if rating:
             font = painter.font()
@@ -652,7 +663,7 @@ class StatsBar(QFrame):
         mod = QKeySequence("Ctrl+1").toString(native)[:-1]  # "⌘" on macOS, "Ctrl+" elsewhere
         hint = QLabel(
             f"P keep · X reject · U unmark · {mod}1–5 stars · {mod}6–9 label · N next unmarked · "
-            f"C compare · Z zoom · I info · G gallery · {undo} undo"
+            f"C compare · E edit · Z zoom · I info · G gallery · {undo} undo"
         )
         hint.setToolTip(hint.text())
         # May be cut off in a narrow window rather than force the window wider.

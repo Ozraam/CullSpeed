@@ -10,6 +10,7 @@ CullSpeed is a PyQt6 desktop application for rapidly reviewing and triaging larg
 - **Star ratings and colour labels**, written to XMP sidecars (`xmp:Rating`, `xmp:Label`) so Lightroom, Bridge, Capture One and darktable see them. Existing sidecars are edited in place, touching only those two properties; new ones are only created for RAWs (`IMG.xmp`).
 - **RAW+JPEG pairs** (same name, same folder) are culled as one photo and always move together.
 - **Shooting info** (exposure, aperture, ISO, focal length, camera, lens, date) read from EXIF; `I` shows or hides it.
+- **Quick edits** (`E`): exposure, contrast, highlights, shadows, white balance (temperature / tint), saturation, film simulation LUTs with strength, grain and vignette. Edits are non-destructive (stored in the session, originals untouched), previewed live, can be copied and pasted across photos, and exported as full-size JPEGs to `_EXPORTS`. RAWs are edited from LibRaw's 16-bit linear development, not from their embedded JPEG.
 - New or removed files are picked up automatically while the folder is open (or with **Refresh**, `⌘R`).
 - Undo for every marking, rating and labelling action.
 - Marks are saved automatically in `cullspeed_session.json` inside each photo folder.
@@ -43,11 +44,19 @@ cullspeed                  # or: python CullSpeed.py, python -m cullspeed
 | Zoom 1:1 / back to fit | `Z` or double-click / `Esc` |
 | Compare (current + next, or the Gallery selection) / leave | `C` / `C` or `Esc` |
 | Show / hide shooting info | `I` |
+| Edit panel | `E` |
+| Copy / paste edit (paste applies to the selection) | `⌘⇧C` / `⌘⇧V` (`Ctrl+Shift+C` / `V`) |
+| Export JPEG (current or selected photos) | `⌘⇧E` / `Ctrl+Shift+E` |
 | Refresh the folder | `⌘R` / `Ctrl+R`, `F5` |
 | Switch Cull ↔ Gallery | `G` (Enter or double-click in the gallery opens a photo) |
 | Open folder | `⌘O` / `Ctrl+O` |
 
 In the Cull view, marking a photo as keep or reject moves on to the next one (in Compare, it stays on the same photos). In the Gallery, marks, stars and labels apply to every selected photo.
+
+## Film simulations
+Film simulations are 3D LUTs, in the same HaldCLUT format RawTherapee uses (`.png` / `.tif`), or `.cube` files. CullSpeed does not ship any: choose a folder of them with **Folder…** in the edit panel (sub-folders become groups). RawTherapee's [film simulation collection](https://rawpedia.rawtherapee.com/Film_Simulation) (CC BY-SA) works as is, and gives the same looks as in RawTherapee. The base development of RAWs (LibRaw) is close to, but not identical with, RawTherapee's own.
+
+Things the first version does not do yet: the 1:1 zoom shows the original (for focus checking), thumbnails show the original, and exported JPEGs carry no EXIF.
 
 ## Sessions
 `cullspeed_session.json` stores marks keyed by path relative to the photo folder (e.g. `_KEEPS/IMG_1.CR2`), so the folder can be moved or renamed without losing decisions. Older sessions keyed by filename are still read. Ratings and labels are stored there too; when a photo has an XMP sidecar, its rating and label are read from the sidecar instead, so changes made in another editor win.
@@ -64,6 +73,10 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `cullspeed/imaging.py` | Thread-safe decoding of RAW and standard images (QImage only) |
 | `cullspeed/exif.py` | Minimal EXIF reader for shooting info |
 | `cullspeed/xmp.py` | Reading and editing ratings and labels in XMP sidecars |
+| `cullspeed/develop.py` | Edit pipeline (numpy): exposure, tone, colour, LUT, grain, vignette |
+| `cullspeed/lut.py` | HaldCLUT / `.cube` loading and fast 256³ lookup tables |
+| `cullspeed/editing.py` | Developing photos for editing, background previews, JPEG export |
+| `cullspeed/editpanel.py` | The edit panel |
 | `cullspeed/fileops.py` | Planning and executing file moves |
 | `cullspeed/widgets.py` | Image and compare views, thumbnail delegate, bars, toast and dialogs |
 | `cullspeed/theme.py` | Dark palette and stylesheet |

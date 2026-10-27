@@ -7,6 +7,7 @@ REJECT = "reject"
 
 KEEP_DIR = "_KEEPS"
 REJECT_DIR = "_REJECTS"
+EXPORT_DIR = "_EXPORTS"
 
 SESSION_FILENAME = "cullspeed_session.json"
 LEGACY_GLOBAL_CONFIG_FILENAME = ".cullspeed_global.json"

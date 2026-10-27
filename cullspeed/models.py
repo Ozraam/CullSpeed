@@ -8,7 +8,7 @@ from itertools import groupby
 
 from PyQt6.QtCore import QAbstractListModel, QModelIndex, QSortFilterProxyModel, Qt, pyqtSignal
 
-from . import xmp
+from . import develop, xmp
 from .constants import KEEP, KEEP_DIR, RAW_EXTENSIONS, REJECT, REJECT_DIR, SESSION_FILENAME, SUPPORTED_EXTENSIONS
 
 STATUS_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -16,8 +16,9 @@ PATH_ROLE = Qt.ItemDataRole.UserRole + 2
 THUMBNAIL_FAILED_ROLE = Qt.ItemDataRole.UserRole + 3
 RATING_ROLE = Qt.ItemDataRole.UserRole + 4
 LABEL_ROLE = Qt.ItemDataRole.UserRole + 5
+EDITED_ROLE = Qt.ItemDataRole.UserRole + 6
 
-_FIELD_ROLES = {"status": STATUS_ROLE, "rating": RATING_ROLE, "label": LABEL_ROLE}
+_FIELD_ROLES = {"status": STATUS_ROLE, "rating": RATING_ROLE, "label": LABEL_ROLE, "edit": EDITED_ROLE}
 
 
 @dataclass
@@ -29,6 +30,9 @@ class Photo:
     label: str | None = None  # colour label, one of xmp.LABELS
     # Same-named files culled with this one: the JPEG of a RAW+JPEG pair.
     companions: list = field(default_factory=list)
+    # Quick edits, as develop.clean() keeps them: {} when not edited. Always
+    # replaced, never changed in place, so undo can keep the previous one.
+    edit: dict = field(default_factory=dict)
 
     @property
     def name(self):
@@ -116,6 +120,7 @@ def scan_folder(folder, fallback_dir=None):
             entry = session.get(photo.name)  # legacy filename-keyed session
         if entry is not None:
             photo.status, photo.rating, photo.label = entry["status"], entry["rating"], entry["label"]
+            photo.edit = entry["edit"]
         # Sidecars are what other editors change, and CullSpeed writes them
         # whenever a rating changes: they are the fresher source.
         if photo.path in from_sidecars:
@@ -146,10 +151,10 @@ def _session_paths(folder, fallback_dir):
 
 
 def _entry(value):
-    """A session value as {"status", "rating", "label"}, or None if it is not valid.
+    """A session value as {"status", "rating", "label", "edit"}, or None if it is not valid.
 
-    Values are a bare status (older sessions, and photos without rating or
-    label) or a dict with the three fields.
+    Values are a bare status (older sessions, and photos without rating,
+    label or edit) or a dict with those fields.
     """
     if not isinstance(value, dict):
         value = {"status": value}
@@ -162,7 +167,7 @@ def _entry(value):
         rating = 0
     if label not in xmp.LABELS:
         label = None
-    return {"status": status, "rating": rating, "label": label}
+    return {"status": status, "rating": rating, "label": label, "edit": develop.clean(value.get("edit"))}
 
 
 def load_session(folder, fallback_dir=None):
@@ -194,9 +199,12 @@ def _write_json(path, data):
 
 
 def _session_value(photo):
-    if not photo.rating and photo.label is None:
+    if not photo.rating and photo.label is None and not photo.edit:
         return photo.status  # same as older sessions
-    return {"status": photo.status, "rating": photo.rating, "label": photo.label}
+    value = {"status": photo.status, "rating": photo.rating, "label": photo.label}
+    if photo.edit:
+        value["edit"] = photo.edit
+    return value
 
 
 def save_session(folder, photos, fallback_dir=None):
@@ -225,7 +233,7 @@ def save_session(folder, photos, fallback_dir=None):
 class PhotoModel(QAbstractListModel):
     """Shared by the filmstrip and the gallery."""
 
-    statuses_changed = pyqtSignal(list)  # rows whose status, rating or label changed
+    statuses_changed = pyqtSignal(list)  # rows whose status, rating, label or edit changed
     ratings_changed = pyqtSignal(list)  # paths whose rating or label changed
 
     def __init__(self, loader, parent=None):
@@ -261,6 +269,8 @@ class PhotoModel(QAbstractListModel):
             return photo.rating
         if role == LABEL_ROLE:
             return photo.label
+        if role == EDITED_ROLE:
+            return bool(photo.edit)
         return None
 
     @property
@@ -284,7 +294,7 @@ class PhotoModel(QAbstractListModel):
         self.statuses_changed.emit(list(range(len(photos))))
 
     def set_field(self, rows, name, value):
-        """Set `name` ("status", "rating" or "label") on `rows`; returns undo changes."""
+        """Set `name` ("status", "rating", "label" or "edit") on `rows`; returns undo changes."""
         changes = []
         for row in rows:
             photo = self._photos[row]
@@ -357,7 +367,7 @@ class PhotoModel(QAbstractListModel):
                 run = [row for _, row in run]
                 self.dataChanged.emit(self.index(run[0]), self.index(run[-1]), [_FIELD_ROLES[name]])
         self.statuses_changed.emit(sorted({self.row_of(path) for path, _, _ in changes}))
-        rated = [path for path, name, _ in changes if name != "status"]
+        rated = [path for path, name, _ in changes if name in ("rating", "label")]
         if rated:
             self.ratings_changed.emit(list(dict.fromkeys(rated)))
 

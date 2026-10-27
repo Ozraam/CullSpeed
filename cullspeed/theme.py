@@ -63,6 +63,21 @@ QScrollBar::handle {{ background: #3a3a3a; border-radius: 4px; min-width: 30px; 
 QScrollBar::handle:hover {{ background: #4a4a4a; }}
 QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {{ width: 0; height: 0; background: none; }}
 
+#EditPanel, #EditPanelContent, #EditPanelFooter {{ background: {COLOR_PANEL}; }}
+#EditPanelFooter {{ border-top: 1px solid {COLOR_BORDER}; }}
+#EditPanel {{ border-left: 1px solid {COLOR_BORDER}; }}
+#SectionTitle {{ color: {COLOR_MUTED}; font-size: 11px; font-weight: bold; letter-spacing: 1px; }}
+QSlider::groove:horizontal {{ height: 4px; background: {COLOR_BORDER}; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: #4b5563; border-radius: 2px; }}
+QSlider::handle:horizontal {{
+    width: 12px; height: 12px; margin: -5px 0; border-radius: 6px; background: {COLOR_TEXT};
+}}
+QSlider::handle:horizontal:hover {{ background: #ffffff; }}
+QComboBox {{
+    background: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; border-radius: 5px; padding: 4px 8px;
+}}
+QComboBox QAbstractItemView {{ background: {COLOR_CARD}; selection-background-color: {COLOR_ACCENT}; }}
+
 QPlainTextEdit {{ background: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; border-radius: 4px; }}
 QProgressBar {{ background: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; border-radius: 4px; text-align: center; }}
 QProgressBar::chunk {{ background: {COLOR_ACCENT}; border-radius: 3px; }}

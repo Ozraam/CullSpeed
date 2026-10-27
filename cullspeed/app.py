@@ -18,6 +18,7 @@ from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
+    QHBoxLayout,
     QMainWindow,
     QProgressDialog,
     QStackedWidget,
@@ -26,8 +27,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import xmp
+from . import lut, xmp
 from .constants import (
+    EXPORT_DIR,
     KEEP,
     KEEP_DIR,
     LEGACY_GLOBAL_CONFIG_FILENAME,
@@ -38,6 +40,8 @@ from .constants import (
     SESSION_FILENAME,
     UNDO_LIMIT,
 )
+from .editing import EditRenderer, export_photo
+from .editpanel import EditPanel
 from .exif import summary
 from .fileops import execute_moves, plan_moves
 from .loader import ImageLoader
@@ -82,6 +86,35 @@ class MoveThread(QThread):
         self.result = execute_moves(self.moves, progress)
 
 
+class ExportThread(QThread):
+    """Renders edited photos to JPEG off the GUI thread."""
+
+    progressed = pyqtSignal(int)
+
+    def __init__(self, jobs, dest_dir, parent=None):
+        super().__init__(parent)
+        self.jobs = jobs  # [(path, edit, LUT path)]
+        self.dest_dir = dest_dir
+        self.exported = []
+        self.errors = []
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        tables = {}
+        for done, (path, edit, lut_path) in enumerate(self.jobs):
+            if self._stop.is_set():
+                break
+            self.progressed.emit(done)
+            try:
+                self.exported.append(export_photo(path, edit, lut_path, self.dest_dir, tables))
+            except Exception as exc:  # one bad photo must not stop the others
+                self.errors.append(f"{os.path.basename(path)}: {exc}")
+        self.progressed.emit(len(self.jobs))
+
+
 class CullSpeedApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -100,6 +133,10 @@ class CullSpeedApp(QMainWindow):
         self.folder = ""
         self.current_row = -1
         self.compare_rows = []  # rows shown side by side; empty outside Compare
+        self.live_edit = None  # (path, edit) while a slider is being dragged, before it is kept
+        self.edit_clipboard = None
+        self.lut_folder = self.settings.value("lut_folder", "")
+        self.luts = {}  # LUT id -> path, from lut_folder
         self.show_info = self.settings.value("show_info", True, type=bool)
         self.undo_stack = []
         self.moving = False
@@ -109,6 +146,10 @@ class CullSpeedApp(QMainWindow):
         self.loader.preview_failed.connect(lambda path, _error: self._on_image_ready(path))
         self.loader.full_loaded.connect(self._on_image_ready)
         self.loader.full_failed.connect(self._on_full_failed)
+
+        self.editor = EditRenderer(self)
+        self.editor.rendered.connect(self._on_image_ready)
+        self.editor.failed.connect(self._on_edit_failed)
 
         self.model = PhotoModel(self.loader, self)
         self.model.statuses_changed.connect(self._on_statuses_changed)
@@ -131,6 +172,7 @@ class CullSpeedApp(QMainWindow):
 
         self._build_ui()
         self._build_shortcuts()
+        self._load_luts(quiet=True)
         self._restore_window()
         QTimer.singleShot(0, self._restore_last_folder)
 
@@ -160,11 +202,26 @@ class CullSpeedApp(QMainWindow):
         self.filmstrip.setFixedHeight(FILMSTRIP_THUMB_SIZE + ThumbnailDelegate.PADDING * 2 + 16)
         self.filmstrip.clicked.connect(lambda index: self.go_to(index.row()))
 
+        self.edit_panel = EditPanel()
+        self.edit_panel.changed.connect(self._on_edit_changed)
+        self.edit_panel.copy_requested.connect(self.copy_edit)
+        self.edit_panel.paste_requested.connect(self.paste_edit)
+        self.edit_panel.reset_requested.connect(self.reset_edit)
+        self.edit_panel.export_requested.connect(self.export_photos)
+        self.edit_panel.lut_folder_requested.connect(self.choose_lut_folder)
+        self.edit_panel.setVisible(self.settings.value("edit_panel", False, type=bool))
+
+        viewer = QHBoxLayout()
+        viewer.setContentsMargins(0, 0, 0, 0)
+        viewer.setSpacing(0)
+        viewer.addWidget(self.cull_stack, 1)
+        viewer.addWidget(self.edit_panel)
+
         cull_page = QWidget()
         cull_layout = QVBoxLayout(cull_page)
         cull_layout.setContentsMargins(0, 0, 0, 0)
         cull_layout.setSpacing(0)
-        cull_layout.addWidget(self.cull_stack, 1)
+        cull_layout.addLayout(viewer, 1)
         cull_layout.addWidget(self.filmstrip)
 
         # Gallery tab: filter chips + grid
@@ -229,6 +286,10 @@ class CullSpeedApp(QMainWindow):
         bind(["G"], self.toggle_tab)
         bind(["C"], self.toggle_compare)
         bind(["I"], self.toggle_info)
+        bind(["E"], self.toggle_edit_panel)
+        bind(["Ctrl+Shift+C"], self.copy_edit)
+        bind(["Ctrl+Shift+V"], self.paste_edit)
+        bind(["Ctrl+Shift+E"], self.export_photos)
 
         # In the gallery the arrow keys move through the grid instead.
         bind(["Up"], lambda: self.mark(KEEP), cull_only=True)
@@ -264,8 +325,10 @@ class CullSpeedApp(QMainWindow):
             inform(self, "Cannot open folder", escape(f"{folder}: {exc}"))
             return
 
+        self.live_edit = None
         if not (keep_state and folder == self.folder):
             self.loader.reset()
+            self.editor.reset()
             self.session_warning = None
             self.xmp_warned = False
             self.undo_stack.clear()
@@ -398,6 +461,8 @@ class CullSpeedApp(QMainWindow):
         nearby = [*range(row + 1, row + 1 + PREFETCH_AHEAD), *range(row - 1, row - 1 - PREFETCH_BEHIND, -1)]
         others = [r for r in self._shown_rows() if r != row] + [r for r in nearby if 0 <= r < count]
         self.loader.ensure_previews(photo.path, [self.model.photo(r).path for r in dict.fromkeys(others)])
+        self.live_edit = None
+        self.edit_panel.set_edit(photo.edit)
         self._refresh_view()
 
     def step(self, delta):
@@ -447,7 +512,9 @@ class CullSpeedApp(QMainWindow):
 
     def _show_in(self, view, row, zoomed):
         photo = self.model.photo(row)
-        pixmap = self.loader.preview(photo.path)
+        pixmap = self._edited_pixmap(photo)
+        if pixmap is None:
+            pixmap = self.loader.preview(photo.path)
         if pixmap is not None:
             view.set_image(pixmap, native_size=self.loader.native_size(photo.path), keep_zoom=True)
         else:
@@ -464,12 +531,27 @@ class CullSpeedApp(QMainWindow):
             else:
                 view.set_full_loading(self.loader.full_error(photo.path) is None)
 
+    def _edited_pixmap(self, photo):
+        """The render of the photo's edit (or of the one being dragged), if it has one."""
+        live = self.live_edit is not None and self.live_edit[0] == photo.path
+        edit = self.live_edit[1] if live else photo.edit
+        if not edit:
+            return None
+        return self.editor.pixmap(photo.path, edit, self._lut_path(edit), quick=live)
+
+    def _lut_path(self, edit):
+        return self.luts.get(edit.get("lut")) if edit.get("lut") else None
+
     def _is_shown(self, path):
         return any(self.model.photo(row).path == path for row in self._shown_rows())
 
     def _on_image_ready(self, path):
         if self._is_shown(path):
             self._refresh_view()
+
+    def _on_edit_failed(self, path, error):
+        if self._is_shown(path):
+            self.toast.show_message(f"Could not render the edit: {error}", 4000)
 
     def _on_full_failed(self, path, error):
         if self._is_shown(path):
@@ -497,6 +579,109 @@ class CullSpeedApp(QMainWindow):
         self.show_info = not self.show_info
         self.settings.setValue("show_info", self.show_info)
         self._refresh_view()
+
+    # -- editing -----------------------------------------------------------
+
+    def toggle_edit_panel(self):
+        visible = not self.edit_panel.isVisible()
+        self.edit_panel.setVisible(visible)
+        self.settings.setValue("edit_panel", visible)
+        if visible:
+            self.tabs.setCurrentIndex(CULL_TAB)
+            if self.current_row >= 0:
+                self.edit_panel.set_edit(self.model.photo(self.current_row).edit)
+        self.live_edit = None
+        self._refresh_view()
+
+    def _on_edit_changed(self, edit, final):
+        if self.current_row < 0:
+            return
+        photo = self.model.photo(self.current_row)
+        if final:
+            self.live_edit = None
+            self._set_edit([self.current_row], edit)
+        else:
+            self.live_edit = (photo.path, edit)
+        self._refresh_view()
+
+    def _set_edit(self, rows, edit):
+        self._push_undo(self.model.set_field(rows, "edit", dict(edit)))
+        if not edit:
+            for row in rows:
+                self.editor.forget(self.model.photo(row).path)
+
+    def copy_edit(self):
+        if self.current_row >= 0:
+            self.edit_clipboard = dict(self.model.photo(self.current_row).edit)
+            self.toast.show_message("Edit copied" if self.edit_clipboard else "Copied: no edit")
+
+    def paste_edit(self):
+        rows = self._target_rows()
+        if self.edit_clipboard is None:
+            self.toast.show_message("Nothing to paste: copy an edit first")
+        elif rows:
+            self._set_edit(rows, self.edit_clipboard)
+            self.toast.show_message(f"Edit pasted on {len(rows)} photo(s)")
+
+    def reset_edit(self):
+        rows = self._target_rows()
+        if rows:
+            self._set_edit(rows, {})
+
+    def choose_lut_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Folder of film simulation LUTs (HaldCLUT .png, .cube)", self.lut_folder or os.path.expanduser("~")
+        )
+        if folder:
+            self.lut_folder = folder
+            self.settings.setValue("lut_folder", folder)
+            self._load_luts()
+
+    def _load_luts(self, quiet=False):
+        try:
+            self.luts = lut.scan(self.lut_folder) if self.lut_folder and os.path.isdir(self.lut_folder) else {}
+        except OSError:
+            self.luts = {}
+        self.edit_panel.set_luts([(lut_id, lut.display_name(lut_id)) for lut_id in self.luts])
+        if not quiet:
+            self.toast.show_message(f"{len(self.luts)} film simulation(s) found")
+        self._refresh_view()
+
+    def export_photos(self):
+        """Export the target photos, with their edits, as full-size JPEGs in _EXPORTS."""
+        rows = self._target_rows()
+        if not rows or self.moving:
+            return
+        self.save_session()
+        jobs = [(p.path, p.edit, self._lut_path(p.edit)) for p in (self.model.photo(row) for row in rows)]
+        dest = os.path.join(self.folder, EXPORT_DIR)
+
+        progress = QProgressDialog("Exporting…", "Stop", 0, len(jobs), self)
+        progress.setWindowTitle("Export JPEG")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        thread = ExportThread(jobs, dest, self)
+        thread.progressed.connect(progress.setValue)
+        progress.canceled.connect(thread.stop)
+        loop = QEventLoop()
+        thread.finished.connect(loop.quit)
+        self.moving = True  # same guard as moving files: no folder change meanwhile
+        thread.start()
+        loop.exec()
+        self.moving = False
+        progress.close()
+        thread.deleteLater()
+
+        if thread.errors:
+            inform(
+                self,
+                "Some photos were not exported",
+                f"Exported {len(thread.exported)} of {len(jobs)} photo(s) to {EXPORT_DIR}. These failed:",
+                details=thread.errors,
+            )
+        else:
+            self.toast.show_message(f"Exported {len(thread.exported)} photo(s) to {EXPORT_DIR}")
 
     # -- compare -----------------------------------------------------------
 
@@ -608,6 +793,8 @@ class CullSpeedApp(QMainWindow):
         self.stats.update_counts(keeps, rejects, unmarked)
         self.gallery_toolbar.update_counts(self.model.rowCount(), keeps, rejects, unmarked)
         self.header.set_can_process(bool(self.folder) and self.model.has_unsorted())
+        if self.current_row in rows and self.live_edit is None:
+            self.edit_panel.set_edit(self.model.photo(self.current_row).edit)  # undo, paste, reset…
         if set(rows) & set(self._shown_rows()):
             self._refresh_view()
         self.session_timer.start()
@@ -702,6 +889,7 @@ class CullSpeedApp(QMainWindow):
         locations = {path: move.status for move in moves for path in (move.src, *move.companions)}
         self.model.apply_moves({old: (new, locations[old]) for old, new in result.moved.items()})
         self.loader.rename_paths(result.moved)
+        self.editor.rename_paths(result.moved)
         self.undo_stack.clear()  # undo entries refer to the old paths
         self.save_session()
         self._on_statuses_changed([])
@@ -738,6 +926,7 @@ class CullSpeedApp(QMainWindow):
         if self.current_row >= 0:
             self.settings.setValue("last_file", relative_key(self.folder, self.model.photo(self.current_row).path))
         self.loader.shutdown()
+        self.editor.shutdown()
         super().closeEvent(event)
 
     def resizeEvent(self, event):

@@ -18,5 +18,6 @@ def main():
 
     window = CullSpeedApp()
     app.aboutToQuit.connect(window.loader.shutdown)
+    app.aboutToQuit.connect(window.editor.shutdown)
     window.show()
     return app.exec()
