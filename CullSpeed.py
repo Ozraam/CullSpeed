@@ -1,17 +1,6 @@
 import sys
 
-from PyQt6.QtWidgets import QApplication
-
-from cullspeed.app import CullSpeedApp
-
-
-def main():
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    window = CullSpeedApp()
-    window.show()
-    sys.exit(app.exec())
-
+from cullspeed.main import main
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

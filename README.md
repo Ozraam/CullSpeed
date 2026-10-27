@@ -1,52 +1,60 @@
 # CullSpeed
 
-CullSpeed is a PyQt6 desktop application for rapidly reviewing and triaging large photo shoots. It focuses on fast thumbnail loading (including embedded RAW previews), streamlined keyboard navigation, and one-click sorting of files into keep/reject folders.
+CullSpeed is a PyQt6 desktop application for rapidly reviewing and triaging large photo shoots. It focuses on fast image loading (embedded RAW previews, background decoding and prefetching), keyboard-driven marking, and one-click sorting of files into keep/reject folders.
 
 ## Features
-- Supports JPEG, PNG, WebP, and common RAW formats (ARW, CR2, NEF, DNG, ORF, RAF, RW2) via `rawpy`.
-- Dual workflow views: **Cull** view for single-image focus with filmstrip, and **Gallery** grid view with multi-select editing.
-- Non-destructive marking system that persists between sessions via `cullspeed_session.json` per folder and a global `.cullspeed_global.json` for last session recall.
-- Batch processing that moves images into `_KEEPS` or `_REJECTS` folders (or back to the root) according to their marks.
-- Keyboard-driven workflow with fast keeps/rejects, navigation, and bulk updates.
+- Supports JPEG, PNG, WebP, TIFF, HEIC (when Qt has a plugin for it) and common RAW formats (ARW, CR2, CR3, NEF, DNG, ORF, RAF, RW2) via `rawpy`.
+- **Cull** view: the current photo fitted to the window with a filmstrip; next/previous photos are prefetched so stepping through is instant. Double-click or `Z` zooms to 1:1 (the photo is loaded at full resolution for focus checking), drag to pan.
+- **Gallery** view: thumbnail grid with multi-select marking, filters (All / Unmarked / Keeps / Rejects) and adjustable thumbnail size.
+- Undo for every marking action.
+- Marks are saved automatically in `cullspeed_session.json` inside each photo folder.
+- **Process Files** moves photos into `_KEEPS` / `_REJECTS` (or back to the root when unmarked). XMP sidecars move with their photo, and existing files are never overwritten (`IMG_1 (1).jpg` instead).
+- Reopens the last folder and photo on launch. Drop a folder onto the window to open it.
 
 ## Requirements
-- Python 3.10+ (PyQt6 wheels require a modern Python release).
-- System packages required by `rawpy`/LibRaw (install via your distribution if missing).
-- Python dependencies from `requirements.txt`:
-  - PyQt6
-  - rawpy
-  - imageio
+- Python 3.10+
+- Dependencies from `requirements.txt`: PyQt6 (6.9+), rawpy, numpy
 
 ## Quick Start
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python CullSpeed.py
+python CullSpeed.py        # or: python -m cullspeed
 ```
 
-## Using CullSpeed
-1. Launch the app and click **Open Folder** to choose a directory of photos. The current selection is saved so reopening is instant.
-2. Browse images in the Cull or Gallery tabs. Thumbnails are generated on demand using embedded RAW previews when available.
-3. Use marks to flag photos as keep, reject, or unmarked. Marks are saved automatically.
-4. Click **Process Files** when ready. The app will summarize the planned moves and, once confirmed, create `_KEEPS` and `_REJECTS` subfolders (if needed) and move files accordingly.
-
-### Keyboard Shortcuts
+## Keyboard Shortcuts
 | Action | Keys |
 | --- | --- |
-| Keep current / selected | `P`, `1`, or `↑` |
-| Reject current / selected | `X`, `3`, or `↓` |
+| Keep current / selected | `P`, `1`, or `↑` (Cull view) |
+| Reject current / selected | `X`, `3`, or `↓` (Cull view) |
 | Unmark | `U`, `2`, or `Backspace` |
-| Next image | `L` or `→` |
-| Previous image | `H` or `←` |
+| Undo | `⌘Z` / `Ctrl+Z` |
+| Next / previous photo | `→` `L` `Space` / `←` `H` |
+| First / last photo | `Home` / `End` |
+| Next unmarked photo | `N` |
+| Zoom 1:1 / back to fit | `Z` or double-click / `Esc` |
+| Switch Cull ↔ Gallery | `G` (Enter or double-click in the gallery opens a photo) |
+| Open folder | `⌘O` / `Ctrl+O` |
 
-## Sessions and Global Config
-- `cullspeed_session.json` lives inside each photo folder and stores marks keyed by filename so you can move the folder without losing decisions.
-- `.cullspeed_global.json` sits in your home directory and remembers the last opened folder/file so the app can reopen automatically.
+In the Cull view, marking a photo as keep or reject moves on to the next one. In the Gallery, marks apply to every selected photo.
+
+## Sessions
+`cullspeed_session.json` stores marks keyed by path relative to the photo folder (e.g. `_KEEPS/IMG_1.CR2`), so the folder can be moved or renamed without losing decisions. Older sessions keyed by filename are still read.
+
+## Code Layout
+| Module | Role |
+| --- | --- |
+| `cullspeed/main.py` | Application entry point |
+| `cullspeed/app.py` | Main window: navigation, marking, processing |
+| `cullspeed/models.py` | Photo list model, gallery filter, folder scan and session file |
+| `cullspeed/loader.py` | Background preview/thumbnail loading, caching and prefetching |
+| `cullspeed/imaging.py` | Thread-safe decoding of RAW and standard images (QImage only) |
+| `cullspeed/fileops.py` | Planning and executing file moves |
+| `cullspeed/widgets.py` | Image view, thumbnail delegate, bars, toast and dialogs |
+| `cullspeed/theme.py` | Dark palette and stylesheet |
 
 ## Development Notes
-- The UI logic resides in `CullSpeed.py`. No additional build step is required—run the script directly.
-- When modifying keyboard shortcuts or UI themes, keep platform consistency in mind (PyQt6 ships with Fusion style by default here).
-- Consider running the app with `python -X faulthandler CullSpeed.py` while debugging any native crashes related to LibRaw/Qt.
-
-Happy culling!
+- Worker threads only produce `QImage`; `QPixmap` is created on the GUI thread.
+- The app uses its own `QDialog`s instead of `QMessageBox`: with Qt 6.11 on recent macOS, `QMessageBox`'s native `NSAlert` crashes AppKit (`trace trap`).
+- `faulthandler` is enabled at startup, so native crashes print a Python traceback.

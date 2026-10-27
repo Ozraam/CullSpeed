@@ -1,577 +1,474 @@
 import json
 import os
-import shutil
+from html import escape
 
-from PyQt6.QtCore import Qt, QThreadPool, QTimer
-from PyQt6.QtGui import QColor, QPalette, QIcon, QKeySequence, QShortcut
+from PyQt6.QtCore import QItemSelectionModel, QSettings, Qt, QTimer
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QFileDialog,
-    QLabel,
-    QListWidgetItem,
     QMainWindow,
-    QMessageBox,
+    QProgressDialog,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from .constants import GLOBAL_CONFIG_FILENAME, SESSION_FILENAME, SUPPORTED_EXTENSIONS
-from .workers import ImageLoaderThread, ThumbnailWorker
-from .widgets import HeaderBar, StatsBar, CullView, GalleryView
+from .constants import (
+    KEEP,
+    LEGACY_GLOBAL_CONFIG_FILENAME,
+    PREFETCH_AHEAD,
+    PREFETCH_BEHIND,
+    REJECT,
+    UNDO_LIMIT,
+)
+from .fileops import execute_moves, plan_moves
+from .loader import ImageLoader
+from .models import PhotoModel, StatusFilterProxy, save_session, scan_folder
+from .widgets import (
+    GalleryToolbar,
+    HeaderBar,
+    ImageView,
+    StatsBar,
+    ThumbnailDelegate,
+    Toast,
+    ask,
+    inform,
+    make_thumbnail_view,
+)
+
+CULL_TAB, GALLERY_TAB = 0, 1
+FILMSTRIP_THUMB_SIZE = 64
 
 
 class CullSpeedApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.setWindowTitle("CullSpeed")
+        self.setMinimumSize(900, 600)
+        self.setAcceptDrops(True)
 
-        self.setWindowTitle("CullSpeed Desktop")
-        self.resize(1400, 900)
-        self.setMinimumSize(800, 600)
+        self.settings = QSettings()
+        self.folder = ""
+        self.current_row = -1
+        self.undo_stack = []
 
-        self.folder_path = ""
-        self.files = []
-        self.current_index = -1
-        self.marks = {}
-        self.loader_thread = None
-        self.current_pixmap = None
+        self.loader = ImageLoader(self)
+        self.loader.preview_loaded.connect(self._on_preview_ready)
+        self.loader.preview_failed.connect(lambda path, _error: self._on_preview_ready(path))
+        self.loader.full_loaded.connect(self._on_full_ready)
+        self.loader.full_failed.connect(self._on_full_failed)
 
-        self.thread_pool = QThreadPool()
-        self.thread_pool.setMaxThreadCount(4)
+        self.model = PhotoModel(self.loader, self)
+        self.model.statuses_changed.connect(self._on_statuses_changed)
+        self.proxy = StatusFilterProxy(self)
+        self.proxy.setSourceModel(self.model)
 
-        self.thumbnail_queue = []
-        self.thumbnail_timer = QTimer()
-        self.thumbnail_timer.timeout.connect(self.process_thumbnail_batch)
-        self.thumbnail_timer.setInterval(30)
+        self.session_timer = QTimer(self)
+        self.session_timer.setSingleShot(True)
+        self.session_timer.setInterval(400)
+        self.session_timer.timeout.connect(self.save_session)
 
-        self.init_ui()
-        self.apply_dark_theme()
+        self._build_ui()
+        self._build_shortcuts()
+        self._restore_window()
+        QTimer.singleShot(0, self._restore_last_folder)
 
-        self.update_ui_state()
+    # -- UI ----------------------------------------------------------------
 
-        QTimer.singleShot(10, self.load_global_state)
+    def _build_ui(self):
+        self.header = HeaderBar()
+        self.header.open_folder_requested.connect(self.choose_folder)
+        self.header.process_requested.connect(self.process_files)
 
-    def init_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        # Cull tab: large image + filmstrip
+        self.image_view = ImageView()
+        self.image_view.zoom_changed.connect(self._on_zoom_changed)
+        self.image_view.set_image(None, "Open a folder of photos to start\n(or drop one onto this window)")
+        self.filmstrip = make_thumbnail_view(
+            self.model, ThumbnailDelegate(FILMSTRIP_THUMB_SIZE, show_names=False, parent=self), horizontal=True
+        )
+        self.filmstrip.setObjectName("Filmstrip")
+        self.filmstrip.setFixedHeight(FILMSTRIP_THUMB_SIZE + ThumbnailDelegate.PADDING * 2 + 16)
+        self.filmstrip.clicked.connect(lambda index: self.go_to(index.row()))
 
-        self.header_bar = HeaderBar()
-        self.header_bar.open_folder_requested.connect(self.open_folder)
-        self.header_bar.process_requested.connect(self.process_files)
-        main_layout.addWidget(self.header_bar)
+        cull_page = QWidget()
+        cull_layout = QVBoxLayout(cull_page)
+        cull_layout.setContentsMargins(0, 0, 0, 0)
+        cull_layout.setSpacing(0)
+        cull_layout.addWidget(self.image_view, 1)
+        cull_layout.addWidget(self.filmstrip)
+
+        # Gallery tab: filter chips + grid
+        grid_size = int(self.settings.value("grid_thumb_size", 150))
+        self.gallery_toolbar = GalleryToolbar(grid_size)
+        self.gallery_toolbar.filter_changed.connect(self.proxy.set_filter)
+        self.gallery_toolbar.size_changed.connect(self._on_grid_size_changed)
+        self.grid_delegate = ThumbnailDelegate(grid_size, show_names=True, parent=self)
+        self.grid = make_thumbnail_view(self.proxy, self.grid_delegate, horizontal=False)
+        self.grid.clicked.connect(self._on_grid_clicked)
+        self.grid.activated.connect(self._on_grid_activated)  # double-click / Enter
+
+        gallery_page = QWidget()
+        gallery_layout = QVBoxLayout(gallery_page)
+        gallery_layout.setContentsMargins(0, 0, 0, 0)
+        gallery_layout.setSpacing(0)
+        gallery_layout.addWidget(self.gallery_toolbar)
+        gallery_layout.addWidget(self.grid, 1)
 
         self.tabs = QTabWidget()
-        self.tabs.setStyleSheet(
-            """
-            QTabWidget::pane { border: none; }
-            QTabBar::tab { background: #222; color: #888; padding: 8px 20px; border-top-left-radius: 4px; border-top-right-radius: 4px; }
-            QTabBar::tab:selected { background: #333; color: white; font-weight: bold; border-bottom: 2px solid #2563eb; }
-            """
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabBar().setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.tabs.addTab(cull_page, "Cull")
+        self.tabs.addTab(gallery_page, "Gallery")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        self.stats = StatsBar()
+
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.header)
+        layout.addWidget(self.tabs, 1)
+        layout.addWidget(self.stats)
+        self.setCentralWidget(central)
+
+        self.toast = Toast(central)
+
+    def _build_shortcuts(self):
+        self.cull_shortcuts = []
+
+        def bind(keys, slot, cull_only=False):
+            for key in keys:
+                shortcut = QShortcut(QKeySequence(key), self)
+                shortcut.activated.connect(slot)
+                if cull_only:
+                    self.cull_shortcuts.append(shortcut)
+
+        bind(["P", "1"], lambda: self.mark(KEEP))
+        bind(["X", "3"], lambda: self.mark(REJECT))
+        bind(["U", "2", "Backspace"], lambda: self.mark(None))
+        bind([QKeySequence.StandardKey.Undo], self.undo)
+        bind([QKeySequence.StandardKey.Open], self.choose_folder)
+        bind(["G"], self.toggle_tab)
+
+        # In the gallery the arrow keys move through the grid instead.
+        bind(["Up"], lambda: self.mark(KEEP), cull_only=True)
+        bind(["Down"], lambda: self.mark(REJECT), cull_only=True)
+        bind(["Right", "L", "Space"], lambda: self.go_to(self.current_row + 1), cull_only=True)
+        bind(["Left", "H"], lambda: self.go_to(self.current_row - 1), cull_only=True)
+        bind(["Home"], lambda: self.go_to(0), cull_only=True)
+        bind(["End"], lambda: self.go_to(self.model.rowCount() - 1), cull_only=True)
+        bind(["N"], self.next_unmarked, cull_only=True)
+        bind(["Z"], self.image_view.toggle_zoom, cull_only=True)
+        bind(["Escape"], self.image_view.reset_zoom, cull_only=True)
+
+    # -- folder ------------------------------------------------------------
+
+    def choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select a photo folder", self.folder or os.path.expanduser("~")
         )
+        if folder:
+            self.load_folder(folder)
 
-        self.cull_view = CullView()
-        self.gallery_view = GalleryView()
-        self.cull_view.filmstrip_clicked.connect(self.on_filmstrip_index_selected)
-        self.gallery_view.item_clicked.connect(self.on_gallery_index_selected)
-        self.gallery_view.item_double_clicked.connect(self.on_gallery_index_double_clicked)
+    def load_folder(self, folder, select_name=None):
+        self.save_session()
+        try:
+            photos = scan_folder(folder)
+        except OSError as exc:
+            inform(self, "Cannot open folder", escape(f"{folder}: {exc}"))
+            return
 
-        self.tabs.addTab(self.cull_view, "Cull (Focus)")
-        self.tabs.addTab(self.gallery_view, "Gallery (Grid)")
-        self.tabs.currentChanged.connect(self.on_tab_changed)
-        main_layout.addWidget(self.tabs)
+        self.loader.reset()
+        self.folder = folder
+        self.undo_stack.clear()
+        self.current_row = -1
+        self.model.set_photos(photos)
+        self.settings.setValue("last_folder", folder)
+        self.header.set_folder(folder)
 
-        self.image_container = self.cull_view.image_container
-        self.lbl_image = self.cull_view.lbl_image
-        self.lbl_overlay = self.cull_view.lbl_overlay
-        self.filmstrip = self.cull_view.filmstrip
-        self.grid_view = self.gallery_view.grid_view
+        if not photos:
+            self.image_view.set_image(None, "No photos in this folder")
+            self.header.set_counter("")
+            return
 
-        self.setup_shortcuts()
+        names = [photo.name for photo in photos]
+        self.go_to(names.index(select_name) if select_name in names else 0)
 
-        self.stats_bar = StatsBar()
-        main_layout.addWidget(self.stats_bar)
+    def _restore_last_folder(self):
+        folder = self.settings.value("last_folder", "")
+        last_file = self.settings.value("last_file", "")
+        if not folder:
+            folder, last_file = self._legacy_global_state()
+        if folder and os.path.isdir(folder):
+            self.load_folder(folder, select_name=last_file)
 
-        self.statusTip = QLabel("Shortcuts: [P] Keep | [X] Reject | [U] Unmark | [H / L] Nav", self)
-        self.statusTip.setStyleSheet("background: rgba(0,0,0,0.5); color: white; padding: 5px; font-family: monospace;")
-        self.statusTip.setGeometry(10, 100, 400, 30)
-
-    def setup_shortcuts(self):
-        for key in [Qt.Key.Key_1, Qt.Key.Key_P]:
-            QShortcut(QKeySequence(key), self).activated.connect(lambda: self.mark_current('keep'))
-
-        for key in [Qt.Key.Key_3, Qt.Key.Key_X]:
-            QShortcut(QKeySequence(key), self).activated.connect(lambda: self.mark_current('reject'))
-
-        for key in [Qt.Key.Key_Backspace, Qt.Key.Key_2, Qt.Key.Key_U]:
-            QShortcut(QKeySequence(key), self).activated.connect(lambda: self.mark_current(None))
-
-    def apply_dark_theme(self):
-        palette = QPalette()
-        palette.setColor(QPalette.ColorRole.Window, QColor(20, 20, 20))
-        palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
-        self.setPalette(palette)
-
-    def get_session_file(self):
-        return os.path.join(self.folder_path, SESSION_FILENAME)
+    @staticmethod
+    def _legacy_global_state():
+        """Last folder from the pre-QSettings `~/.cullspeed_global.json`."""
+        try:
+            with open(os.path.join(os.path.expanduser("~"), LEGACY_GLOBAL_CONFIG_FILENAME)) as file:
+                config = json.load(file)
+            return config.get("last_folder") or "", config.get("last_file") or ""
+        except (OSError, ValueError, AttributeError):
+            return "", ""
 
     def save_session(self):
-        if not self.folder_path:
+        self.session_timer.stop()
+        if not self.folder or not self.model.photos:
             return
-        data = {}
-        for path, status in self.marks.items():
-            data[os.path.basename(path)] = status
-
         try:
-            with open(self.get_session_file(), 'w') as file:
-                json.dump(data, file, indent=2)
-        except Exception as exc:
-            print(f"Failed to save session: {exc}")
+            save_session(self.folder, self.model.photos)
+        except OSError as exc:
+            self.toast.show_message(f"Could not save marks: {exc}", 4000)
 
-    def get_global_config_path(self):
-        return os.path.join(os.path.expanduser("~"), GLOBAL_CONFIG_FILENAME)
+    # -- navigation --------------------------------------------------------
 
-    def load_global_state(self):
-        try:
-            config_path = self.get_global_config_path()
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as file:
-                    config = json.load(file)
-
-                last_folder = config.get('last_folder')
-                last_file = config.get('last_file')
-
-                if last_folder and os.path.isdir(last_folder):
-                    self.folder_path = last_folder
-                    self.scan_folder(target_filename=last_file)
-        except Exception as exc:
-            print(f"Global state load error: {exc}")
-
-    def save_global_state(self):
-        if not self.folder_path:
+    def go_to(self, row):
+        if not 0 <= row < self.model.rowCount():
             return
+        self.current_row = row
+        photo = self.model.photo(row)
+        self.header.set_counter(f"{row + 1} / {self.model.rowCount()}")
+        self.header.set_folder(self.folder, photo.name)
 
-        try:
-            current_file = ""
-            if self.files and 0 <= self.current_index < len(self.files):
-                current_file = os.path.basename(self.files[self.current_index])
+        index = self.model.index(row)
+        self.filmstrip.selectionModel().setCurrentIndex(
+            index, QItemSelectionModel.SelectionFlag.ClearAndSelect
+        )
+        self.filmstrip.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
 
-            config = {
-                'last_folder': self.folder_path,
-                'last_file': current_file,
-            }
+        self._show_current()
+        count = self.model.rowCount()
+        nearby = [*range(row + 1, row + 1 + PREFETCH_AHEAD), *range(row - 1, row - 1 - PREFETCH_BEHIND, -1)]
+        self.loader.ensure_previews(
+            photo.path, [self.model.photo(r).path for r in nearby if 0 <= r < count]
+        )
 
-            with open(self.get_global_config_path(), 'w') as file:
-                json.dump(config, file)
-        except Exception as exc:
-            print(f"Global state save error: {exc}")
-
-    def closeEvent(self, event):
-        self.save_global_state()
-        super().closeEvent(event)
-
-    def open_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Image Folder")
-        if folder:
-            self.folder_path = folder
-            self.scan_folder()
-
-    def scan_folder(self, target_filename=None):
-        self.files = []
-        self.filmstrip.clear()
-        self.grid_view.clear()
-        self.marks = {}
-        self.thumbnail_queue = []
-        self.thumbnail_timer.stop()
-        self.thread_pool.clear()
-        self.header_bar.set_progress_visible(False)
-
-        def scan_dir(path):
-            found = []
-            if os.path.exists(path):
-                with os.scandir(path) as entries:
-                    for entry in entries:
-                        if entry.is_file() and entry.name.lower().endswith(SUPPORTED_EXTENSIONS):
-                            found.append(entry.path)
-            return found
-
-        try:
-            root_files = scan_dir(self.folder_path)
-
-            keep_dir = os.path.join(self.folder_path, "_KEEPS")
-            reject_dir = os.path.join(self.folder_path, "_REJECTS")
-
-            keep_files = scan_dir(keep_dir)
-            reject_files = scan_dir(reject_dir)
-
-            all_files = root_files + keep_files + reject_files
-            all_files.sort(key=lambda x: os.path.basename(x))
-
-            self.files = all_files
-
-            if not self.files:
-                self.current_index = -1
-                self.lbl_image.setText("No images found")
-                self.header_bar.set_filename(self.folder_path)
-                self.update_ui_state()
+    def next_unmarked(self):
+        count = self.model.rowCount()
+        for offset in range(1, count + 1):
+            row = (self.current_row + offset) % count
+            if self.model.photo(row).status is None:
+                self.go_to(row)
                 return
+        self.toast.show_message("Every photo is marked")
 
-            for f in keep_files:
-                self.marks[f] = 'keep'
-            for f in reject_files:
-                self.marks[f] = 'reject'
+    def toggle_tab(self):
+        self.tabs.setCurrentIndex(GALLERY_TAB if self.tabs.currentIndex() == CULL_TAB else CULL_TAB)
 
-            session_file = self.get_session_file()
-            if os.path.exists(session_file):
-                try:
-                    with open(session_file, 'r') as file:
-                        session_data = json.load(file)
+    def _show_current(self):
+        if self.current_row < 0:
+            return
+        photo = self.model.photo(self.current_row)
+        image = self.loader.preview(photo.path)
+        if image is not None:
+            self.image_view.set_image(image)
+        else:
+            error = self.loader.preview_error(photo.path)
+            self.image_view.set_image(None, f"Could not load {photo.name}\n\n{error}" if error else "Loading…")
+        self.image_view.set_status(photo.status)
 
-                    name_to_path = {os.path.basename(p): p for p in self.files}
+    def _is_current(self, path):
+        return self.current_row >= 0 and self.model.photo(self.current_row).path == path
 
-                    for fname, status in session_data.items():
-                        if fname in name_to_path:
-                            self.marks[name_to_path[fname]] = status
-                except Exception as exc:
-                    print(f"Session load error: {exc}")
+    def _on_preview_ready(self, path):
+        if self._is_current(path):
+            self._show_current()
 
-            for i, fpath in enumerate(self.files):
-                fname = os.path.basename(fpath)
+    # -- 1:1 zoom ----------------------------------------------------------
+    # Previews are downscaled, so zooming loads the photo at full resolution.
 
-                item_f = QListWidgetItem(fname)
-                item_f.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.filmstrip.addItem(item_f)
+    def _on_zoom_changed(self, zoomed):
+        if not zoomed or self.current_row < 0:
+            return
+        path = self.model.photo(self.current_row).path
+        image = self.loader.full_image(path)
+        if image is not None:
+            self.image_view.set_full_image(image)
+        else:
+            self.image_view.set_full_loading(True)
+            self.loader.ensure_full(path)
 
-                item_g = QListWidgetItem(fname)
-                item_g.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.grid_view.addItem(item_g)
+    def _on_full_ready(self, path):
+        if self._is_current(path) and self.image_view.zoomed:
+            self.image_view.set_full_image(self.loader.full_image(path))
 
-                self.thumbnail_queue.append((i, fpath))
+    def _on_full_failed(self, path, error):
+        if self._is_current(path):
+            self.image_view.set_full_loading(False)
+            self.toast.show_message(f"Full resolution unavailable: {error}", 4000)
 
-            self.header_bar.configure_progress(len(self.files))
-            self.header_bar.set_progress_format("Thumbnails: %v / %m")
+    # -- marking -----------------------------------------------------------
 
-            if self.tabs.currentIndex() == 1:
-                self.thumbnail_timer.start()
-                self.header_bar.set_progress_visible(True)
+    def _target_rows(self):
+        if self.tabs.currentIndex() == GALLERY_TAB:
+            rows = sorted(self.proxy.mapToSource(i).row() for i in self.grid.selectionModel().selectedIndexes())
+            if rows:
+                return rows
+            # Never mark a photo the gallery filter is hiding.
+            if not self.proxy.mapFromSource(self.model.index(self.current_row)).isValid():
+                return []
+        return [self.current_row] if self.current_row >= 0 else []
 
-            start_index = 0
-            if target_filename:
-                for i, fpath in enumerate(self.files):
-                    if os.path.basename(fpath) == target_filename:
-                        start_index = i
-                        break
+    def mark(self, status):
+        rows = self._target_rows()
+        if not rows:
+            return
+        in_gallery = self.tabs.currentIndex() == GALLERY_TAB
+        first_visible = min(self.proxy.mapFromSource(self.model.index(row)).row() for row in rows)
+        changes = self.model.set_status(rows, status)
+        if changes:
+            self.undo_stack.append(changes)
+            del self.undo_stack[:-UNDO_LIMIT]
+        if in_gallery:
+            self._select_after_filtering(first_visible)
+        elif status is not None:
+            self.go_to(self.current_row + 1)
 
-            self.current_index = start_index
-            self.load_current_image()
-            self.update_ui_state()
+    def _select_after_filtering(self, proxy_row):
+        """Marked photos may drop out of a filtered gallery: select the one now in their place."""
+        if self.grid.selectionModel().hasSelection() or self.proxy.rowCount() == 0:
+            return
+        index = self.proxy.index(min(proxy_row, self.proxy.rowCount() - 1), 0)
+        self.grid.selectionModel().setCurrentIndex(index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        self.grid.scrollTo(index)
+        self.go_to(self.proxy.mapToSource(index).row())
+
+    def undo(self):
+        if not self.undo_stack:
+            self.toast.show_message("Nothing to undo")
+            return
+        changes = self.undo_stack.pop()
+        rows = self.model.restore(changes)
+        if rows and self.tabs.currentIndex() == CULL_TAB:
+            self.go_to(rows[0])
+        self.toast.show_message("Undone" if len(changes) == 1 else f"Undone ({len(changes)} photos)")
+
+    def _on_statuses_changed(self, rows):
+        keeps, rejects, unmarked = self.model.counts()
+        self.stats.update_counts(keeps, rejects, unmarked)
+        self.gallery_toolbar.update_counts(self.model.rowCount(), keeps, rejects, unmarked)
+        self.header.set_can_process(bool(self.folder and plan_moves(self.folder, self.model.photos)))
+        if self.current_row in rows:
+            self.image_view.set_status(self.model.photo(self.current_row).status)
+        self.session_timer.start()
+
+    # -- gallery -----------------------------------------------------------
+
+    def _on_tab_changed(self, index):
+        for shortcut in self.cull_shortcuts:
+            shortcut.setEnabled(index == CULL_TAB)
+        if index == GALLERY_TAB and self.current_row >= 0:
+            proxy_index = self.proxy.mapFromSource(self.model.index(self.current_row))
+            if proxy_index.isValid():
+                self.grid.selectionModel().setCurrentIndex(
+                    proxy_index, QItemSelectionModel.SelectionFlag.ClearAndSelect
+                )
+                self.grid.scrollTo(proxy_index, QAbstractItemView.ScrollHint.PositionAtCenter)
+            self.grid.setFocus()
+        else:
+            self.image_view.reset_zoom()
             self.setFocus()
 
-        except Exception as exc:
-            QMessageBox.critical(self, "Error", str(exc))
+    def _on_grid_clicked(self, proxy_index):
+        if len(self.grid.selectionModel().selectedIndexes()) <= 1:
+            self.go_to(self.proxy.mapToSource(proxy_index).row())
 
-    def on_tab_changed(self, index):
-        if index == 1:
-            if self.thumbnail_queue:
-                self.thumbnail_timer.start()
-                self.header_bar.set_progress_visible(True)
-        else:
-            self.thumbnail_timer.stop()
-            self.header_bar.set_progress_visible(False)
+    def _on_grid_activated(self, proxy_index):
+        self.go_to(self.proxy.mapToSource(proxy_index).row())
+        self.tabs.setCurrentIndex(CULL_TAB)
 
-    def process_thumbnail_batch(self):
-        if not self.thumbnail_queue:
-            self.thumbnail_timer.stop()
-            self.header_bar.set_progress_visible(False)
+    def _on_grid_size_changed(self, size):
+        self.grid_delegate.thumb_size = size
+        self.grid.doItemsLayout()
+        self.settings.setValue("grid_thumb_size", size)
+
+    # -- processing --------------------------------------------------------
+
+    def process_files(self):
+        if not self.folder:
+            return
+        self.save_session()
+        moves = plan_moves(self.folder, self.model.photos)
+        if not moves:
+            self.toast.show_message("Everything is already sorted")
             return
 
-        batch_size = 5
-        count = 0
-
-        while count < batch_size and self.thumbnail_queue:
-            idx, fpath = self.thumbnail_queue.pop(0)
-
-            processed_count = len(self.files) - len(self.thumbnail_queue)
-            self.header_bar.update_progress(processed_count)
-
-            worker = ThumbnailWorker(fpath, idx)
-            worker.signals.finished.connect(self.update_thumbnail)
-            self.thread_pool.start(worker)
-            count += 1
-
-    def update_thumbnail(self, index, file_path, pixmap):
-        if index < len(self.files) and self.files[index] == file_path:
-            icon = QIcon(pixmap)
-            if index < self.grid_view.count():
-                self.grid_view.item(index).setIcon(icon)
-
-    def on_filmstrip_index_selected(self, index: int):
-        if index != -1:
-            self.switch_to_image(index)
-
-    def on_gallery_index_selected(self, index: int):
-        if index != -1 and len(self.grid_view.selectedItems()) <= 1:
-            self.switch_to_image(index)
-
-    def on_gallery_index_double_clicked(self, index: int):
-        if index != -1:
-            self.switch_to_image(index)
-            self.tabs.setCurrentIndex(0)
-
-    def switch_to_image(self, index):
-        self.current_index = index
-        self.load_current_image()
-        self.update_ui_state()
-        self.setFocus()
-
-    def load_current_image(self):
-        if not self.files or self.current_index < 0:
+        keeps = sum(1 for m in moves if m.status == KEEP)
+        rejects = sum(1 for m in moves if m.status == REJECT)
+        unmarked = len(moves) - keeps - rejects
+        lines = [f"<b>{len(moves)}</b> file(s) will be moved:"]
+        if keeps:
+            lines.append(f"&nbsp;&nbsp;• {keeps} → <b>_KEEPS</b>")
+        if rejects:
+            lines.append(f"&nbsp;&nbsp;• {rejects} → <b>_REJECTS</b>")
+        if unmarked:
+            lines.append(f"&nbsp;&nbsp;• {unmarked} → folder root (unmarked)")
+        lines.append("<br>XMP sidecars move with their photo. Existing files are never overwritten.")
+        if not ask(self, "Process files", "<br>".join(lines), "Move Files"):
             return
 
-        filepath = self.files[self.current_index]
-        self.header_bar.set_filename(os.path.basename(filepath))
+        progress = QProgressDialog("Moving files…", "Stop", 0, len(moves), self)
+        progress.setWindowTitle("Process files")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(300)
 
-        self.lbl_image.setText("Loading...")
+        def on_progress(done):
+            progress.setValue(done)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
 
-        if self.loader_thread and self.loader_thread.isRunning():
-            self.loader_thread.terminate()
-            self.loader_thread.wait()
+        result = execute_moves(moves, on_progress)
+        progress.close()
 
-        self.loader_thread = ImageLoaderThread(filepath)
-        self.loader_thread.image_loaded.connect(self.on_image_loaded)
-        self.loader_thread.start()
+        self.model.update_paths(result.moved)
+        self.loader.rename_paths(result.moved)
+        self.undo_stack.clear()  # undo entries refer to the old paths
+        self.save_session()
+        self._on_statuses_changed([])
+        if self.current_row >= 0:
+            self.header.set_folder(self.folder, self.model.photo(self.current_row).name)
 
-        self.update_overlay()
-
-        self.filmstrip.setCurrentRow(self.current_index)
-        self.filmstrip.scrollToItem(self.filmstrip.item(self.current_index), QAbstractItemView.ScrollHint.EnsureVisible)
-        if self.tabs.currentIndex() != 1:
-            self.grid_view.setCurrentRow(self.current_index)
-
-    def on_image_loaded(self, pixmap, error):
-        if error:
-            self.lbl_image.setText(f"Error: {error}")
+        if result.errors:
+            inform(
+                self,
+                "Some files were not moved",
+                f"Moved {len(result.moved)} of {len(moves)} file(s). These failed:",
+                details=result.errors,
+            )
+        elif result.cancelled:
+            self.toast.show_message(f"Stopped after moving {len(result.moved)} file(s)")
         else:
-            self.current_pixmap = pixmap
-            self.update_image_view()
-            self.lbl_image.setText("")
+            self.toast.show_message(f"Moved {len(result.moved)} file(s)")
+
+    # -- window ------------------------------------------------------------
+
+    def _restore_window(self):
+        geometry = self.settings.value("geometry")
+        if geometry is None or not self.restoreGeometry(geometry):
+            self.resize(1400, 900)
+
+    def closeEvent(self, event):
+        self.save_session()
+        self.settings.setValue("geometry", self.saveGeometry())
+        if self.current_row >= 0:
+            self.settings.setValue("last_file", self.model.photo(self.current_row).name)
+        self.loader.shutdown()
+        super().closeEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.update_image_view()
+        if self.toast.isVisible():
+            self.toast.show_message(self.toast.text())
 
-    def update_image_view(self):
-        if not self.current_pixmap or self.current_pixmap.isNull():
-            return
-        size = self.image_container.size()
-        scaled_pixmap = self.current_pixmap.scaled(
-            size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.lbl_image.setPixmap(scaled_pixmap)
+    def dragEnterEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls and urls[0].isLocalFile() and os.path.isdir(urls[0].toLocalFile()):
+            event.acceptProposedAction()
 
-    def update_overlay(self):
-        if not self.files:
-            return
-        path = self.files[self.current_index]
-        status = self.marks.get(path)
-
-        if status == 'keep':
-            self.image_container.setStyleSheet("background-color: #052e16; border: 4px solid #4ade80;")
-        elif status == 'reject':
-            self.image_container.setStyleSheet("background-color: #450a0a; border: 4px solid #f87171;")
-        else:
-            self.image_container.setStyleSheet("background-color: #000; border: none;")
-
-        self.update_item_colors()
-
-    def update_item_colors(self):
-        for i in range(len(self.files)):
-            fpath = self.files[i]
-            status = self.marks.get(fpath)
-            is_selected = i == self.current_index
-
-            bg = QColor("#222")
-            fg = QColor("#ccc")
-
-            if status == 'keep':
-                bg = QColor("#1b5e20")
-                fg = QColor("#66bb6a")
-            elif status == 'reject':
-                bg = QColor("#b71c1c")
-                fg = QColor("#ef5350")
-
-            if is_selected:
-                if status == 'keep':
-                    bg = QColor("#2e7d32")
-                elif status == 'reject':
-                    bg = QColor("#c62828")
-                else:
-                    bg = QColor("#2563eb")
-
-            if i < self.filmstrip.count():
-                item = self.filmstrip.item(i)
-                item.setBackground(bg)
-                item.setForeground(fg)
-
-            if i < self.grid_view.count():
-                item = self.grid_view.item(i)
-                item.setBackground(bg)
-                item.setForeground(fg)
-
-                base_name = os.path.basename(fpath)
-                new_text = base_name
-                if status == 'keep':
-                    new_text = f"✔ {base_name}"
-                elif status == 'reject':
-                    new_text = f"✘ {base_name}"
-
-                if item.text() != new_text:
-                    item.setText(new_text)
-
-    def update_ui_state(self):
-        count = len(self.files)
-        if count > 0:
-            self.header_bar.set_counter(f"{self.current_index + 1} / {count}")
-        else:
-            self.header_bar.set_counter("0 / 0")
-
-        keeps = list(self.marks.values()).count('keep')
-        rejects = list(self.marks.values()).count('reject')
-
-        self.stats_bar.update_counts(keeps, rejects)
-
-    def next_image(self):
-        if self.current_index < len(self.files) - 1:
-            self.switch_to_image(self.current_index + 1)
-
-    def prev_image(self):
-        if self.current_index > 0:
-            self.switch_to_image(self.current_index - 1)
-
-    def mark_current(self, status):
-        if not self.files:
-            return
-
-        if self.tabs.currentIndex() == 1:
-            selected_items = self.grid_view.selectedItems()
-            if len(selected_items) > 0:
-                for item in selected_items:
-                    idx = self.grid_view.row(item)
-                    if idx != -1:
-                        path_at_idx = self.files[idx]
-                        if status is None:
-                            if path_at_idx in self.marks:
-                                del self.marks[path_at_idx]
-                        else:
-                            self.marks[path_at_idx] = status
-
-                self.save_session()
-                self.update_item_colors()
-                self.update_ui_state()
-                return
-
-        path = self.files[self.current_index]
-
-        if status is None:
-            if path in self.marks:
-                del self.marks[path]
-        else:
-            self.marks[path] = status
-            if status is not None and self.tabs.currentIndex() == 0:
-                self.next_image()
-
-        self.save_session()
-        self.update_overlay()
-        self.update_ui_state()
-
-    def process_files(self):
-        keeps_pending = []
-        rejects_pending = []
-        unmarked_pending = []
-
-        keep_dir = os.path.join(self.folder_path, "_KEEPS")
-        reject_dir = os.path.join(self.folder_path, "_REJECTS")
-
-        for fpath in self.files:
-            status = self.marks.get(fpath)
-            current_dir = os.path.dirname(fpath)
-
-            target_dir = self.folder_path
-            if status == 'keep':
-                target_dir = keep_dir
-            elif status == 'reject':
-                target_dir = reject_dir
-
-            if os.path.abspath(current_dir) != os.path.abspath(target_dir):
-                if status == 'keep':
-                    keeps_pending.append(fpath)
-                elif status == 'reject':
-                    rejects_pending.append(fpath)
-                else:
-                    unmarked_pending.append(fpath)
-
-        total_moves = len(keeps_pending) + len(rejects_pending) + len(unmarked_pending)
-
-        if total_moves == 0:
-            QMessageBox.information(self, "Info", "No file movements needed.")
-            return
-
-        msg = (
-            f"Processing {total_moves} moves:\n"
-            f"{len(keeps_pending)} -> _KEEPS\n"
-            f"{len(rejects_pending)} -> _REJECTS\n"
-            f"{len(unmarked_pending)} -> Root (Unmarked)\n\n"
-            "Proceed?"
-        )
-
-        reply = QMessageBox.question(
-            self,
-            "Process Files",
-            msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                if not os.path.exists(keep_dir):
-                    os.makedirs(keep_dir)
-                if not os.path.exists(reject_dir):
-                    os.makedirs(reject_dir)
-
-                def safe_move(src, dest_folder):
-                    fname = os.path.basename(src)
-                    dest = os.path.join(dest_folder, fname)
-                    if src != dest:
-                        shutil.move(src, dest)
-
-                for f in keeps_pending:
-                    safe_move(f, keep_dir)
-                for f in rejects_pending:
-                    safe_move(f, reject_dir)
-                for f in unmarked_pending:
-                    safe_move(f, self.folder_path)
-
-                QMessageBox.information(self, "Success", "Files moved successfully!")
-                self.save_session()
-                self.scan_folder()
-
-            except Exception as exc:
-                QMessageBox.critical(self, "Error", f"An error occurred:\n{exc}")
-
-    def keyPressEvent(self, event):
-        key = event.key()
-
-        if key in (Qt.Key.Key_Right, Qt.Key.Key_L):
-            self.next_image()
-        elif key in (Qt.Key.Key_Left, Qt.Key.Key_H):
-            self.prev_image()
-        elif key == Qt.Key.Key_Up:
-            self.mark_current('keep')
-        elif key == Qt.Key.Key_Down:
-            self.mark_current('reject')
-        else:
-            super().keyPressEvent(event)
+    def dropEvent(self, event):
+        self.load_folder(event.mimeData().urls()[0].toLocalFile())
