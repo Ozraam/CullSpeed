@@ -29,17 +29,12 @@ def target_dir(folder, status):
     return folder
 
 
-def _same_dir(a, b):
-    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
-
-
 def plan_moves(folder, photos):
-    moves = []
-    for photo in photos:
-        dest = target_dir(folder, photo.status)
-        if not _same_dir(os.path.dirname(photo.path), dest):
-            moves.append(Move(photo.path, dest, photo.status))
-    return moves
+    return [
+        Move(photo.path, target_dir(folder, photo.status), photo.status)
+        for photo in photos
+        if photo.status != photo.location
+    ]
 
 
 def _sidecars(path, dir_listing):

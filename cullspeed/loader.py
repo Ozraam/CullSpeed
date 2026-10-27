@@ -52,14 +52,14 @@ class ImageLoader(QObject):
         self._generation = 0
         self._priority = count()
 
-        self._previews = OrderedDict()  # path -> QImage, LRU order
+        self._previews = OrderedDict()  # path -> QPixmap, LRU order
         self._preview_errors = {}
         self._preview_pending = set()
         self._wanted_previews = set()
 
         # Full resolution (for 1:1 zoom) is kept for one photo only: it is huge.
         self._full_path = None
-        self._full_image = None
+        self._full_pixmap = None
 
         self._thumbnails = OrderedDict()  # path -> QPixmap, LRU order
         self._thumbnail_failed = set()
@@ -106,10 +106,10 @@ class ImageLoader(QObject):
     # -- previews ----------------------------------------------------------
 
     def preview(self, path):
-        image = self._previews.get(path)
-        if image is not None:
+        pixmap = self._previews.get(path)
+        if pixmap is not None:
             self._previews.move_to_end(path)
-        return image
+        return pixmap
 
     def preview_error(self, path):
         return self._preview_errors.get(path)
@@ -149,7 +149,9 @@ class ImageLoader(QObject):
             self.preview_failed.emit(path, error)
             return
 
-        self._previews[path] = image
+        # Converted here, ahead of time for prefetched photos, so that
+        # stepping to a photo does not pay for QPixmap.fromImage().
+        self._previews[path] = QPixmap.fromImage(image)
         self._trim_previews()
         self.preview_loaded.emit(path)
 
@@ -162,15 +164,15 @@ class ImageLoader(QObject):
 
     # -- full resolution ---------------------------------------------------
 
-    def full_image(self, path):
-        return self._full_image if path == self._full_path else None
+    def full_pixmap(self, path):
+        return self._full_pixmap if path == self._full_path else None
 
     def ensure_full(self, path):
         """Decode `path` without downscaling; replaces any other full image."""
         if path == self._full_path:
             return  # loaded or in flight
         self._full_path = path
-        self._full_image = None
+        self._full_pixmap = None
         generation = self._generation
 
         def job():
@@ -184,7 +186,7 @@ class ImageLoader(QObject):
 
     def _release_full(self):
         self._full_path = None
-        self._full_image = None
+        self._full_pixmap = None
 
     def _on_full_done(self, generation, path, image, error):
         if generation != self._generation or path != self._full_path or error == _CANCELLED:
@@ -193,7 +195,7 @@ class ImageLoader(QObject):
             self._full_path = None  # allow a retry on the next zoom
             self.full_failed.emit(path, error)
             return
-        self._full_image = image
+        self._full_pixmap = QPixmap.fromImage(image)
         self.full_loaded.emit(path)
 
     # -- thumbnails --------------------------------------------------------

@@ -2,6 +2,7 @@ import json
 import os
 from collections import Counter
 from dataclasses import dataclass
+from itertools import groupby
 
 from PyQt6.QtCore import QAbstractListModel, QModelIndex, QSortFilterProxyModel, Qt, pyqtSignal
 
@@ -15,6 +16,7 @@ PATH_ROLE = Qt.ItemDataRole.UserRole + 2
 class Photo:
     path: str
     status: str | None = None
+    location: str | None = None  # folder the file sits in: KEEP, REJECT or None (root)
 
     @property
     def name(self):
@@ -39,8 +41,8 @@ def _scan_dir(path):
 def scan_folder(folder):
     """Photos in `folder`, `_KEEPS` and `_REJECTS`, with their saved marks."""
     photos = [Photo(p) for p in _scan_dir(folder)]
-    photos += [Photo(p, KEEP) for p in _scan_dir(os.path.join(folder, KEEP_DIR))]
-    photos += [Photo(p, REJECT) for p in _scan_dir(os.path.join(folder, REJECT_DIR))]
+    photos += [Photo(p, KEEP, KEEP) for p in _scan_dir(os.path.join(folder, KEEP_DIR))]
+    photos += [Photo(p, REJECT, REJECT) for p in _scan_dir(os.path.join(folder, REJECT_DIR))]
 
     # Saved marks win over folder location, so marks changed after the last
     # "Process Files" are not lost.
@@ -94,6 +96,8 @@ class PhotoModel(QAbstractListModel):
         self._loader = loader
         self._photos = []
         self._rows = {}
+        # Kept up to date on every change so per-keystroke updates stay O(1).
+        self._keeps = self._rejects = self._unsorted = 0
         loader.thumbnail_loaded.connect(self._on_thumbnail_loaded)
 
     def rowCount(self, parent=QModelIndex()):
@@ -129,6 +133,9 @@ class PhotoModel(QAbstractListModel):
         self.beginResetModel()
         self._photos = photos
         self._reindex()
+        self._keeps = self._rejects = self._unsorted = 0
+        for photo in photos:
+            self._tally(photo, 1)
         self.endResetModel()
         self.statuses_changed.emit(list(range(len(photos))))
 
@@ -140,7 +147,7 @@ class PhotoModel(QAbstractListModel):
             photo = self._photos[row]
             if photo.status != status:
                 changes.append((photo.path, photo.status))
-                photo.status = status
+                self._set(photo, status)
                 changed_rows.append(row)
         self._emit_changed(changed_rows)
         return changes
@@ -150,22 +157,41 @@ class PhotoModel(QAbstractListModel):
         for path, status in changes:
             row = self.row_of(path)
             if row != -1:
-                self._photos[row].status = status
+                self._set(self._photos[row], status)
                 rows.append(row)
         self._emit_changed(rows)
         return rows
 
-    def update_paths(self, mapping):
+    def apply_moves(self, moved):
+        """`moved`: old path -> (new path, location it was moved to)."""
         for photo in self._photos:
-            photo.path = mapping.get(photo.path, photo.path)
+            if photo.path in moved:
+                self._tally(photo, -1)
+                photo.path, photo.location = moved[photo.path]
+                self._tally(photo, 1)
         self._reindex()
         if self._photos:
             self.dataChanged.emit(self.index(0), self.index(len(self._photos) - 1))
 
     def counts(self):
-        keeps = sum(1 for p in self._photos if p.status == KEEP)
-        rejects = sum(1 for p in self._photos if p.status == REJECT)
-        return keeps, rejects, len(self._photos) - keeps - rejects
+        return self._keeps, self._rejects, len(self._photos) - self._keeps - self._rejects
+
+    def has_unsorted(self):
+        """Whether any photo is not in the folder its mark sends it to."""
+        return self._unsorted > 0
+
+    def _set(self, photo, status):
+        self._tally(photo, -1)
+        photo.status = status
+        self._tally(photo, 1)
+
+    def _tally(self, photo, sign):
+        if photo.status == KEEP:
+            self._keeps += sign
+        elif photo.status == REJECT:
+            self._rejects += sign
+        if photo.status != photo.location:
+            self._unsorted += sign
 
     def _reindex(self):
         self._rows = {photo.path: row for row, photo in enumerate(self._photos)}
@@ -173,9 +199,11 @@ class PhotoModel(QAbstractListModel):
     def _emit_changed(self, rows):
         if not rows:
             return
-        for row in rows:
-            index = self.index(row)
-            self.dataChanged.emit(index, index, [STATUS_ROLE])
+        # One signal per run of consecutive rows: marking a big selection
+        # would otherwise re-filter the gallery once per photo.
+        for _, run in groupby(enumerate(sorted(rows)), lambda item: item[1] - item[0]):
+            run = [row for _, row in run]
+            self.dataChanged.emit(self.index(run[0]), self.index(run[-1]), [STATUS_ROLE])
         self.statuses_changed.emit(rows)
 
     def _on_thumbnail_loaded(self, path):

@@ -1,12 +1,12 @@
 import json
 import os
+import threading
 from html import escape
 
-from PyQt6.QtCore import QItemSelectionModel, QSettings, Qt, QTimer
+from PyQt6.QtCore import QEventLoop, QItemSelectionModel, QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QFileDialog,
     QMainWindow,
     QProgressDialog,
@@ -42,6 +42,28 @@ CULL_TAB, GALLERY_TAB = 0, 1
 FILMSTRIP_THUMB_SIZE = 64
 
 
+class MoveThread(QThread):
+    """Runs execute_moves() off the GUI thread, so slow disks don't freeze the window."""
+
+    progressed = pyqtSignal(int)
+
+    def __init__(self, moves, parent=None):
+        super().__init__(parent)
+        self.moves = moves
+        self.result = None
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        def progress(done):
+            self.progressed.emit(done)
+            return not self._stop.is_set()
+
+        self.result = execute_moves(self.moves, progress)
+
+
 class CullSpeedApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -53,6 +75,7 @@ class CullSpeedApp(QMainWindow):
         self.folder = ""
         self.current_row = -1
         self.undo_stack = []
+        self.moving = False
 
         self.loader = ImageLoader(self)
         self.loader.preview_loaded.connect(self._on_preview_ready)
@@ -175,6 +198,8 @@ class CullSpeedApp(QMainWindow):
             self.load_folder(folder)
 
     def load_folder(self, folder, select_name=None):
+        if self.moving:
+            return
         self.save_session()
         try:
             photos = scan_folder(folder)
@@ -264,9 +289,9 @@ class CullSpeedApp(QMainWindow):
         if self.current_row < 0:
             return
         photo = self.model.photo(self.current_row)
-        image = self.loader.preview(photo.path)
-        if image is not None:
-            self.image_view.set_image(image)
+        pixmap = self.loader.preview(photo.path)
+        if pixmap is not None:
+            self.image_view.set_image(pixmap)
         else:
             error = self.loader.preview_error(photo.path)
             self.image_view.set_image(None, f"Could not load {photo.name}\n\n{error}" if error else "Loading…")
@@ -286,16 +311,16 @@ class CullSpeedApp(QMainWindow):
         if not zoomed or self.current_row < 0:
             return
         path = self.model.photo(self.current_row).path
-        image = self.loader.full_image(path)
-        if image is not None:
-            self.image_view.set_full_image(image)
+        pixmap = self.loader.full_pixmap(path)
+        if pixmap is not None:
+            self.image_view.set_full_image(pixmap)
         else:
             self.image_view.set_full_loading(True)
             self.loader.ensure_full(path)
 
     def _on_full_ready(self, path):
         if self._is_current(path) and self.image_view.zoomed:
-            self.image_view.set_full_image(self.loader.full_image(path))
+            self.image_view.set_full_image(self.loader.full_pixmap(path))
 
     def _on_full_failed(self, path, error):
         if self._is_current(path):
@@ -352,7 +377,7 @@ class CullSpeedApp(QMainWindow):
         keeps, rejects, unmarked = self.model.counts()
         self.stats.update_counts(keeps, rejects, unmarked)
         self.gallery_toolbar.update_counts(self.model.rowCount(), keeps, rejects, unmarked)
-        self.header.set_can_process(bool(self.folder and plan_moves(self.folder, self.model.photos)))
+        self.header.set_can_process(bool(self.folder) and self.model.has_unsorted())
         if self.current_row in rows:
             self.image_view.set_status(self.model.photo(self.current_row).status)
         self.session_timer.start()
@@ -415,17 +440,27 @@ class CullSpeedApp(QMainWindow):
         progress = QProgressDialog("Moving files…", "Stop", 0, len(moves), self)
         progress.setWindowTitle("Process files")
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.setMinimumDuration(300)
+        # Shown at once: being modal is what keeps marks from changing mid-move.
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
 
-        def on_progress(done):
-            progress.setValue(done)
-            QApplication.processEvents()
-            return not progress.wasCanceled()
-
-        result = execute_moves(moves, on_progress)
+        thread = MoveThread(moves, self)
+        thread.progressed.connect(progress.setValue)
+        progress.canceled.connect(thread.stop)
+        loop = QEventLoop()
+        thread.finished.connect(loop.quit)
+        self.moving = True
+        thread.start()
+        loop.exec()
+        self.moving = False
         progress.close()
+        result = thread.result
+        thread.deleteLater()
 
-        self.model.update_paths(result.moved)
+        # Locations come from the plan: once Stop is pressed the window is
+        # usable again while the last file finishes, so marks may have changed.
+        locations = {move.src: move.status for move in moves}
+        self.model.apply_moves({old: (new, locations[old]) for old, new in result.moved.items()})
         self.loader.rename_paths(result.moved)
         self.undo_stack.clear()  # undo entries refer to the old paths
         self.save_session()
@@ -453,6 +488,9 @@ class CullSpeedApp(QMainWindow):
             self.resize(1400, 900)
 
     def closeEvent(self, event):
+        if self.moving:
+            event.ignore()  # files are being moved; the progress dialog has a Stop button
+            return
         self.save_session()
         self.settings.setValue("geometry", self.saveGeometry())
         if self.current_row >= 0:

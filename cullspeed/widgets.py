@@ -193,8 +193,8 @@ class ImageView(QWidget):
         self.setMinimumSize(200, 200)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-    def set_image(self, image, message=""):
-        self._pixmap = QPixmap.fromImage(image) if image is not None and not image.isNull() else None
+    def set_image(self, pixmap, message=""):
+        self._pixmap = pixmap if pixmap is not None and not pixmap.isNull() else None
         self._scaled = None
         self._message = message
         self._zoomed = False
@@ -202,11 +202,11 @@ class ImageView(QWidget):
         self._update_cursor()
         self.update()
 
-    def set_full_image(self, image):
+    def set_full_image(self, pixmap):
         """Swap in the full-resolution image, keeping the zoom position."""
         self._full_loading = False
-        if image is not None and not image.isNull() and self._pixmap is not None:
-            self._pixmap = QPixmap.fromImage(image)
+        if pixmap is not None and not pixmap.isNull() and self._pixmap is not None:
+            self._pixmap = pixmap
             self._scaled = None
         self.update()
 
