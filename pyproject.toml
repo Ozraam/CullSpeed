@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cullspeed"
+version = "0.1.0"
+description = "Fast keyboard-driven photo culling: sort a shoot into keeps and rejects."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.9,<7",  # 6.9: QSortFilterProxyModel.beginFilterChange()
+    "rawpy>=0.21,<1",
+    "numpy>=1.24,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+build = ["pyinstaller>=6"]
+
+[project.gui-scripts]
+cullspeed = "cullspeed.main:main"
+
+[tool.setuptools]
+packages = ["cullspeed"]
+
+[tool.ruff]
+line-length = 132
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Qt's own default for `parent` arguments.
+extend-immutable-calls = ["PyQt6.QtCore.QModelIndex"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

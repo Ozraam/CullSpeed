@@ -13,14 +13,14 @@ CullSpeed is a PyQt6 desktop application for rapidly reviewing and triaging larg
 
 ## Requirements
 - Python 3.10+
-- Dependencies from `requirements.txt`: PyQt6 (6.9+), rawpy, numpy
+- PyQt6 (6.9+), rawpy and numpy, installed from `pyproject.toml`
 
 ## Quick Start
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-python CullSpeed.py        # or: python -m cullspeed
+pip install -e .
+cullspeed                  # or: python CullSpeed.py, python -m cullspeed
 ```
 
 ## Keyboard Shortcuts
@@ -53,6 +53,20 @@ In the Cull view, marking a photo as keep or reject moves on to the next one. In
 | `cullspeed/fileops.py` | Planning and executing file moves |
 | `cullspeed/widgets.py` | Image view, thumbnail delegate, bars, toast and dialogs |
 | `cullspeed/theme.py` | Dark palette and stylesheet |
+
+## Development
+```bash
+pip install -e ".[dev]"
+pytest                     # file moves, session file, model counters
+ruff check .
+```
+CI runs both on every push and pull request (`.github/workflows/ci.yml`).
+
+To build a standalone app (`dist/CullSpeed.app` on macOS):
+```bash
+pip install -e ".[build]"
+./scripts/build_app.sh
+```
 
 ## Development Notes
 - Worker threads only produce `QImage`; `QPixmap` is created on the GUI thread.

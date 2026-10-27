@@ -34,10 +34,7 @@ def load_image(path, max_size):
 
     `max_size=None` decodes at full resolution (for 1:1 zoom).
     """
-    if is_raw(path):
-        image = _load_raw(path, max_size)
-    else:
-        image = _read(path, max_size)
+    image = _load_raw(path, max_size) if is_raw(path) else _read(path, max_size)
     return _fit(image, max_size)
 
 

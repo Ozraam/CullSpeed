@@ -5,6 +5,7 @@ queued signals on this long-lived QObject, where they become QPixmaps.
 Superseded requests are skipped rather than terminated.
 """
 from collections import OrderedDict
+from contextlib import suppress
 from itertools import count
 
 from PyQt6.QtCore import QObject, QThread, QThreadPool, pyqtSignal
@@ -17,10 +18,8 @@ _CANCELLED = "\0cancelled"
 
 
 def _emit(signal, *args):
-    try:
+    with suppress(RuntimeError):  # loader already destroyed during shutdown
         signal.emit(*args)
-    except RuntimeError:
-        pass  # loader already destroyed during shutdown
 
 
 def _decode(path, max_size):
