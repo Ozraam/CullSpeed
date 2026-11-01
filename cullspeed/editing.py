@@ -87,10 +87,12 @@ def render_parallel(linear, edit, table, seed):
 
 # -- export --------------------------------------------------------------------
 
-def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92):
+def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=None):
     """Render `path` with `edit` at full resolution into `dest_dir` as JPEG; returns the new path.
 
     `tables` caches LUT tables between photos of one export (path -> table).
+    With `name` the file is written under that name, replacing one already
+    there; without, it gets a free name (`IMG_1 (1).jpg`).
     """
     table = None
     if lut_path:
@@ -119,10 +121,11 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92):
     del pixels
 
     os.makedirs(dest_dir, exist_ok=True)
-    stem = os.path.splitext(os.path.basename(path))[0]
-    name, n = f"{stem}.jpg", 1
-    while os.path.exists(os.path.join(dest_dir, name)):
-        name, n = f"{stem} ({n}).jpg", n + 1
+    if name is None:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        name, n = f"{stem}.jpg", 1
+        while os.path.exists(os.path.join(dest_dir, name)):
+            name, n = f"{stem} ({n}).jpg", n + 1
     dest = os.path.join(dest_dir, name)
     if not array_to_image(out).save(dest, "JPG", quality):
         raise EditError(f"could not write {name}")

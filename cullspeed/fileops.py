@@ -1,4 +1,4 @@
-"""Moving photos into _KEEPS / _REJECTS (or back to the root)."""
+"""Moving photos into _KEEPS / _REJECTS (or back to the root), and what goes to _EXPORTS."""
 import os
 import shutil
 from dataclasses import dataclass, field
@@ -13,6 +13,13 @@ class Move:
     dest_dir: str
     status: str | None
     companions: list = field(default_factory=list)  # moved along, e.g. the JPEG of a RAW+JPEG pair
+
+
+@dataclass
+class ExportJob:
+    path: str  # the file rendered or copied
+    edit: dict  # {}: copied as it is
+    name: str  # file name in _EXPORTS
 
 
 @dataclass
@@ -121,3 +128,49 @@ def execute_moves(moves, progress=None):
     if progress:
         progress(len(moves))
     return result
+
+
+JPEG_EXTENSIONS = frozenset({'.jpg', '.jpeg'})
+
+
+def _jpeg(photo):
+    """The photo's JPEG: itself, or the JPEG of a RAW+JPEG pair. None if it has none."""
+    for path in photo.files:
+        if os.path.splitext(path)[1].lower() in JPEG_EXTENSIONS:
+            return path
+    return None
+
+
+def plan_exports(photos):
+    """What "Process Files" puts in _EXPORTS: edited photos rendered, the JPEG of the others copied.
+
+    Rejected photos are left out. Names are unique within the plan (` (n)`
+    added when two photos share one); a file of the same name already in
+    _EXPORTS is replaced, so processing again refreshes the exports.
+    """
+    jobs, taken = [], set()
+
+    def unique(stem, ext):
+        name, n = stem + ext, 1
+        while name.lower() in taken:
+            name, n = f"{stem} ({n}){ext}", n + 1
+        taken.add(name.lower())
+        return name
+
+    for photo in photos:
+        if photo.status == REJECT:
+            continue
+        if photo.edit:
+            stem = os.path.splitext(photo.name)[0]
+            jobs.append(ExportJob(photo.path, photo.edit, unique(stem, ".jpg")))
+        elif (jpeg := _jpeg(photo)) is not None:
+            jobs.append(ExportJob(jpeg, {}, unique(*os.path.splitext(os.path.basename(jpeg)))))
+    return jobs
+
+
+def copy_export(path, dest_dir, name):
+    """Copy `path` into `dest_dir` as `name`, replacing it; returns the new path."""
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, name)
+    shutil.copy2(path, dest)
+    return dest
