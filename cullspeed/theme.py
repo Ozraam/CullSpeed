@@ -45,7 +45,7 @@ QPushButton#Chip {{ border-radius: 12px; padding: 3px 12px; }}
 QPushButton#Chip:checked {{ background: {COLOR_ACCENT}; border-color: {COLOR_ACCENT}; color: white; }}
 
 QTabWidget::pane {{ border: none; }}
-QTabBar {{ background: {COLOR_PANEL}; }}
+QTabBar, #TabCorner {{ background: {COLOR_PANEL}; }}
 QTabBar::tab {{
     background: transparent; color: {COLOR_MUTED};
     padding: 7px 18px; border: none; border-bottom: 2px solid transparent;

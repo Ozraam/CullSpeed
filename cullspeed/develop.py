@@ -10,12 +10,20 @@ Every step depends only on a pixel and its position in the full image, so
 a large image can be processed in strips (export) with the same result.
 An edit is a plain dict holding only the settings that differ from
 DEFAULTS, which is also how it is stored in the session.
+
+The crop is applied before all of this (see crop_array()), so the vignette
+and the grain follow the final frame: render() is given the cropped pixels.
 """
+import math
+
 import numpy as np
 
 from .lut import apply as apply_lut
 
+MIN_CROP_SIZE = 0.005  # smallest stored crop side, as a fraction of the photo's
+
 DEFAULTS = {
+    "crop": None,  # [left, top, right, bottom], fractions of the photo's width and height
     "exposure": 0.0,  # EV
     "temperature": 0,  # -100 cooler … +100 warmer
     "tint": 0,  # -100 greener … +100 more magenta
@@ -54,6 +62,35 @@ DECODE_8BIT = np.where(_v <= 0.04045, _v / 12.92, np.power((_v + 0.055) / 1.055,
 del _x, _v
 
 
+def clean_crop(crop):
+    """`crop` as stored: [left, top, right, bottom] in 0–1, or None if invalid or the whole photo."""
+    if not isinstance(crop, (list, tuple)) or len(crop) != 4:
+        return None
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in crop):
+        return None
+    left, top, right, bottom = (round(min(1.0, max(0.0, float(v))), 5) for v in crop)
+    if right - left < MIN_CROP_SIZE or bottom - top < MIN_CROP_SIZE:
+        return None
+    if (left, top, right, bottom) == (0.0, 0.0, 1.0, 1.0):
+        return None
+    return [left, top, right, bottom]
+
+
+def crop_box(height, width, crop):
+    """(top, bottom, left, right) in pixels of `crop` on an image of that size, at least 1×1."""
+    left, top, right, bottom = crop
+    x0, y0 = min(width - 1, round(left * width)), min(height - 1, round(top * height))
+    return y0, max(y0 + 1, round(bottom * height)), x0, max(x0 + 1, round(right * width))
+
+
+def crop_array(pixels, crop):
+    """The `crop` of `pixels` (h×w×…), without copying; `pixels` itself when `crop` is None."""
+    if not crop:
+        return pixels
+    top, bottom, left, right = crop_box(*pixels.shape[:2], crop)
+    return pixels[top:bottom, left:right]
+
+
 def clean(edit):
     """`edit` without default or invalid values: what is stored. {} means no edit."""
     result = {}
@@ -61,6 +98,11 @@ def clean(edit):
         return result
     for key, default in DEFAULTS.items():
         value = edit.get(key, default)
+        if key == "crop":
+            crop = clean_crop(value)
+            if crop:
+                result[key] = crop
+            continue
         if key == "lut":
             if isinstance(value, str) and value:
                 result[key] = value

@@ -295,8 +295,12 @@ class PhotoModel(QAbstractListModel):
 
     def set_field(self, rows, name, value):
         """Set `name` ("status", "rating", "label" or "edit") on `rows`; returns undo changes."""
+        return self.set_values(name, {row: value for row in rows})
+
+    def set_values(self, name, values):
+        """Like set_field(), with a value per row: `values` is {row: value}."""
         changes = []
-        for row in rows:
+        for row, value in values.items():
             photo = self._photos[row]
             if getattr(photo, name) != value:
                 changes.append((photo.path, name, getattr(photo, name)))

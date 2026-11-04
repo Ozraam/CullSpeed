@@ -103,6 +103,7 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=N
         table = tables[lut_path]
 
     pixels, kind = _source(path, None)
+    pixels = develop.crop_array(pixels, edit.get("crop"))
     height, width = pixels.shape[:2]
     out = np.empty((height, width, 3), dtype=np.uint8)
     seed = _seed(path)
@@ -169,10 +170,12 @@ class EditRenderer(QObject):
     def _key(edit, lut_path):
         return json.dumps([edit, lut_path], sort_keys=True)
 
-    def pixmap(self, path, edit, lut_path, quick=False):
+    def pixmap(self, path, edit, lut_path, quick=False, same_crop=False):
         """The render of `edit`, or the latest one while it is being made (None if none yet).
 
         `quick` asks for the half-size preview, for use while dragging a slider.
+        `same_crop` only accepts a latest render framed like `edit`, for the crop
+        tool, whose frame would otherwise sit on the wrong picture for a moment.
         """
         key = self._key(edit, lut_path)
         current = self._renders.get(path)
@@ -180,7 +183,9 @@ class EditRenderer(QObject):
             return current[2]
         if self._errors.get(path) != key:
             self._request(path, key, edit, lut_path, quick)
-        return current[2] if current is not None else None
+        if current is None or (same_crop and json.loads(current[0])[0].get("crop") != edit.get("crop")):
+            return None
+        return current[2]
 
     def error(self, path):
         return path in self._errors
@@ -205,7 +210,7 @@ class EditRenderer(QObject):
                 try:
                     full, half = self._base(path)
                     table = self._table(lut_path) if lut_path else None
-                    linear = half if quick else full
+                    linear = develop.crop_array(half if quick else full, edit.get("crop"))
                     image = array_to_image(render_parallel(linear, edit, table, _seed(path)))
                     error = ""
                 except Exception as exc:  # a bad photo or LUT must not kill the worker
