@@ -16,7 +16,7 @@ CullSpeed is a PyQt6 desktop application for rapidly reviewing and triaging larg
 - New or removed files are picked up automatically while the folder is open (or with **Refresh**, `⌘R`).
 - Undo for every marking, rating and labelling action.
 - Marks are saved automatically in `cullspeed_session.json` inside each photo folder.
-- **Process Files** moves photos into `_KEEPS` / `_REJECTS` (or back to the root when unmarked). XMP sidecars move with their photo, and existing files are never overwritten (`IMG_1 (1).jpg` instead). It then fills `_EXPORTS`: edited photos are exported as JPEGs and unedited ones get their JPEG (the photo itself, or the JPEG of a RAW+JPEG pair) copied; rejected photos are left out. Earlier exports of the same photos are replaced, so processing again refreshes them.
+- **Process Files** moves photos into `_KEEPS` / `_REJECTS` (or back to the root when unmarked). XMP sidecars move with their photo, and existing files are never overwritten (`IMG_1 (1).jpg` instead). Unless you untick the export box in its confirmation (ticked by default), it then fills `_EXPORTS`: edited photos are exported as JPEGs and unedited ones get their JPEG (the photo itself, or the JPEG of a RAW+JPEG pair) copied; rejected photos are left out. Earlier exports of the same photos are replaced, so processing again refreshes them.
 - Reopens the last folder and photo on launch. Drop a folder onto the window to open it.
 
 ## Requirements

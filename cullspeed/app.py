@@ -19,6 +19,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QMainWindow,
@@ -54,10 +55,10 @@ from .widgets import (
     GalleryToolbar,
     HeaderBar,
     ImageView,
+    ProcessDialog,
     StatsBar,
     ThumbnailDelegate,
     Toast,
-    ask,
     inform,
     make_thumbnail_view,
 )
@@ -1079,7 +1080,7 @@ class CullSpeedApp(QMainWindow):
     # -- processing --------------------------------------------------------
 
     def process_files(self):
-        """Move photos to the folder of their mark, then fill _EXPORTS.
+        """Move photos to the folder of their mark, then fill _EXPORTS if asked to.
 
         Edited photos are exported as JPEGs; unedited ones get their JPEG
         (if they have one) copied. Rejected photos are not exported.
@@ -1107,20 +1108,23 @@ class CullSpeedApp(QMainWindow):
             lines.append(f"&nbsp;&nbsp;• {rejects} → <b>_REJECTS</b>")
         if unmarked:
             lines.append(f"&nbsp;&nbsp;• {unmarked} → folder root (unmarked)")
+        if moves:
+            lines.append("<br>RAW+JPEG pairs and XMP sidecars move together. Existing files are never overwritten.")
+
+        export_label = export_text = None
         if exports:
             edited = sum(1 for job in exports if job.edit)
-            if lines:
-                lines.append("")
-            lines.append(f"<b>{len(exports)}</b> photo(s) will be exported to <b>{EXPORT_DIR}</b>:")
+            export_label = f"Export {len(exports)} photo(s) to {EXPORT_DIR}"
+            details = []
             if edited:
-                lines.append(f"&nbsp;&nbsp;• {edited} edited → rendered as JPEG")
+                details.append(f"&nbsp;&nbsp;• {edited} edited → rendered as JPEG")
             if len(exports) - edited:
-                lines.append(f"&nbsp;&nbsp;• {len(exports) - edited} without edits → JPEG copied")
-        lines.append(
-            "<br>RAW+JPEG pairs and XMP sidecars move together. Existing files are never overwritten,"
-            f" except earlier exports of the same photos in {EXPORT_DIR}."
-        )
-        if not ask(self, "Process files", "<br>".join(lines), "Process"):
+                details.append(f"&nbsp;&nbsp;• {len(exports) - edited} without edits → JPEG copied")
+            details.append("Earlier exports of the same photos are replaced.")
+            export_text = "<br>".join(details)
+
+        dialog = ProcessDialog(self, "<br>".join(lines), export_label, export_text)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
         if moves:
@@ -1139,6 +1143,10 @@ class CullSpeedApp(QMainWindow):
             summary_text = f"Moved {moved} photo(s)"
         else:
             summary_text = "Nothing to move"
+
+        if not dialog.export_requested:
+            self.toast.show_message(summary_text)
+            return
 
         # Planned again: the photos may have just moved.
         exports = plan_exports(self.model.photos)

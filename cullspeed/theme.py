@@ -27,6 +27,7 @@ QMainWindow, QDialog {{ background: {COLOR_BG}; }}
 #KeepCount {{ color: {COLOR_KEEP}; font-weight: bold; }}
 #RejectCount {{ color: {COLOR_REJECT}; font-weight: bold; }}
 #DialogTitle {{ font-size: 15px; font-weight: bold; }}
+QLabel:disabled {{ color: #5b5b5b; }}
 #Toast {{
     background: rgba(20, 20, 20, 235); color: {COLOR_TEXT};
     border: 1px solid {COLOR_BORDER}; border-radius: 8px; padding: 9px 16px;

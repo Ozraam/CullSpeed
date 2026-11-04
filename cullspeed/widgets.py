@@ -5,6 +5,7 @@ from PyQt6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QPainterPa
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -922,7 +923,7 @@ class MessageDialog(QDialog):
 
         heading = QLabel(title)
         heading.setObjectName("DialogTitle")
-        body = QLabel(text)
+        self.body = body = QLabel(text)
         body.setWordWrap(True)
         body.setTextFormat(Qt.TextFormat.RichText)
 
@@ -946,13 +947,42 @@ class MessageDialog(QDialog):
             ok = buttons.addButton("OK", QDialogButtonBox.ButtonRole.AcceptRole)
         ok.setObjectName("Primary")
         ok.setDefault(True)
+        self.confirm_button = ok
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
 
-def ask(parent, title, text, confirm_text):
-    return MessageDialog(parent, title, text, confirm_text=confirm_text).exec() == QDialog.DialogCode.Accepted
+class ProcessDialog(MessageDialog):
+    """Confirms "Process Files", with a choice of whether to fill _EXPORTS too.
+
+    Without an export_label there is nothing to export, so no choice is shown.
+    """
+
+    def __init__(self, parent, moves_text, export_label=None, export_text=""):
+        super().__init__(parent, "Process files", moves_text, confirm_text="Process")
+        self.body.setVisible(bool(moves_text))
+        self._has_moves = bool(moves_text)
+        self.export_check = None
+        if export_label:
+            self.export_check = QCheckBox(export_label)
+            self.export_check.setChecked(True)
+            self.export_details = QLabel(export_text)
+            self.export_details.setWordWrap(True)
+            self.export_details.setTextFormat(Qt.TextFormat.RichText)
+            self.export_check.toggled.connect(self._on_export_toggled)
+            # Between the text and the buttons, which are the last item.
+            layout = self.layout()
+            layout.insertWidget(layout.count() - 1, self.export_check)
+            layout.insertWidget(layout.count() - 1, self.export_details)
+
+    def _on_export_toggled(self, checked):
+        self.export_details.setEnabled(checked)
+        self.confirm_button.setEnabled(checked or self._has_moves)  # otherwise there is nothing to do
+
+    @property
+    def export_requested(self):
+        return self.export_check is not None and self.export_check.isChecked()
 
 
 def inform(parent, title, text, details=None):

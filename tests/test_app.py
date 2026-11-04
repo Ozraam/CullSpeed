@@ -7,10 +7,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QPoint, QSettings, Qt  # noqa: E402
 from PyQt6.QtGui import QColor, QImage  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
-from PyQt6.QtWidgets import QApplication  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 
 from cullspeed.app import CULL_TAB, GALLERY_TAB, CullSpeedApp  # noqa: E402
 from cullspeed.constants import KEEP, REJECT  # noqa: E402
+from cullspeed.widgets import ProcessDialog  # noqa: E402
 
 CTRL = Qt.KeyboardModifier.ControlModifier
 PHOTOS = 6
@@ -371,3 +372,46 @@ def test_crop_is_saved_with_the_session(window, tmp_path):
     window.save_session()
     window.load_folder(str(tmp_path))
     assert window.model.photo(2).edit == {"crop": [0.1, 0.2, 0.3, 0.4]}
+
+
+# -- process files -------------------------------------------------------------
+
+def process(win, monkeypatch, export):
+    """Run "Process Files" through its real dialog, setting the export box then confirming."""
+    def confirm(dialog):
+        assert dialog.export_check.isChecked()  # ticked by default
+        dialog.export_check.setChecked(export)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ProcessDialog, "exec", confirm)
+    win.process_files()
+
+
+def test_process_files_exports_by_default(window, tmp_path, monkeypatch):
+    statuses(window, keep=[0])
+    process(window, monkeypatch, export=True)
+    assert (tmp_path / "_KEEPS" / "IMG_0.jpg").exists()
+    assert wait_until(lambda: (tmp_path / "_EXPORTS" / "IMG_0.jpg").exists())
+
+
+def test_process_files_can_skip_the_exports(window, tmp_path, monkeypatch):
+    statuses(window, keep=[0])
+    process(window, monkeypatch, export=False)
+    assert (tmp_path / "_KEEPS" / "IMG_0.jpg").exists()
+    assert not (tmp_path / "_EXPORTS").exists()
+
+
+def test_process_dialog_needs_something_to_do(qapp):
+    with_moves = ProcessDialog(None, "1 photo will be moved", "Export 1 photo(s)", "details")
+    with_moves.export_check.setChecked(False)
+    assert with_moves.confirm_button.isEnabled()
+    assert not with_moves.export_requested
+
+    exports_only = ProcessDialog(None, "", "Export 1 photo(s)", "details")
+    assert exports_only.export_requested
+    exports_only.export_check.setChecked(False)
+    assert not exports_only.confirm_button.isEnabled()
+
+    moves_only = ProcessDialog(None, "1 photo will be moved")
+    assert moves_only.export_check is None
+    assert not moves_only.export_requested
