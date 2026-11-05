@@ -159,3 +159,34 @@ def test_raw_jpeg_pair_moves_and_renames_together(tmp_path):
         raw: os.path.join(folder, KEEP_DIR, "IMG (1).CR2"),
         jpg: os.path.join(folder, KEEP_DIR, "IMG (1).JPG"),
     }
+
+
+def test_plan_exports_renders_edited_and_copies_jpegs(tmp_path):
+    from cullspeed.fileops import plan_exports
+
+    folder = str(tmp_path)
+    photos = [
+        Photo(f"{folder}/a.CR2", KEEP, companions=[f"{folder}/a.JPG"], edit={"exposure": 1.0}),
+        Photo(f"{folder}/b.CR2", KEEP, companions=[f"{folder}/b.JPG"]),
+        Photo(f"{folder}/c.jpg"),
+        Photo(f"{folder}/d.CR2"),  # no JPEG, no edit: nothing to export
+        Photo(f"{folder}/e.jpg", REJECT, edit={"exposure": 1.0}),  # rejected
+        Photo(f"{folder}/{KEEP_DIR}/c.png", KEEP, KEEP, edit={"contrast": 10}),  # same stem as c.jpg
+    ]
+    jobs = [(os.path.basename(j.path), bool(j.edit), j.name) for j in plan_exports(photos)]
+    assert jobs == [
+        ("a.CR2", True, "a.jpg"),
+        ("b.JPG", False, "b.JPG"),
+        ("c.jpg", False, "c.jpg"),
+        ("c.png", True, "c (1).jpg"),
+    ]
+
+
+def test_copy_export_replaces_earlier_export(tmp_path):
+    from cullspeed.fileops import copy_export
+
+    source = touch(tmp_path / "a.jpg", "new")
+    touch(tmp_path / "_EXPORTS" / "a.jpg", "old")
+    dest = copy_export(source, str(tmp_path / "_EXPORTS"), "a.jpg")
+    assert read(dest) == "new"
+    assert listing(str(tmp_path), "_EXPORTS") == ["a.jpg"]

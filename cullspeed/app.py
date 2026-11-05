@@ -43,7 +43,7 @@ from .constants import (
 from .editing import EditRenderer, export_photo
 from .editpanel import EditPanel
 from .exif import summary
-from .fileops import execute_moves, plan_moves
+from .fileops import copy_export, execute_moves, plan_exports, plan_moves
 from .loader import ImageLoader
 from .models import PhotoModel, StatusFilterProxy, photo_files, relative_key, save_session, scan_folder
 from .widgets import (
@@ -87,13 +87,13 @@ class MoveThread(QThread):
 
 
 class ExportThread(QThread):
-    """Renders edited photos to JPEG off the GUI thread."""
+    """Renders edited photos to JPEG (or copies unedited ones) off the GUI thread."""
 
     progressed = pyqtSignal(int)
 
     def __init__(self, jobs, dest_dir, parent=None):
         super().__init__(parent)
-        self.jobs = jobs  # [(path, edit, LUT path)]
+        self.jobs = jobs  # [(path, edit, LUT path, name)]: edit {} copies; name None picks a free one
         self.dest_dir = dest_dir
         self.exported = []
         self.errors = []
@@ -104,12 +104,15 @@ class ExportThread(QThread):
 
     def run(self):
         tables = {}
-        for done, (path, edit, lut_path) in enumerate(self.jobs):
+        for done, (path, edit, lut_path, name) in enumerate(self.jobs):
             if self._stop.is_set():
                 break
             self.progressed.emit(done)
             try:
-                self.exported.append(export_photo(path, edit, lut_path, self.dest_dir, tables))
+                if edit:
+                    self.exported.append(export_photo(path, edit, lut_path, self.dest_dir, tables, name=name))
+                else:
+                    self.exported.append(copy_export(path, self.dest_dir, name))
             except Exception as exc:  # one bad photo must not stop the others
                 self.errors.append(f"{os.path.basename(path)}: {exc}")
         self.progressed.emit(len(self.jobs))
@@ -653,15 +656,26 @@ class CullSpeedApp(QMainWindow):
         if not rows or self.moving:
             return
         self.save_session()
-        jobs = [(p.path, p.edit, self._lut_path(p.edit)) for p in (self.model.photo(row) for row in rows)]
-        dest = os.path.join(self.folder, EXPORT_DIR)
+        jobs = [(p.path, p.edit, self._lut_path(p.edit), None) for p in (self.model.photo(row) for row in rows)]
+        thread = self._run_export(jobs, "Export JPEG")
+        if thread.errors:
+            inform(
+                self,
+                "Some photos were not exported",
+                f"Exported {len(thread.exported)} of {len(jobs)} photo(s) to {EXPORT_DIR}. These failed:",
+                details=thread.errors,
+            )
+        else:
+            self.toast.show_message(f"Exported {len(thread.exported)} photo(s) to {EXPORT_DIR}")
 
+    def _run_export(self, jobs, title):
+        """Run an ExportThread behind a modal progress dialog; returns the finished thread."""
         progress = QProgressDialog("Exporting…", "Stop", 0, len(jobs), self)
-        progress.setWindowTitle("Export JPEG")
+        progress.setWindowTitle(title)
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.setMinimumDuration(0)
         progress.setValue(0)
-        thread = ExportThread(jobs, dest, self)
+        thread = ExportThread(jobs, os.path.join(self.folder, EXPORT_DIR), self)
         thread.progressed.connect(progress.setValue)
         progress.canceled.connect(thread.stop)
         loop = QEventLoop()
@@ -672,16 +686,7 @@ class CullSpeedApp(QMainWindow):
         self.moving = False
         progress.close()
         thread.deleteLater()
-
-        if thread.errors:
-            inform(
-                self,
-                "Some photos were not exported",
-                f"Exported {len(thread.exported)} of {len(jobs)} photo(s) to {EXPORT_DIR}. These failed:",
-                details=thread.errors,
-            )
-        else:
-            self.toast.show_message(f"Exported {len(thread.exported)} photo(s) to {EXPORT_DIR}")
+        return thread
 
     # -- compare -----------------------------------------------------------
 
@@ -792,7 +797,8 @@ class CullSpeedApp(QMainWindow):
         keeps, rejects, unmarked = self.model.counts()
         self.stats.update_counts(keeps, rejects, unmarked)
         self.gallery_toolbar.update_counts(self.model.rowCount(), keeps, rejects, unmarked)
-        self.header.set_can_process(bool(self.folder) and self.model.has_unsorted())
+        # Even when everything is sorted, processing refreshes _EXPORTS.
+        self.header.set_can_process(bool(self.folder) and self.model.rowCount() > 0)
         if self.current_row in rows and self.live_edit is None:
             self.edit_panel.set_edit(self.model.photo(self.current_row).edit)  # undo, paste, reset…
         if set(rows) & set(self._shown_rows()):
@@ -839,31 +845,82 @@ class CullSpeedApp(QMainWindow):
     # -- processing --------------------------------------------------------
 
     def process_files(self):
+        """Move photos to the folder of their mark, then fill _EXPORTS.
+
+        Edited photos are exported as JPEGs; unedited ones get their JPEG
+        (if they have one) copied. Rejected photos are not exported.
+        """
         if not self.folder:
             return
         self._end_compare()
         self.save_session()
         moves = plan_moves(self.folder, self.model.photos)
-        if not moves:
+        exports = plan_exports(self.model.photos)
+        if not moves and not exports:
             self.toast.show_message("Everything is already sorted")
             return
 
         keeps = sum(1 for m in moves if m.status == KEEP)
         rejects = sum(1 for m in moves if m.status == REJECT)
         unmarked = len(moves) - keeps - rejects
-        lines = [f"<b>{len(moves)}</b> photo(s) will be moved:"]
+        lines = []
+        if moves:
+            lines.append(f"<b>{len(moves)}</b> photo(s) will be moved:")
         if keeps:
             lines.append(f"&nbsp;&nbsp;• {keeps} → <b>_KEEPS</b>")
         if rejects:
             lines.append(f"&nbsp;&nbsp;• {rejects} → <b>_REJECTS</b>")
         if unmarked:
             lines.append(f"&nbsp;&nbsp;• {unmarked} → folder root (unmarked)")
+        if exports:
+            edited = sum(1 for job in exports if job.edit)
+            if lines:
+                lines.append("")
+            lines.append(f"<b>{len(exports)}</b> photo(s) will be exported to <b>{EXPORT_DIR}</b>:")
+            if edited:
+                lines.append(f"&nbsp;&nbsp;• {edited} edited → rendered as JPEG")
+            if len(exports) - edited:
+                lines.append(f"&nbsp;&nbsp;• {len(exports) - edited} without edits → JPEG copied")
         lines.append(
-            "<br>RAW+JPEG pairs and XMP sidecars move together. Existing files are never overwritten."
+            "<br>RAW+JPEG pairs and XMP sidecars move together. Existing files are never overwritten,"
+            f" except earlier exports of the same photos in {EXPORT_DIR}."
         )
-        if not ask(self, "Process files", "<br>".join(lines), "Move Files"):
+        if not ask(self, "Process files", "<br>".join(lines), "Process"):
             return
 
+        if moves:
+            result = self._move_files(moves)
+            moved = sum(1 for move in moves if move.src in result.moved)
+            if result.errors:
+                inform(
+                    self,
+                    "Some files were not moved",
+                    f"Moved {moved} of {len(moves)} photo(s). These failed:",
+                    details=result.errors,
+                )
+            elif result.cancelled:
+                self.toast.show_message(f"Stopped after moving {moved} photo(s)")
+                return
+            summary_text = f"Moved {moved} photo(s)"
+        else:
+            summary_text = "Nothing to move"
+
+        # Planned again: the photos may have just moved.
+        exports = plan_exports(self.model.photos)
+        jobs = [(job.path, job.edit, self._lut_path(job.edit), job.name) for job in exports]
+        thread = self._run_export(jobs, "Process files")
+        if thread.errors:
+            inform(
+                self,
+                "Some photos were not exported",
+                f"Exported {len(thread.exported)} of {len(jobs)} photo(s) to {EXPORT_DIR}. These failed:",
+                details=thread.errors,
+            )
+        else:
+            self.toast.show_message(f"{summary_text}, exported {len(thread.exported)} to {EXPORT_DIR}")
+
+    def _move_files(self, moves):
+        """Run the moves behind a modal progress dialog and update the model; returns the MoveResult."""
         progress = QProgressDialog("Moving files…", "Stop", 0, len(moves), self)
         progress.setWindowTitle("Process files")
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -896,19 +953,7 @@ class CullSpeedApp(QMainWindow):
         self._watch(self.folder)  # _KEEPS / _REJECTS may have just been created
         if self.current_row >= 0:
             self.header.set_folder(self.folder, self.model.photo(self.current_row).display_name)
-
-        moved = sum(1 for move in moves if move.src in result.moved)
-        if result.errors:
-            inform(
-                self,
-                "Some files were not moved",
-                f"Moved {moved} of {len(moves)} photo(s). These failed:",
-                details=result.errors,
-            )
-        elif result.cancelled:
-            self.toast.show_message(f"Stopped after moving {moved} photo(s)")
-        else:
-            self.toast.show_message(f"Moved {moved} photo(s)")
+        return result
 
     # -- window ------------------------------------------------------------
 

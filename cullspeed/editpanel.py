@@ -1,4 +1,6 @@
 """The quick edit panel shown beside the photo in the Cull view."""
+import os
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -6,6 +8,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -48,6 +51,65 @@ class _Slider(QSlider):
     def mouseDoubleClickEvent(self, event):
         self.setValue(self.default)
         self.sliderReleased.emit()  # a deliberate change: commit it
+
+
+class _LutCombo(QComboBox):
+    """A combo box whose popup is a menu tree following the LUT folder's sub-folders.
+
+    Items stay a flat list (text: display name, data: LUT id like "Fuji/Velvia 50.png");
+    only the popup is nested, so a big LUT collection is browsed one folder at a time.
+    """
+
+    def showPopup(self):
+        menu = self.build_menu()
+        menu.setMinimumWidth(self.width())
+        menu.exec(self.mapToGlobal(self.rect().bottomLeft()))
+        menu.deleteLater()
+        self.hidePopup()  # resets the combo's pressed state
+
+    def build_menu(self):
+        menu = QMenu(self)
+        submenus = {}  # folder path -> QMenu
+
+        def folder_menu(parts):
+            if not parts:
+                return menu
+            key = "/".join(parts)
+            if key not in submenus:
+                submenus[key] = folder_menu(parts[:-1]).addMenu(parts[-1])
+            return submenus[key]
+
+        luts = []
+        for index in range(self.count()):
+            lut_id = self.itemData(index)
+            if lut_id and self.itemText(index).startswith("Missing: "):
+                lut_id = None  # not in the folder: keep it at the top level
+            if lut_id:
+                luts.append((lut_id.split("/"), index))
+            else:
+                self._add_action(menu, self.itemText(index), index)
+        if luts:
+            menu.addSeparator()
+        # Sub-folders before the LUTs next to them, like a file browser.
+        for parts, index in sorted(luts, key=lambda item: (
+            [p.casefold() for p in item[0][:-1]] + ["￿"], item[0][-1].casefold()
+        )):
+            *folders, name = parts
+            self._add_action(folder_menu(folders), os.path.splitext(name)[0], index)
+        return menu
+
+    def _add_action(self, menu, text, index):
+        action = menu.addAction(text)
+        action.setCheckable(True)
+        action.setChecked(index == self.currentIndex())
+        action.triggered.connect(lambda _checked, index=index: self.setCurrentIndex(index))
+        if index == self.currentIndex():
+            # Bold the folders leading to the current LUT, so it's easy to find again.
+            while isinstance(menu.parent(), QMenu):
+                font = menu.menuAction().font()
+                font.setBold(True)
+                menu.menuAction().setFont(font)
+                menu = menu.parent()
 
 
 def _format(key, value):
@@ -163,7 +225,7 @@ class EditPanel(QFrame):
         return button
 
     def _lut_row(self):
-        self.lut_combo = QComboBox()
+        self.lut_combo = _LutCombo()
         self.lut_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.lut_combo.setMinimumWidth(0)
         self.lut_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
