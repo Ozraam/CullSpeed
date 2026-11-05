@@ -5,6 +5,7 @@ from PyQt6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QPainterPa
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -22,6 +23,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from . import cropping
 from .constants import (
     COLOR_ACCENT,
     COLOR_CARD,
@@ -233,9 +235,15 @@ class ImageView(QWidget):
     zoom_changed = pyqtSignal(bool)
     view_changed = pyqtSignal(bool, QPointF)  # zoomed, center: the user zoomed or panned
     clicked = pyqtSignal()
+    crop_confirmed = pyqtSignal()  # double-click on the crop frame
+
+    CROP_HANDLE_REACH = 12  # pixels around a crop handle that grab it
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._crop = None  # the crop frame, while cropping (see cropping.py)
+        self._crop_ratio = None  # its shape: width / height in pixels, "original" or None
+        self._crop_drag = None  # (handle, mouse position, frame) when the drag started
         self._pixmap = None
         self._source_key = None  # cacheKey() of the pixmap last given to set_image()
         self._native = None  # size of the photo itself, which a preview is smaller than
@@ -308,6 +316,122 @@ class ImageView(QWidget):
     def zoomed(self):
         return self._zoomed
 
+    # crop tool: the whole photo is shown with the frame over it
+
+    @property
+    def crop_frame(self):
+        return self._crop
+
+    def start_crop(self, frame, ratio):
+        self._crop = tuple(frame)
+        self._crop_drag = None
+        self.setMouseTracking(True)
+        self.set_crop_ratio(ratio)
+        self.update()
+
+    def stop_crop(self):
+        self._crop = self._crop_drag = None
+        self.setMouseTracking(False)
+        self._update_cursor()
+        self.update()
+
+    def set_crop_ratio(self, ratio):
+        """Give the frame a new shape (see EditPanel.crop_pixel_ratio())."""
+        self._crop_ratio = ratio
+        self.set_crop_frame(self._crop)
+
+    def set_crop_frame(self, frame):
+        self._crop = cropping.fit_aspect(tuple(frame), self._crop_aspect())
+        self.update()
+
+    def _crop_aspect(self):
+        if self._crop_ratio is None or self._pixmap is None:
+            return None
+        if self._crop_ratio == "original":
+            return 1.0
+        return self._crop_ratio * self._pixmap.height() / self._pixmap.width()
+
+    def _crop_rect(self, fit):
+        """The frame in widget coordinates."""
+        left, top, right, bottom = self._crop
+        return QRectF(
+            fit.x() + left * fit.width(), fit.y() + top * fit.height(),
+            (right - left) * fit.width(), (bottom - top) * fit.height(),
+        )
+
+    def _crop_handle_at(self, position):
+        rect = self._crop_rect(self._fit_rect())
+        xs = {"l": rect.left(), "r": rect.right()}
+        ys = {"t": rect.top(), "b": rect.bottom()}
+        reach = self.CROP_HANDLE_REACH
+        near_x = next((k for k, x in xs.items() if abs(position.x() - x) <= reach), "")
+        near_y = next((k for k, y in ys.items() if abs(position.y() - y) <= reach), "")
+        in_x = rect.left() - reach <= position.x() <= rect.right() + reach
+        in_y = rect.top() - reach <= position.y() <= rect.bottom() + reach
+        if near_x and near_y:
+            return near_y + near_x
+        if near_x and in_y:
+            return near_x
+        if near_y and in_x:
+            return near_y
+        return cropping.MOVE if rect.contains(position) else None
+
+    def _update_crop_cursor(self, position):
+        handle = self._crop_drag[0] if self._crop_drag else self._crop_handle_at(position)
+        shapes = {
+            "tl": Qt.CursorShape.SizeFDiagCursor, "br": Qt.CursorShape.SizeFDiagCursor,
+            "tr": Qt.CursorShape.SizeBDiagCursor, "bl": Qt.CursorShape.SizeBDiagCursor,
+            "l": Qt.CursorShape.SizeHorCursor, "r": Qt.CursorShape.SizeHorCursor,
+            "t": Qt.CursorShape.SizeVerCursor, "b": Qt.CursorShape.SizeVerCursor,
+            cropping.MOVE: Qt.CursorShape.ClosedHandCursor if self._crop_drag else Qt.CursorShape.OpenHandCursor,
+        }
+        if handle in shapes:
+            self.setCursor(shapes[handle])
+        else:
+            self.unsetCursor()
+
+    def _draw_crop(self, painter, fit):
+        rect = self._crop_rect(fit)
+        outside = QPainterPath()
+        outside.addRect(QRectF(fit))
+        outside.addRect(rect)
+        painter.fillPath(outside, QColor(0, 0, 0, 165))  # odd-even fill: everything but the frame
+
+        painter.setPen(QPen(QColor(255, 255, 255, 110), 1))
+        for i in (1, 2):  # rule of thirds
+            x, y = rect.left() + rect.width() * i / 3, rect.top() + rect.height() * i / 3
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+        painter.setPen(QPen(QColor("#ffffff"), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(rect)
+
+        pen = QPen(QColor("#ffffff"), 3)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(pen)
+        arm = min(18.0, rect.width() / 2, rect.height() / 2)
+        for x, sx in ((rect.left(), 1), (rect.right(), -1)):
+            for y, sy in ((rect.top(), 1), (rect.bottom(), -1)):
+                painter.drawLine(QPointF(x, y), QPointF(x + sx * arm, y))
+                painter.drawLine(QPointF(x, y), QPointF(x, y + sy * arm))
+        for x, y in ((rect.center().x(), rect.top()), (rect.center().x(), rect.bottom())):
+            painter.drawLine(QPointF(x - arm / 2, y), QPointF(x + arm / 2, y))
+        for x, y in ((rect.left(), rect.center().y()), (rect.right(), rect.center().y())):
+            painter.drawLine(QPointF(x, y - arm / 2), QPointF(x, y + arm / 2))
+
+        native = self._native or self._pixmap.size()
+        left, top, right, bottom = self._crop
+        text = (
+            f"{round((right - left) * native.width())} × {round((bottom - top) * native.height())}"
+            "  ·  Enter to apply  ·  Esc to cancel"
+        )
+        metrics = QFontMetrics(painter.font())
+        note = QRectF(0, 0, metrics.horizontalAdvance(text) + 24, metrics.height() + 10)
+        note.moveCenter(QPointF(self.width() / 2, self.height() - note.height() / 2 - 22))
+        _fill_pill(painter, note)
+        painter.setPen(QColor(COLOR_TEXT))
+        painter.drawText(note, Qt.AlignmentFlag.AlignCenter, text)
+
     def toggle_zoom(self, at=None):
         if self._pixmap is None:
             return
@@ -353,6 +477,8 @@ class ImageView(QWidget):
         return QRectF(x, y, size.width(), size.height())
 
     def _update_cursor(self):
+        if self._crop is not None:
+            return  # follows the handle under the mouse
         if self._zoomed and self._pixmap is not None:
             self.setCursor(Qt.CursorShape.ClosedHandCursor if self._drag_from else Qt.CursorShape.OpenHandCursor)
         else:
@@ -365,15 +491,37 @@ class ImageView(QWidget):
         super().resizeEvent(event)
 
     def mouseDoubleClickEvent(self, event):
+        if self._crop is not None:
+            self.crop_confirmed.emit()
+            return
         self.toggle_zoom(event.position().toPoint())
 
     def mousePressEvent(self, event):
         self.clicked.emit()
+        if self._crop is not None:
+            if self._pixmap is not None and event.button() == Qt.MouseButton.LeftButton:
+                handle = self._crop_handle_at(event.position())
+                if handle:
+                    self._crop_drag = (handle, event.position(), self._crop)
+                    self._update_crop_cursor(event.position())
+            return
         if self._zoomed and self._pixmap is not None and event.button() == Qt.MouseButton.LeftButton:
             self._drag_from = event.position()
             self._update_cursor()
 
     def mouseMoveEvent(self, event):
+        if self._crop is not None:
+            if self._crop_drag and self._pixmap is not None:
+                handle, start, frame = self._crop_drag
+                fit = self._fit_rect()
+                delta = event.position() - start
+                self._crop = cropping.drag(
+                    frame, handle, delta.x() / fit.width(), delta.y() / fit.height(), self._crop_aspect()
+                )
+                self.update()
+            if self._pixmap is not None:
+                self._update_crop_cursor(event.position())
+            return
         if self._drag_from is None:
             return
         rect = self._zoom_rect()
@@ -387,6 +535,11 @@ class ImageView(QWidget):
         self.view_changed.emit(True, self._center)
 
     def mouseReleaseEvent(self, event):
+        if self._crop is not None:
+            self._crop_drag = None
+            if self._pixmap is not None:
+                self._update_crop_cursor(event.position())
+            return
         self._drag_from = None
         self._update_cursor()
 
@@ -417,6 +570,9 @@ class ImageView(QWidget):
                 self._scaled.setDevicePixelRatio(dpr)
             painter.drawPixmap(fit.topLeft(), self._scaled)
             target = QRectF(fit)
+            if self._crop is not None:
+                self._draw_crop(painter, fit)
+                return
 
         visible = target.intersected(QRectF(self.rect()))
         color = STATUS_COLORS.get(self._status)
@@ -662,8 +818,8 @@ class StatsBar(QFrame):
         undo = QKeySequence(QKeySequence.StandardKey.Undo).toString(native)
         mod = QKeySequence("Ctrl+1").toString(native)[:-1]  # "⌘" on macOS, "Ctrl+" elsewhere
         hint = QLabel(
-            f"P keep · X reject · U unmark · {mod}1–5 stars · {mod}6–9 label · N next unmarked · "
-            f"C compare · E edit · Z zoom · I info · G gallery · {undo} undo"
+            f"P keep · X reject · U unmark · {mod}1–5 stars · {mod}6–9 label · N next unmarked · K keeps only · "
+            f"C compare · E edit · R crop · {mod}C / {mod}V copy / paste edit · Z zoom · I info · G gallery · {undo} undo"
         )
         hint.setToolTip(hint.text())
         # May be cut off in a narrow window rather than force the window wider.
@@ -767,7 +923,7 @@ class MessageDialog(QDialog):
 
         heading = QLabel(title)
         heading.setObjectName("DialogTitle")
-        body = QLabel(text)
+        self.body = body = QLabel(text)
         body.setWordWrap(True)
         body.setTextFormat(Qt.TextFormat.RichText)
 
@@ -791,13 +947,42 @@ class MessageDialog(QDialog):
             ok = buttons.addButton("OK", QDialogButtonBox.ButtonRole.AcceptRole)
         ok.setObjectName("Primary")
         ok.setDefault(True)
+        self.confirm_button = ok
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
 
-def ask(parent, title, text, confirm_text):
-    return MessageDialog(parent, title, text, confirm_text=confirm_text).exec() == QDialog.DialogCode.Accepted
+class ProcessDialog(MessageDialog):
+    """Confirms "Process Files", with a choice of whether to fill _EXPORTS too.
+
+    Without an export_label there is nothing to export, so no choice is shown.
+    """
+
+    def __init__(self, parent, moves_text, export_label=None, export_text=""):
+        super().__init__(parent, "Process files", moves_text, confirm_text="Process")
+        self.body.setVisible(bool(moves_text))
+        self._has_moves = bool(moves_text)
+        self.export_check = None
+        if export_label:
+            self.export_check = QCheckBox(export_label)
+            self.export_check.setChecked(True)
+            self.export_details = QLabel(export_text)
+            self.export_details.setWordWrap(True)
+            self.export_details.setTextFormat(Qt.TextFormat.RichText)
+            self.export_check.toggled.connect(self._on_export_toggled)
+            # Between the text and the buttons, which are the last item.
+            layout = self.layout()
+            layout.insertWidget(layout.count() - 1, self.export_check)
+            layout.insertWidget(layout.count() - 1, self.export_details)
+
+    def _on_export_toggled(self, checked):
+        self.export_details.setEnabled(checked)
+        self.confirm_button.setEnabled(checked or self._has_moves)  # otherwise there is nothing to do
+
+    @property
+    def export_requested(self):
+        return self.export_check is not None and self.export_check.isChecked()
 
 
 def inform(parent, title, text, details=None):

@@ -27,6 +27,7 @@ QMainWindow, QDialog {{ background: {COLOR_BG}; }}
 #KeepCount {{ color: {COLOR_KEEP}; font-weight: bold; }}
 #RejectCount {{ color: {COLOR_REJECT}; font-weight: bold; }}
 #DialogTitle {{ font-size: 15px; font-weight: bold; }}
+QLabel:disabled {{ color: #5b5b5b; }}
 #Toast {{
     background: rgba(20, 20, 20, 235); color: {COLOR_TEXT};
     border: 1px solid {COLOR_BORDER}; border-radius: 8px; padding: 9px 16px;
@@ -45,7 +46,7 @@ QPushButton#Chip {{ border-radius: 12px; padding: 3px 12px; }}
 QPushButton#Chip:checked {{ background: {COLOR_ACCENT}; border-color: {COLOR_ACCENT}; color: white; }}
 
 QTabWidget::pane {{ border: none; }}
-QTabBar {{ background: {COLOR_PANEL}; }}
+QTabBar, #TabCorner {{ background: {COLOR_PANEL}; }}
 QTabBar::tab {{
     background: transparent; color: {COLOR_MUTED};
     padding: 7px 18px; border: none; border-bottom: 2px solid transparent;

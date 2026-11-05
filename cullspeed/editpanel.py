@@ -112,6 +112,20 @@ class _LutCombo(QComboBox):
                 menu = menu.parent()
 
 
+# Label, width / height of the frame in pixels; "original" is the photo's own shape.
+CROP_RATIOS = (
+    ("Free", None),
+    ("Original", "original"),
+    ("1:1", 1.0),
+    ("3:2", 3 / 2),
+    ("2:3", 2 / 3),
+    ("4:5", 4 / 5),
+    ("5:4", 5 / 4),
+    ("16:9", 16 / 9),
+    ("9:16", 9 / 16),
+)
+
+
 def _format(key, value):
     if key == "exposure":
         return f"{value:+.2f} EV"
@@ -135,6 +149,9 @@ class EditPanel(QFrame):
     reset_requested = pyqtSignal()
     export_requested = pyqtSignal()
     lut_folder_requested = pyqtSignal()
+    crop_requested = pyqtSignal()
+    crop_cleared = pyqtSignal()
+    crop_ratio_changed = pyqtSignal()
 
     WIDTH = 300
 
@@ -145,6 +162,7 @@ class EditPanel(QFrame):
         self._sliders = {}
         self._values = {}
         self._updating = False
+        self._crop = None  # the photo's crop: not a slider, but part of edit()
 
         content = QWidget()
         content.setObjectName("EditPanelContent")
@@ -158,6 +176,12 @@ class EditPanel(QFrame):
         hint.setObjectName("Muted")
         layout.addWidget(title)
         layout.addWidget(hint)
+
+        heading = QLabel("CROP")
+        heading.setObjectName("SectionTitle")
+        layout.addSpacing(8)
+        layout.addWidget(heading)
+        layout.addLayout(self._crop_row())
 
         for section, rows in _SECTIONS:
             heading = QLabel(section.upper())
@@ -224,6 +248,24 @@ class EditPanel(QFrame):
         button.clicked.connect(signal)
         return button
 
+    def _crop_row(self):
+        self.crop_button = self._button("Crop", self.crop_requested)
+        self.crop_button.setToolTip("Crop this photo (R)")
+        self.crop_ratio = QComboBox()
+        self.crop_ratio.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.crop_ratio.setToolTip("Shape of the crop frame")
+        for label, ratio in CROP_RATIOS:
+            self.crop_ratio.addItem(label, ratio)
+        self.crop_ratio.currentIndexChanged.connect(lambda _index: self.crop_ratio_changed.emit())
+        clear = self._button("Clear", self.crop_cleared)
+        clear.setToolTip("Back to the whole photo")
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.addWidget(self.crop_button)
+        row.addWidget(self.crop_ratio, 1)
+        row.addWidget(clear)
+        return row
+
     def _lut_row(self):
         self.lut_combo = _LutCombo()
         self.lut_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -262,6 +304,7 @@ class EditPanel(QFrame):
     def set_edit(self, edit):
         """Show `edit` without emitting `changed`."""
         values = develop.settings(edit)
+        self._crop = values["crop"]
         self._updating = True
         for key, (slider, scale) in self._sliders.items():
             slider.setValue(round(values[key] * scale))
@@ -272,7 +315,24 @@ class EditPanel(QFrame):
     def edit(self):
         values = {key: slider.value() / scale for key, (slider, scale) in self._sliders.items()}
         values["lut"] = self.lut_combo.currentData()
+        values["crop"] = self._crop
         return develop.clean(values)
+
+    def set_cropping(self, cropping):
+        self.crop_button.setText("Done" if cropping else "Crop")
+        self.crop_button.setObjectName("Primary" if cropping else "")
+        self.crop_button.style().unpolish(self.crop_button)
+        self.crop_button.style().polish(self.crop_button)
+
+    def crop_pixel_ratio(self):
+        """The chosen frame shape: width / height in pixels, "original", or None when free."""
+        return self.crop_ratio.currentData()
+
+    def set_crop_free(self):
+        """Choose the free shape, without emitting `crop_ratio_changed`."""
+        blocked = self.crop_ratio.blockSignals(True)
+        self.crop_ratio.setCurrentIndex(0)
+        self.crop_ratio.blockSignals(blocked)
 
     # -- signals -------------------------------------------------------------
 
