@@ -65,7 +65,9 @@ QScrollBar::handle {{ background: #3a3a3a; border-radius: 4px; min-width: 30px; 
 QScrollBar::handle:hover {{ background: #4a4a4a; }}
 QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {{ width: 0; height: 0; background: none; }}
 
-#EditPanel, #EditPanelContent, #EditPanelFooter {{ background: {COLOR_PANEL}; }}
+#EditPanel, #EditPanelHeader, #EditPanelContent, #EditPanelFooter {{ background: {COLOR_PANEL}; }}
+#EditPanelHeader {{ border-bottom: 1px solid {COLOR_BORDER}; }}
+#EditPanelHeader QPushButton:checked {{ background: {COLOR_ACCENT}; border-color: {COLOR_ACCENT}; color: white; }}
 #EditPanelFooter {{ border-top: 1px solid {COLOR_BORDER}; }}
 #EditPanel {{ border-left: 1px solid {COLOR_BORDER}; }}
 #SectionTitle {{ color: {COLOR_MUTED}; font-size: 11px; font-weight: bold; letter-spacing: 1px; }}

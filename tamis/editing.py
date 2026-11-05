@@ -6,7 +6,10 @@ on one background thread, newest request first, and split each image into
 strips processed in parallel (numpy releases the GIL while it computes).
 While a slider is being dragged a half-size preview is rendered, which
 keeps up with the mouse; the full preview follows when it is released.
+EditThumbnails renders small versions of edits for the filmstrip and the
+gallery, one at a time, at low priority.
 """
+import hashlib
 import json
 import os
 import threading
@@ -14,15 +17,18 @@ import zlib
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from itertools import count
 
 import numpy as np
 import rawpy
-from PyQt6.QtCore import QObject, Qt, QThreadPool, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, QThread, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QImage, QImageReader, QPixmap
 
 from . import develop, lut
+from .constants import THUMBNAIL_CACHE_BYTES
 from .fileops import atomic_write, free_name
 from .imaging import array_to_image, image_to_array, is_raw, resize_array
+from .loader import file_state, pixmap_bytes, thumbnail_decode_size
 
 EDIT_PREVIEW_SIZE = 2048  # longest edge of the image edits are previewed on
 _STRIP_THREADS = max(1, min(8, (os.cpu_count() or 2)))
@@ -86,6 +92,16 @@ def render_parallel(linear, edit, table, seed):
     return np.concatenate(list(parts))
 
 
+def straighten_parallel(pixels, degrees):
+    """develop.straighten_rows() over the whole of `pixels`, in parallel."""
+    height = pixels.shape[0]
+    step = max(16, -(-height // (_STRIP_THREADS * 2)))
+    parts = _strip_pool.map(
+        lambda top: develop.straighten_rows(pixels, degrees, top, min(height, top + step)), range(0, height, step)
+    )
+    return np.concatenate(list(parts))
+
+
 # -- export --------------------------------------------------------------------
 
 def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=None):
@@ -104,6 +120,9 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=N
         table = tables[lut_path]
 
     pixels, kind = _source(path, None)
+    pixels = develop.turn_array(pixels, edit.get("rotate", 0))
+    if edit.get("straighten"):
+        pixels = straighten_parallel(pixels, edit["straighten"])
     pixels = develop.crop_array(pixels, edit.get("crop"))
     height, width = pixels.shape[:2]
     out = np.empty((height, width, 3), dtype=np.uint8)
@@ -150,6 +169,7 @@ class EditRenderer(QObject):
     BASES = 4  # developed photos kept (≈ 33 MB each at EDIT_PREVIEW_SIZE)
     TABLES = 2  # LUT tables kept (48 MB each)
     RENDERS = 8
+    TURNED = 2  # turned or straightened photos kept, so that a slider doesn't turn them again each time
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -159,6 +179,7 @@ class EditRenderer(QObject):
         self._generation = 0
         self._bases = OrderedDict()  # path -> (full preview, half-size preview)
         self._tables = OrderedDict()  # LUT path -> table
+        self._turned = OrderedDict()  # (path, quick, rotate, straighten) -> pixels
         self._wanted = {}  # path -> (key, edit, lut path, quick): the newest request
         self._running = set()  # paths with a job queued or running
         self._renders = OrderedDict()  # path -> (key, quick, QPixmap); GUI thread only
@@ -182,7 +203,7 @@ class EditRenderer(QObject):
             return current[2]
         if self._errors.get(path) != key:
             self._request(path, key, edit, lut_path, quick)
-        if current is None or (same_crop and json.loads(current[0])[0].get("crop") != edit.get("crop")):
+        if current is None or (same_crop and develop.framing(json.loads(current[0])[0]) != develop.framing(edit)):
             return None
         return current[2]
 
@@ -208,8 +229,8 @@ class EditRenderer(QObject):
                 key, edit, lut_path, quick = wanted
                 try:
                     full, half = self._base(path)
-                    table = self._table(lut_path) if lut_path else None
-                    linear = develop.crop_array(half if quick else full, edit.get("crop"))
+                    table = self.table(lut_path) if lut_path else None
+                    linear = develop.crop_array(self._upright(path, quick, half if quick else full, edit), edit.get("crop"))
                     image = array_to_image(render_parallel(linear, edit, table, _seed(path)))
                     error = ""
                 except Exception as exc:  # a bad photo or LUT must not kill the worker
@@ -237,7 +258,27 @@ class EditRenderer(QObject):
                 self._bases.popitem(last=False)
         return full, half
 
-    def _table(self, lut_path):
+    def _upright(self, path, quick, base, edit):
+        """`base` turned and straightened as `edit` says."""
+        rotate, straighten = edit.get("rotate", 0), edit.get("straighten", 0)
+        if not rotate and not straighten:
+            return base
+        key = (path, quick, rotate, straighten)
+        with self._lock:
+            if key in self._turned:
+                self._turned.move_to_end(key)
+                return self._turned[key]
+        pixels = np.ascontiguousarray(develop.turn_array(base, rotate))
+        if straighten:
+            pixels = straighten_parallel(pixels, straighten)
+        with self._lock:
+            self._turned[key] = pixels
+            while len(self._turned) > self.TURNED:
+                self._turned.popitem(last=False)
+        return pixels
+
+    def table(self, lut_path):
+        """The lookup table of a LUT file; called from worker threads."""
         with self._lock:
             if lut_path in self._tables:
                 self._tables.move_to_end(lut_path)
@@ -275,6 +316,7 @@ class EditRenderer(QObject):
             for old, new in mapping.items():
                 if old in self._bases:
                     self._bases[new] = self._bases.pop(old)
+            self._turned.clear()
         for cache in (self._renders, self._errors):
             for old, new in mapping.items():
                 if old in cache:
@@ -287,8 +329,172 @@ class EditRenderer(QObject):
             self._wanted.clear()
             self._running.clear()
             self._bases.clear()
+            self._turned.clear()
         self._renders.clear()
         self._errors.clear()
+
+    def shutdown(self):
+        self.reset()
+        self._pool.waitForDone()
+
+
+# -- thumbnails ------------------------------------------------------------------
+
+class EditThumbnails(QObject):
+    """Small renders of edits; results arrive as `ready(path)`.
+
+    Only what is on screen is asked for, newest first. A photo keeps showing its
+    latest thumbnail until the one of a new edit is ready. Renders are also kept on
+    disk, by edit: the key holds the file's and the LUT's state, so a change is a miss.
+    """
+
+    ready = pyqtSignal(str)
+
+    _done = pyqtSignal(int, str, str, QImage)  # generation, path, key, image (null if it failed)
+
+    BASES = 16  # small developed photos kept, so that a new edit of one doesn't develop it again
+
+    def __init__(self, renderer, disk_cache=None, parent=None):
+        super().__init__(parent)
+        self._renderer = renderer  # shares its LUT tables, which are big
+        self._disk = disk_cache
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(1)
+        self._priority = count()
+        self._lock = threading.Lock()  # guards everything a worker touches
+        self._generation = 0
+        self._bases = OrderedDict()  # path -> linear pixels
+        self._wanted = {}  # path -> (key, edit, lut path, size): the newest request
+        self._running = set()  # paths with a job queued or running
+        self._pixmaps = OrderedDict()  # path -> (key, QPixmap), LRU order; GUI thread only
+        self._bytes = 0
+        self._failed = {}  # path -> key that failed; GUI thread only
+        self._done.connect(self._on_done)
+
+    def pixmap(self, path, edit, lut_path):
+        """The thumbnail of `edit`, or the latest one while it is being made (None if none yet)."""
+        key = EditRenderer._key(edit, lut_path)
+        current = self._pixmaps.get(path)
+        if current is not None:
+            self._pixmaps.move_to_end(path)
+            if current[0] == key:
+                return current[1]
+        if self._failed.get(path) != key:
+            self._request(path, key, edit, lut_path)
+        return current[1] if current is not None else None
+
+    def _request(self, path, key, edit, lut_path):
+        with self._lock:
+            self._wanted[path] = (key, edit, lut_path, thumbnail_decode_size())
+            if path in self._running:
+                return  # the running job picks the newest request up when it is done
+            self._running.add(path)
+        self._pool.start(self._job(path, self._generation), next(self._priority) % 2**30)
+
+    def _job(self, path, generation):
+        def job():
+            QThread.currentThread().setPriority(QThread.Priority.LowPriority)
+            while True:
+                with self._lock:
+                    wanted = self._wanted.get(path)
+                    if wanted is None or generation != self._generation:
+                        self._running.discard(path)
+                        return
+                try:
+                    image = self._render(path, *wanted)
+                except Exception:  # a bad photo or LUT must not kill the worker; it keeps the original's thumbnail
+                    image = QImage()
+                with suppress(RuntimeError):  # destroyed during shutdown
+                    self._done.emit(generation, path, wanted[0], image)
+                with self._lock:
+                    if self._wanted.get(path) == wanted:
+                        del self._wanted[path]
+                        self._running.discard(path)
+                        return
+                # A newer request arrived meanwhile: render again.
+
+        return job
+
+    def _render(self, path, key, edit, lut_path, size):
+        state = file_state(path)
+        lut_state = file_state(lut_path) if lut_path else None
+        digest = hashlib.sha1(f"{key}\0{lut_state}".encode("utf-8", "surrogateescape")).hexdigest()
+        disk_key = f"{size}:{digest}"
+        if self._disk and state:
+            cached = self._disk.load(path, state, disk_key)
+            if cached is not None:
+                return cached
+        table = self._renderer.table(lut_path) if lut_path else None
+        linear = develop.turn_array(self._base(path, size), edit.get("rotate", 0))
+        if edit.get("straighten"):
+            linear = develop.straighten_rows(linear, edit["straighten"], 0, linear.shape[0])
+        linear = develop.crop_array(linear, edit.get("crop"))
+        image = array_to_image(develop.render(linear, edit, table, _seed(path))).scaled(
+            size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
+        if self._disk and state:
+            self._disk.save(path, state, disk_key, image)
+        return image
+
+    def _base(self, path, size):
+        with self._lock:
+            if path in self._bases:
+                self._bases.move_to_end(path)
+                return self._bases[path]
+        base = develop_base(path, size * 2)  # twice the size, for what a crop leaves
+        with self._lock:
+            self._bases[path] = base
+            while len(self._bases) > self.BASES:
+                self._bases.popitem(last=False)
+        return base
+
+    def _on_done(self, generation, path, key, image):
+        if generation != self._generation:
+            return
+        if image.isNull():
+            self._failed[path] = key
+            return
+        self._failed.pop(path, None)
+        self._drop(path)
+        pixmap = QPixmap.fromImage(image)
+        self._pixmaps[path] = (key, pixmap)
+        self._bytes += pixmap_bytes(pixmap)
+        while self._bytes > THUMBNAIL_CACHE_BYTES // 2 and len(self._pixmaps) > 1:
+            self._drop(next(iter(self._pixmaps)))  # rendered or read again if scrolled back to
+        self.ready.emit(path)
+
+    def _drop(self, path):
+        current = self._pixmaps.pop(path, None)
+        if current is not None:
+            self._bytes -= pixmap_bytes(current[1])
+
+    def forget(self, path):
+        """This file is gone."""
+        self._drop(path)
+        self._failed.pop(path, None)
+        with self._lock:
+            self._bases.pop(path, None)
+
+    def rename_paths(self, mapping):
+        with self._lock:
+            for old, new in mapping.items():
+                if old in self._bases:
+                    self._bases[new] = self._bases.pop(old)
+        for cache in (self._pixmaps, self._failed):
+            for old, new in mapping.items():
+                if old in cache:
+                    cache[new] = cache.pop(old)
+
+    def reset(self):
+        self._generation += 1
+        self._pool.clear()
+        with self._lock:
+            self._wanted.clear()
+            self._running.clear()
+            self._bases.clear()
+        self._pixmaps.clear()
+        self._bytes = 0
+        self._failed.clear()
 
     def shutdown(self):
         self.reset()

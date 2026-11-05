@@ -15,11 +15,16 @@ Tamis is a PyQt6 desktop application for rapidly reviewing and triaging large ph
 - **Import** (`⌘I`): finds the photos in the sub-folders of a memory card, copies them with their sidecars to a folder and optionally to a backup, reads every copy back to compare it with the original, then opens the folder. Nothing on the card changes, files never overwrite others (`IMG_1 (1).CR2`), and those already imported are skipped, even if sorted into `_KEEPS` or `_REJECTS` since.
 - **Trash Rejects**: moves the photos in `_REJECTS` that are still marked reject to the system Trash, with their pairs and sidecars, after a confirmation with their count and size. Nothing is ever deleted: a photo that can't go to the Trash stays where it is, whole.
 - Thumbnails are kept on disk (up to 512 MB, in the app's cache folder), so reopening a folder is fast. They are found by a file's path, size and modification time, so a changed or moved file just gets a new one.
+- **Edited thumbnails**: the filmstrip and the Gallery show photos with their edit and frame, rendered in the background at low priority and kept on disk per edit; until then they show the original.
 - **Star ratings and colour labels**, written to XMP sidecars (`xmp:Rating`, `xmp:Label`) so Lightroom, Bridge, Capture One and darktable see them. Existing sidecars are edited in place, touching only those two properties; new ones are only created for RAWs (`IMG.xmp`).
 - **Keep and reject in other editors**, off by default (**Options ▾ > Show Keep and Reject in Other Editors**), as no flag is common to them. *Rejected as rating −1* writes the `xmp:Rating="-1"` that darktable and Bridge read as rejected; the photo keeps its stars in Tamis, but other editors no longer see them. *Keep green, reject red* gives photos those colour labels, for editors that read `xmp:Label` such as Lightroom, whose own flags are not in XMP at all. A label you gave a photo yourself stays, except that unmarking clears a green or red one. As with ratings, new sidecars are only created for RAWs.
 - **RAW+JPEG pairs** (same name, same folder) are culled as one photo and always move together.
 - **Shooting info** (exposure, aperture, ISO, focal length, camera, lens, date) read from EXIF; `I` shows or hides it.
 - **Quick edits** (`E`): exposure, contrast, highlights, shadows, white balance (temperature / tint), saturation, film simulation LUTs with strength, grain and vignette. Edits are non-destructive (stored in the session, originals untouched), previewed live, can be copied and pasted across photos, and exported as full-size JPEGs to `_EXPORTS`. RAWs are edited from LibRaw's 16-bit linear development, not from their embedded JPEG.
+- **Histogram and clipping**: the edit panel shows the red, green and blue histogram of what is on screen, updated in the background, with the share of the photo clipped at either end. `J` (or **Clipping**) paints clipped highlights in red and blocked shadows in blue, in the Cull view, panel open or not. A highlight is clipped when any channel is, a shadow when all of them are, so a saturated colour isn't taken for a black.
+- **Before / after**: hold `Y` or `\` (or the **Before** button) to see the photo without its edit, in the same frame; the edit itself doesn't change. It shows the same preview as an unedited photo, so for a RAW that is the camera's embedded JPEG, which can differ from LibRaw's development even with no edit.
+- **Rotate and straighten**: `]` / `⇧R` and `[` / `⇧L` turn the current or selected photos by 90°, while culling too; the **Straighten** slider levels a horizon by up to 15°, enlarging the picture so that no empty corner shows. A crop stays on the same part of the picture through a quarter turn. Like a crop, these belong to their photo's framing: they are undoable, exported and cleared by Reset, but neither copied nor kept in a preset, and vignette and grain follow the final frame.
+- **Presets**: **Presets > Save Current Look…** keeps a look (without its framing) under a name, and choosing it applies it to the current or selected photos, on this shoot or any other, as one undo step. They are stored in `presets.json` in the app's data folder.
 - **Crop** (`R`): drag the frame's corners and edges, or inside it to move it, with a free or fixed shape (original, 1:1, 3:2, 4:5, 16:9…). `Enter`, `R` or a double-click applies it, `Esc` cancels; moving to another photo applies it too. Vignette and grain follow the final frame. A crop is part of the photo's edit (undoable, exported, cleared by Reset), but it stays with its photo: copying and pasting an edit carries the look over and leaves each photo's own crop alone.
 - New or removed files are picked up automatically while the folder is open (or with **Refresh**, `⌘R`).
 - Undo for every marking, rating and labelling action.
@@ -58,6 +63,9 @@ tamis                  # or: python Tamis.py, python -m tamis
 | Show / hide shooting info | `I` |
 | Edit panel | `E` |
 | Crop: open / apply, cancel | `R` or `Enter`, `Esc` |
+| Rotate right / left (current or selected) | `]` or `⇧R` / `[` or `⇧L` |
+| Show the photo without its edit, while held (Cull view) | `Y` or `\` |
+| Clipping warnings, on / off (Cull view) | `J` |
 | Copy / paste edit (paste applies to the selection) | `⌘C` / `⌘V` or `⌘⇧C` / `⌘⇧V` (`Ctrl+C` / `V`, `Ctrl+Shift+C` / `V`) |
 | Export JPEG (current or selected photos: edited ones and those without a JPEG are rendered, others copied) | `⌘⇧E` / `Ctrl+Shift+E` |
 | Refresh the folder | `⌘R` / `Ctrl+R`, `F5` |
@@ -73,7 +81,7 @@ In the Cull view, marking a photo as keep or reject moves on to the next one (in
 ## Film simulations
 Film simulations are 3D LUTs, in the same HaldCLUT format RawTherapee uses (`.png` / `.tif`), or `.cube` files. Tamis does not ship any: choose a folder of them with **Folder…** in the edit panel (sub-folders become groups). RawTherapee's [film simulation collection](https://rawpedia.rawtherapee.com/Film_Simulation) (CC BY-SA) works as is, and gives the same looks as in RawTherapee. The base development of RAWs (LibRaw) is close to, but not identical with, RawTherapee's own.
 
-Things the first version does not do yet: the 1:1 zoom shows the original inside the crop (for focus checking), thumbnails show the original, uncropped, and exported JPEGs carry no EXIF.
+Things the first version does not do yet: the 1:1 zoom shows the original inside the frame (for focus checking), and exported JPEGs carry no EXIF.
 
 ## Plugins
 A plugin is a Python file (or a package folder) in the plugins folder, which **Plugins ▾ > Open Plugins Folder** creates and opens. Plugins load at launch, so restart Tamis after adding one. This is all it takes:
@@ -146,11 +154,13 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `tamis/imaging.py` | Thread-safe decoding of RAW and standard images (QImage only) |
 | `tamis/exif.py` | Minimal EXIF reader for shooting info |
 | `tamis/xmp.py` | Reading and editing ratings and labels in XMP sidecars |
-| `tamis/develop.py` | Edit pipeline (numpy): exposure, tone, colour, LUT, grain, vignette |
+| `tamis/develop.py` | Edit pipeline (numpy): turns and straightening, exposure, tone, colour, LUT, grain, vignette |
 | `tamis/cropping.py` | Geometry of the crop frame while it is dragged |
 | `tamis/lut.py` | HaldCLUT / `.cube` loading and fast 256³ lookup tables |
-| `tamis/editing.py` | Developing photos for editing, background previews, JPEG export |
-| `tamis/editpanel.py` | The edit panel |
+| `tamis/editing.py` | Developing photos for editing, background previews and thumbnails of edits, JPEG export |
+| `tamis/editpanel.py` | The edit panel and its histogram |
+| `tamis/tones.py` | Histograms and clipping overlays, and their background worker |
+| `tamis/presets.py` | Named looks, kept in the app's data folder |
 | `tamis/fileops.py` | Planning and executing file moves, the Trash and imports |
 | `tamis/plugins.py` | Loading plugins, the API they receive and the Plugins menu |
 | `tamis/widgets.py` | Image and compare views, thumbnail delegate, bars, toast and dialogs |
@@ -159,7 +169,7 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 ## Development
 ```bash
 pip install -e ".[dev]"
-pytest                     # main window, plugins, edits, crop, LUTs, file moves, sessions, XMP, EXIF
+pytest                     # main window, plugins, edits, crop, presets, tones, LUTs, file moves, sessions, XMP, EXIF
 ruff check .
 ```
 CI runs both on every push and pull request (`.github/workflows/ci.yml`).

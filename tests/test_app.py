@@ -2,20 +2,22 @@
 import json
 import os
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt6.QtCore import QPoint, QSettings, QSize, Qt  # noqa: E402
-from PyQt6.QtGui import QColor, QImage  # noqa: E402
+from PyQt6.QtCore import QEvent, QPoint, QSettings, QSize, Qt  # noqa: E402
+from PyQt6.QtGui import QColor, QImage, QPixmap  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 
-from tamis import fileops, loader, xmp  # noqa: E402
+from tamis import develop, fileops, loader, xmp  # noqa: E402
 from tamis.app import CULL_TAB, GALLERY_TAB, TamisApp  # noqa: E402
 from tamis.constants import KEEP, REJECT, SESSION_FILENAME  # noqa: E402
 from tamis.fileops import MoveResult, plan_moves  # noqa: E402
+from tamis.imaging import image_to_array  # noqa: E402
 from tamis.plugins import PhotoInfo, Plugin, PluginApi  # noqa: E402
-from tamis.widgets import ImportDialog, MessageDialog, ProcessDialog  # noqa: E402
+from tamis.widgets import ImportDialog, MessageDialog, NameDialog, ProcessDialog  # noqa: E402
 
 CTRL = Qt.KeyboardModifier.ControlModifier
 PHOTOS = 6
@@ -38,7 +40,11 @@ def window(qapp, tmp_path, tmp_path_factory):
         assert image.save(str(tmp_path / f"IMG_{i}.jpg"))
     QSettings().clear()  # before the window reads them
     # Never the real app's plugins or caches.
-    win = TamisApp(plugins_dir=str(tmp_path_factory.mktemp("plugins")), cache_dir=str(tmp_path_factory.mktemp("cache")))
+    win = TamisApp(
+        plugins_dir=str(tmp_path_factory.mktemp("plugins")),
+        cache_dir=str(tmp_path_factory.mktemp("cache")),
+        presets_file=str(tmp_path_factory.mktemp("presets") / "presets.json"),
+    )
     win.settings.clear()
     win.resize(1200, 800)
     win.show()
@@ -1389,3 +1395,339 @@ def test_plugins_marks_follow_the_option(window):
     window.xmp_mark_actions["labels"].trigger()
     PluginApi(window.plugins, Plugin("test", "test", "test")).set_status(window.model.photo(3).path, KEEP)
     assert window.model.photo(3).label == "Green"
+
+
+# -- rotation and straightening -------------------------------------------------
+
+def test_rotating_turns_the_photo_at_once_and_undo_brings_it_back(window):
+    window.model.set_field([0], "edit", {"contrast": 10})
+    wait_until(lambda: window.image_view._pixmap.width() > window.image_view._pixmap.height())
+    press(window, Qt.Key.Key_R, Qt.KeyboardModifier.ShiftModifier)
+    assert window.model.photo(0).edit == {"contrast": 10, "rotate": 90}
+    assert window.edit_panel.edit()["rotate"] == 90
+    assert wait_until(lambda: window.image_view._pixmap.height() > window.image_view._pixmap.width())
+    press(window, Qt.Key.Key_Z, CTRL)
+    assert window.model.photo(0).edit == {"contrast": 10}
+    assert wait_until(lambda: window.image_view._pixmap.width() > window.image_view._pixmap.height())
+
+
+def test_rotating_also_works_while_culling_on_an_unedited_photo(window):
+    press(window, Qt.Key.Key_L, Qt.KeyboardModifier.ShiftModifier)
+    assert window.model.photo(0).edit == {"rotate": 270}
+    for _ in range(3):
+        press(window, Qt.Key.Key_L, Qt.KeyboardModifier.ShiftModifier)
+    assert window.model.photo(0).edit == {}  # four turns: nothing left of the edit
+
+
+def test_rotating_in_the_gallery_applies_to_the_selection_as_one_undo(window):
+    press(window, Qt.Key.Key_G)
+    window.grid.selectAll()
+    window.rotate_photos(90)
+    assert all(photo.edit == {"rotate": 90} for photo in window.model.photos)
+    press(window, Qt.Key.Key_Z, CTRL)
+    assert all(photo.edit == {} for photo in window.model.photos)
+
+
+def test_rotating_a_cropped_photo_keeps_the_same_part_of_it(window):
+    window.model.set_field([0], "edit", {"crop": [0.0, 0.0, 0.5, 1.0]})
+    window.rotate_photos(90)
+    assert window.model.photo(0).edit == {"crop": [0.0, 0.0, 1.0, 0.5], "rotate": 90}
+
+
+def test_rotating_applies_an_open_crop_first(window):
+    press(window, Qt.Key.Key_R)
+    window.image_view.set_crop_frame((0.0, 0.0, 0.5, 1.0))
+    window.rotate_photos(90)
+    assert not window.cropping
+    assert window.model.photo(0).edit == {"crop": [0.0, 0.0, 1.0, 0.5], "rotate": 90}
+
+
+def test_the_crop_tool_works_on_the_turned_photo(window):
+    window.rotate_photos(90)
+    press(window, Qt.Key.Key_R)
+    assert wait_until(lambda: window.image_view._pixmap.height() > window.image_view._pixmap.width())
+    assert window.cropping
+
+
+def test_preview_shown_before_the_render_is_framed_like_the_render(window, qapp):
+    # A photo whose top-left corner is the only bright part.
+    photo = window.model.photo(0)
+    image = QImage(300, 200, QImage.Format.Format_RGB32)
+    image.fill(QColor(0, 0, 0))
+    for y in range(50):
+        for x in range(50):
+            image.setPixelColor(x, y, QColor(255, 255, 255))
+    pixmap = QPixmap.fromImage(image)
+    assert photo.path
+
+    turned = window._framed(pixmap, {"rotate": 90})
+    assert (turned.width(), turned.height()) == (200, 300)
+    assert turned.toImage().pixelColor(190, 10).red() > 200  # top-left went to the top right
+
+    level = window._framed(pixmap, {"straighten": 5.0})
+    assert level.size() == pixmap.size()
+    numpy_level = develop.straighten_rows(image_to_array(image).astype(np.float32) / 65535, 5.0, 0, 200)
+    painted = image_to_array(level.toImage()).astype(np.float32) / 65535
+    assert np.abs(painted - numpy_level).mean() < 0.03  # Qt and numpy agree, antialiasing aside
+
+
+def test_straighten_slider_goes_into_the_edit(window):
+    slider, _scale = window.edit_panel._sliders["straighten"]
+    slider.setValue(25)
+    assert window.model.photo(0).edit == {"straighten": 2.5}
+    assert window.edit_panel._values["straighten"].text() == "+2.5°"
+
+
+def test_copying_leaves_turns_and_straightening_behind(window):
+    window.model.set_field([0], "edit", {"contrast": 30, "rotate": 90, "straighten": 2.0})
+    window.model.set_field([1], "edit", {"rotate": 180})
+    window.copy_edit()
+    assert window.edit_clipboard == {"contrast": 30}
+    window.go_to(1)
+    window.paste_edit()
+    assert window.model.photo(1).edit == {"contrast": 30, "rotate": 180}
+
+
+def test_rotation_is_kept_in_the_session(window):
+    window.rotate_photos(90)
+    window.save_session()
+    with open(os.path.join(window.folder, SESSION_FILENAME), encoding="utf-8") as file:
+        assert '"rotate": 90' in file.read()
+    window.load_folder(window.folder)
+    assert window.model.photo(0).edit == {"rotate": 90}
+
+
+# -- before / after -------------------------------------------------------------
+
+def test_holding_the_key_shows_the_photo_without_its_edit(window):
+    original = window.image_view._pixmap.cacheKey()
+    window.model.set_field([0], "edit", {"exposure": 2.0, "crop": [0, 0, 0.5, 0.5]})
+    assert wait_until(lambda: window.image_view._pixmap.toImage().pixelColor(5, 5).green() > 140)
+    edit = dict(window.model.photo(0).edit)
+    width = window.image_view._pixmap.width()
+    assert original != window.image_view._pixmap.cacheKey()
+
+    QTest.keyPress(window, Qt.Key.Key_Y)
+    assert window.before and window.image_view._note == "Before"
+    # Without the exposure, and in the same frame.
+    assert window.image_view._pixmap.toImage().pixelColor(5, 5).green() < 120
+    assert window.image_view._pixmap.width() == width
+    assert window.model.photo(0).edit == edit
+
+    QTest.keyRelease(window, Qt.Key.Key_Y)
+    assert not window.before and window.image_view._note == ""
+    assert wait_until(lambda: window.image_view._pixmap.toImage().pixelColor(5, 5).green() > 140)
+    assert window.model.photo(0).edit == edit
+
+
+def test_backslash_holds_too_and_no_note_without_an_edit(window):
+    QTest.keyPress(window, Qt.Key.Key_Backslash)
+    assert window.before and window.image_view._note == ""
+    QTest.keyRelease(window, Qt.Key.Key_Backslash)
+    assert not window.before
+
+
+def test_before_button_holds_while_pressed(window):
+    window.toggle_edit_panel()
+    window.model.set_field([0], "edit", {"contrast": 30})
+    QTest.mousePress(window.edit_panel.before_button, Qt.MouseButton.LeftButton)
+    assert window.before
+    QTest.mouseRelease(window.edit_panel.before_button, Qt.MouseButton.LeftButton)
+    assert not window.before
+
+
+def test_leaving_the_window_ends_before(window):
+    window._hold_before()
+    QApplication.sendEvent(window, QEvent(QEvent.Type.WindowDeactivate))
+    assert not window.before
+
+
+def test_before_keeps_the_crop_tool_alone(window):
+    window.model.set_field([0], "edit", {"contrast": 30})
+    press(window, Qt.Key.Key_R)
+    QTest.keyPress(window, Qt.Key.Key_Y)
+    assert window.image_view._note == ""
+    QTest.keyRelease(window, Qt.Key.Key_Y)
+    assert window.cropping
+
+
+# -- histogram and clipping -----------------------------------------------------
+
+def test_histogram_follows_the_photo_and_its_edit(window):
+    panel = window.edit_panel
+    window.toggle_edit_panel()
+    assert wait_until(lambda: panel.histogram.tone is not None)
+    first = panel.histogram.tone
+    window.model.set_field([0], "edit", {"exposure": 5.0})
+    assert wait_until(lambda: panel.histogram.tone is not first and panel.histogram.tone.highlights > 0.5)
+    panel.histogram.grab()  # paints without trouble, clipped or not
+
+
+def test_histogram_is_not_worked_out_while_the_panel_is_closed(window):
+    assert not window.edit_panel.isVisible()
+    QTest.qWait(50)
+    assert window.edit_panel.histogram.tone is None
+
+
+def test_clipping_overlay_with_its_shortcut_and_button(window):
+    view = window.image_view
+    press(window, Qt.Key.Key_J)
+    assert window.show_clipping and window.edit_panel.clipping_button.isChecked()
+    assert wait_until(lambda: view._clipping is not None)
+    assert view._clipping.size() == view._pixmap.size()
+    view.grab()
+    press(window, Qt.Key.Key_J)
+    assert not window.show_clipping and view._clipping is None
+    window.edit_panel.clipping_button.click()
+    assert window.show_clipping
+
+
+def test_clipping_shows_in_red_what_an_edit_blows_out(window):
+    window.model.set_field([0], "edit", {"exposure": 5.0})
+    press(window, Qt.Key.Key_J)
+    assert wait_until(lambda: (
+        window.image_view._clipping is not None
+        and window.image_view._clipping.toImage().pixelColor(10, 10).alpha() == 255
+    ))
+
+
+def test_clipping_keeps_the_crop_tool_clear(window):
+    press(window, Qt.Key.Key_J)
+    assert wait_until(lambda: window.image_view._clipping is not None)
+    press(window, Qt.Key.Key_R)
+    assert window.image_view._clipping is None
+
+
+# -- presets ---------------------------------------------------------------------
+
+def name_it(monkeypatch, name):
+    def fill(dialog):
+        dialog.field.setText(name)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(NameDialog, "exec", fill)
+
+
+def test_saving_a_preset_and_applying_it_to_the_selection(window, monkeypatch):
+    window.model.set_field([0], "edit", {"contrast": 30, "crop": [0, 0, 0.5, 0.5], "rotate": 90})
+    window.model.set_field([2], "edit", {"crop": [0.2, 0.2, 0.8, 0.8], "grain": 5})
+    name_it(monkeypatch, "  Punchy ")
+    window.save_preset()
+    assert window.presets.get("Punchy") == {"contrast": 30}
+    assert [action.text() for action in window.edit_panel.presets_menu.actions()][0] == "Punchy"
+
+    press(window, Qt.Key.Key_G)
+    window.grid.selectAll()
+    window.edit_panel.presets_menu.actions()[0].trigger()
+    assert window.model.photo(1).edit == {"contrast": 30}
+    assert window.model.photo(2).edit == {"contrast": 30, "crop": [0.2, 0.2, 0.8, 0.8]}  # its own framing stays
+    assert window.model.photo(0).edit["rotate"] == 90
+
+    press(window, Qt.Key.Key_Z, CTRL)  # one undo step
+    assert window.model.photo(1).edit == {}
+    assert window.model.photo(2).edit == {"crop": [0.2, 0.2, 0.8, 0.8], "grain": 5}
+
+
+def test_a_photo_without_a_look_has_nothing_to_save(window, monkeypatch):
+    monkeypatch.setattr(NameDialog, "exec", lambda _dialog: pytest.fail("should not ask"))
+    window.model.set_field([0], "edit", {"rotate": 90})
+    window.save_preset()
+    assert window.presets.names() == []
+
+
+def test_replacing_a_preset_asks_first(window, monkeypatch):
+    window.model.set_field([0], "edit", {"contrast": 30})
+    name_it(monkeypatch, "A")
+    window.save_preset()
+    window.model.set_field([0], "edit", {"contrast": 60})
+
+    asked = []
+    monkeypatch.setattr(MessageDialog, "exec", lambda _dialog: asked.append(1) or QDialog.DialogCode.Rejected)
+    window.save_preset()
+    assert asked and window.presets.get("A") == {"contrast": 30}
+
+    monkeypatch.setattr(MessageDialog, "exec", lambda _dialog: QDialog.DialogCode.Accepted)
+    window.save_preset()
+    assert window.presets.get("A") == {"contrast": 60}
+
+
+def test_deleting_a_preset_leaves_photos_alone(window, monkeypatch):
+    window.model.set_field([0], "edit", {"contrast": 30})
+    name_it(monkeypatch, "A")
+    window.save_preset()
+    monkeypatch.setattr(MessageDialog, "exec", lambda _dialog: QDialog.DialogCode.Accepted)
+    delete = next(action.menu() for action in window.edit_panel.presets_menu.actions() if action.menu())
+    delete.actions()[0].trigger()
+    assert window.presets.names() == []
+    assert window.model.photo(0).edit == {"contrast": 30}
+    assert not any(action.menu() for action in window.edit_panel.presets_menu.actions())
+
+
+def test_a_preset_that_cannot_be_written_is_reported(window, monkeypatch):
+    window.model.set_field([0], "edit", {"contrast": 30})
+    name_it(monkeypatch, "A")
+    told = []
+    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, _text, **_kwargs: told.append(title))
+    monkeypatch.setattr(window.presets, "save", lambda *_args: (_ for _ in ()).throw(OSError("read-only")))
+    window.save_preset()
+    assert told == ["Could not save the presets"]
+
+
+# -- thumbnails of edits ---------------------------------------------------------
+
+def thumbnail(window, row):
+    return window.model.data(window.model.index(row), Qt.ItemDataRole.DecorationRole)
+
+
+def test_thumbnails_show_the_edit_and_its_frame(window):
+    assert wait_until(lambda: thumbnail(window, 1) is not None)
+    plain = thumbnail(window, 1).toImage().pixelColor(10, 10).green()
+    window.model.set_field([1], "edit", {"exposure": 2.0, "crop": [0, 0, 0.5, 1.0]})
+    assert wait_until(lambda: thumbnail(window, 1).toImage().pixelColor(10, 10).green() > plain + 40)
+    edited = thumbnail(window, 1)
+    assert edited.height() > edited.width()  # 150 × 200 of the photo
+
+    window.model.set_field([1], "edit", {"rotate": 90})
+    assert wait_until(lambda: thumbnail(window, 1).height() > thumbnail(window, 1).width() * 1.4)
+    window.model.set_field([1], "edit", {})
+    assert wait_until(lambda: thumbnail(window, 1).width() > thumbnail(window, 1).height())
+
+
+def test_changing_an_edit_tells_the_views(window):
+    roles = []
+    window.model.dataChanged.connect(lambda _first, _last, changed: roles.extend(changed))
+    window.model.set_field([1], "edit", {"exposure": 2.0})
+    assert Qt.ItemDataRole.DecorationRole in roles
+
+
+def test_thumbnails_of_edits_come_back_from_disk(window):
+    edit = {"exposure": 2.0}
+    window.model.set_field([1], "edit", edit)
+    path = window.model.photo(1).path
+    lut = window._lut_path
+    assert wait_until(lambda: window.edit_thumbnails.pixmap(path, edit, lut(edit)) is not None)
+    window.edit_thumbnails.reset()
+    developed = []
+    original = window.edit_thumbnails._base
+    window.edit_thumbnails._base = lambda *args: developed.append(args) or original(*args)
+    assert wait_until(lambda: window.edit_thumbnails.pixmap(path, edit, lut(edit)) is not None)
+    assert developed == []
+
+
+def test_a_thumbnail_that_cannot_be_rendered_falls_back_to_the_original(window, monkeypatch):
+    assert wait_until(lambda: thumbnail(window, 1) is not None)
+    original = thumbnail(window, 1).cacheKey()
+    monkeypatch.setattr("tamis.editing.develop_base", lambda *_args: (_ for _ in ()).throw(ValueError("bad")))
+    window.model.set_field([1], "edit", {"exposure": 2.0})
+    assert wait_until(lambda: window.edit_thumbnails._failed.get(window.model.photo(1).path))
+    assert thumbnail(window, 1).cacheKey() == original
+
+
+def test_thumbnails_of_edits_follow_moves(window):
+    edit = {"exposure": 2.0}
+    window.model.set_field([1], "edit", edit)
+    path = window.model.photo(1).path
+    assert wait_until(lambda: window.edit_thumbnails.pixmap(path, edit, None) is not None)
+    key = window.edit_thumbnails.pixmap(path, edit, None).cacheKey()
+    window.edit_thumbnails.rename_paths({path: path + ".moved"})
+    assert window.edit_thumbnails.pixmap(path + ".moved", edit, None).cacheKey() == key

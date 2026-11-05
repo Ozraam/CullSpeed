@@ -36,7 +36,7 @@ All changes to marks, ratings, labels and edits go through `PhotoModel.set_field
 The results of the background analysis (`capture_time`, `sharpness`, `image_hash`, `burst`) live on the `Photo` itself and aren't marks: they are set directly, never saved in the session, and only ever suggest. Rows change when the sort order does (`PhotoModel.reorder`, `TamisApp._apply_order`), so nothing may keep a row across that.
 
 ### Threading
-Four engines follow the same pattern, `ImageLoader` (`loader.py`, previews, thumbnails, full resolution), `EditRenderer` (`editing.py`, live edit previews), `PhotoAnalyzer` (`analysis.py`, dates and scores) and `FocusPeaker` (`peaking.py`):
+Six engines follow the same pattern, `ImageLoader` (`loader.py`, previews, thumbnails, full resolution), `EditRenderer` (`editing.py`, live edit previews), `EditThumbnails` (`editing.py`, thumbnails of edits, at low priority, kept on disk per edit), `PhotoAnalyzer` (`analysis.py`, dates and scores), `FocusPeaker` (`peaking.py`) and `ToneReader` (`tones.py`, histograms and clipping overlays):
 
 - Workers only produce `QImage`; they send it through an internal queued signal, and the `QPixmap` is created on the GUI thread.
 - Each job captures a `_generation` number. `reset()` increments it, and stale results are ignored rather than the threads being terminated. Superseded requests are skipped the same way.
@@ -47,7 +47,9 @@ Four engines follow the same pattern, `ImageLoader` (`loader.py`, previews, thum
 ### Edit pipeline
 An edit is a plain dict holding only the non-default settings, as normalised by `develop.clean()`; `{}` means not edited. The same dict is stored in the session file and passed to the renderer.
 
-`develop.render()` takes linear float32 RGB and must stay position-independent: each step may depend only on a pixel and its position in the full image (`origin` / `full_size`), so strip-based export gives the same result as a preview. The crop is applied before `render()`, so vignette and grain follow the final frame. When adding a setting, update `DEFAULTS` and `RANGES` in `develop.py` and the panel in `editpanel.py`.
+`develop.render()` takes linear float32 RGB and must stay position-independent: each step may depend only on a pixel and its position in the full image (`origin` / `full_size`), so strip-based export gives the same result as a preview. The framing is applied before `render()` in this order, so vignette and grain follow the final frame: quarter turns (`rotate`), straightening (`straighten`, enlarged to fill the frame, same size), crop (in fractions of the turned picture). When adding a setting, update `DEFAULTS` and `RANGES` in `develop.py` and the panel in `editpanel.py`.
+
+`develop.FRAMING` belongs to one photo: copy, paste and presets carry `develop.look(edit)` over and leave each photo's `develop.framing(edit)` alone. `TamisApp._framed` frames with Qt what the renderer didn't make (the preview before a render, the before view, the 1:1 zoom) and must keep matching the numpy pipeline. Presets (`presets.py`) are stored in `presets.json` in the app's data folder, through `develop.clean()` on load; `TamisApp(presets_file=...)` overrides the file, as the tests' `window` fixture does.
 
 `PhotoAnalyzer` only reads what the current options need (`TamisApp._request_analysis`), since a card can be slow, and remembers results per folder by file name, size and modification time, in the app's cache folder, as does `ThumbnailCache` (`thumbcache.py`) for thumbnails, by path, size and modification time. Neither needs to follow moves: a moved file keeps its name and date, or is a miss. `StatusFilterProxy` filters on `FILTER_ROLE`, which any change a filter depends on must announce, since Qt only re-checks rows for that one role.
 

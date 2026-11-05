@@ -13,6 +13,7 @@ APP_NAME = "Tamis"
 SESSION_FILENAME = "tamis_session.json"
 FALLBACK_SESSIONS_DIR = "sessions"
 PLUGINS_DIR = "plugins"
+PRESETS_FILENAME = "presets.json"
 
 # The app used to be called CullSpeed: what it left behind is still read.
 LEGACY_APP_NAME = "CullSpeed"
