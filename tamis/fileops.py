@@ -1,6 +1,7 @@
 """Moving photos into _KEEPS / _REJECTS (or back to the root), and what goes to _EXPORTS."""
 import os
 import shutil
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 
 from .constants import KEEP, KEEP_DIR, REJECT, REJECT_DIR
@@ -96,8 +97,36 @@ def _free_number(dest_dir, group, taken):
     return n
 
 
+def _move_group(group, dest_dir, n):
+    """Move a whole group or, if one of its files fails, none; returns {source: new path}.
+
+    The OSError raised on failure has a `stranded` attribute: {source: new path}
+    of the files that could not be moved back, so the caller can follow them.
+    """
+    moved = {}
+    try:
+        for source, name in group:
+            new_path = os.path.join(dest_dir, name(n))
+            shutil.move(source, new_path)
+            moved[source] = new_path
+    except OSError as exc:
+        stranded = {}
+        for source, new_path in moved.items():
+            try:
+                shutil.move(new_path, source)
+            except OSError:
+                stranded[source] = new_path
+        exc.stranded = stranded
+        raise
+    return moved
+
+
 def execute_moves(moves, progress=None):
-    """Move files, never overwriting. `progress(done)` may return False to stop."""
+    """Move files, never overwriting. `progress(done)` may return False to stop.
+
+    A photo's files (RAW, JPEG, sidecars) move together: when one fails, the
+    others go back and the photo is reported as failed.
+    """
     result = MoveResult()
     listings = {}
     taken = {}
@@ -116,14 +145,16 @@ def execute_moves(moves, progress=None):
             photo_files = [move.src, *move.companions]
             group = _group(photo_files, listings[src_dir])
             n = _free_number(move.dest_dir, group, dest_taken)
-            for source, name in group:
-                new_path = os.path.join(move.dest_dir, name(n))
-                shutil.move(source, new_path)
-                dest_taken.add(name(n).lower())
-                if source in photo_files:
-                    result.moved[source] = new_path
+            moved = _move_group(group, move.dest_dir, n)
+            dest_taken.update(os.path.basename(new_path).lower() for new_path in moved.values())
+            result.moved.update({source: new_path for source, new_path in moved.items() if source in photo_files})
         except OSError as exc:
-            result.errors.append(f"{os.path.basename(move.src)}: {exc.strerror or exc}")
+            stranded = getattr(exc, "stranded", {})
+            result.moved.update({source: new_path for source, new_path in stranded.items() if source in photo_files})
+            error = f"{os.path.basename(move.src)}: {exc.strerror or exc}"
+            if stranded:
+                error += f" (could not be moved back: {', '.join(map(os.path.basename, stranded))})"
+            result.errors.append(error)
 
     if progress:
         progress(len(moves))
@@ -177,6 +208,71 @@ def plan_exports(photos):
     return jobs
 
 
+def without_export(photos):
+    """The photos plan_exports() leaves out for having no edit and no JPEG, rejected ones aside."""
+    return [photo for photo in photos if photo.status != REJECT and not photo.edit and jpeg_file(photo) is None]
+
+
+@contextmanager
+def atomic_write(dest):
+    """Gives a temporary path to write to, which replaces `dest` once the write has succeeded.
+
+    A crash or a full disk then cannot leave a truncated file in place of a good one.
+    """
+    folder, name = os.path.split(dest)
+    tmp_path = os.path.join(folder, f".{name}.tmp")
+    try:
+        yield tmp_path
+        with open(tmp_path, "rb+") as file:
+            os.fsync(file.fileno())  # or a power cut can leave an empty file after the rename
+        os.replace(tmp_path, dest)
+    except Exception:
+        with suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
+def export_record(path):
+    """What Photo.exports remembers of an export, to tell later whether the file is still that export."""
+    stat = os.stat(path)
+    return {"name": os.path.basename(path), "size": stat.st_size, "mtime": stat.st_mtime_ns}
+
+
+def rejected_exports(photos, dest_dir):
+    """(removable, changed): paths of the exports of rejected photos, as they were written or changed since.
+
+    Only files recorded as exports of a photo are considered, so what the user
+    added to _EXPORTS is never touched, even under a photo's name.
+    """
+    removable, changed = [], []
+    for photo in photos:
+        if photo.status == REJECT:
+            for record in photo.exports:
+                path = os.path.join(dest_dir, record["name"])
+                with suppress(OSError):  # already gone
+                    (removable if export_record(path) == record else changed).append(path)
+    return removable, changed
+
+
+def remove_rejected_exports(photos, dest_dir):
+    """Delete what rejected_exports() calls removable; returns (paths removed, errors).
+
+    Rejected photos then only remember the exports that could not be removed.
+    """
+    removed, errors, failed = [], [], set()
+    for path in rejected_exports(photos, dest_dir)[0]:
+        try:
+            os.remove(path)
+            removed.append(path)
+        except OSError as exc:
+            errors.append(f"{os.path.basename(path)}: {exc.strerror or exc}")
+            failed.add(os.path.basename(path))
+    for photo in photos:
+        if photo.status == REJECT:
+            photo.exports = [record for record in photo.exports if record["name"] in failed]
+    return removed, errors
+
+
 def copy_export(path, dest_dir, name=None):
     """Copy `path` into `dest_dir`; returns the new path.
 
@@ -187,5 +283,6 @@ def copy_export(path, dest_dir, name=None):
     if name is None:
         name = free_name(dest_dir, *os.path.splitext(os.path.basename(path)))
     dest = os.path.join(dest_dir, name)
-    shutil.copy2(path, dest)
+    with atomic_write(dest) as tmp_path:
+        shutil.copy2(path, tmp_path)
     return dest

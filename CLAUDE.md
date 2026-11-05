@@ -58,7 +58,9 @@ RAWs are edited from LibRaw's 16-bit linear development, not their embedded JPEG
 - XMP sidecars win over the session for ratings and labels, so changes from other editors take effect. Writes are batched through `xmp_dirty` and flushed by `save_session`. A failed write stays in `xmp_dirty` and sets `Photo.xmp_pending`, stored in the session, which makes the session win until a write succeeds. Existing sidecars are edited in place, touching only `xmp:Rating` and `xmp:Label`.
 
 ### Process Files
-`fileops` keeps planning separate from execution: `plan_moves` / `execute_moves` and `plan_exports` / `copy_export`. Moves never overwrite (`IMG_1 (1).jpg`), while files in `_EXPORTS` are deliberately replaced so that reprocessing refreshes them. `process_files` plans exports a second time after moving, because the paths have changed.
+`fileops` keeps planning separate from execution: `plan_moves` / `execute_moves` and `plan_exports` / `copy_export`. Moves never overwrite (`IMG_1 (1).jpg`), while files in `_EXPORTS` are deliberately replaced so that reprocessing refreshes them. `process_files` plans exports a second time after moving, because the paths have changed. `execute_moves` moves a photo's files all together or not at all, and exports are written through `atomic_write`.
+
+`Photo.exports` records what was written to `_EXPORTS` for a photo (name, size, modification time), in the session. `remove_rejected_exports` only deletes files that still match their record, so files the user added or changed in `_EXPORTS` are safe.
 
 ### Plugins
 `plugins.py` loads `<name>.py` or `<name>/__init__.py` from `plugins/` in the app's data folder at startup and calls `register(tamis)` with a `PluginApi`; the README documents that API for plugin authors, so keep it up to date. `TamisApp(plugins_dir=...)` overrides the folder, and the tests' `window` fixture always does so they never run the real app's plugins.

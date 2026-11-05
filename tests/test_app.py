@@ -5,17 +5,17 @@ import os
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt6.QtCore import QPoint, QSettings, Qt  # noqa: E402
+from PyQt6.QtCore import QPoint, QSettings, QSize, Qt  # noqa: E402
 from PyQt6.QtGui import QColor, QImage  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 
-from tamis import xmp  # noqa: E402
+from tamis import loader, xmp  # noqa: E402
 from tamis.app import CULL_TAB, GALLERY_TAB, TamisApp  # noqa: E402
 from tamis.constants import KEEP, REJECT, SESSION_FILENAME  # noqa: E402
-from tamis.fileops import plan_moves  # noqa: E402
+from tamis.fileops import MoveResult, plan_moves  # noqa: E402
 from tamis.plugins import PhotoInfo  # noqa: E402
-from tamis.widgets import ProcessDialog  # noqa: E402
+from tamis.widgets import MessageDialog, ProcessDialog  # noqa: E402
 
 CTRL = Qt.KeyboardModifier.ControlModifier
 PHOTOS = 6
@@ -419,6 +419,206 @@ def test_process_dialog_needs_something_to_do(qapp):
     moves_only = ProcessDialog(None, "1 photo will be moved")
     assert moves_only.export_check is None
     assert not moves_only.export_requested
+
+
+def process_seeing_dialog(win, monkeypatch, export=True):
+    """Like process(); returns the texts of the dialog, moves then exports."""
+    seen = []
+
+    def confirm(dialog):
+        seen.append(dialog.body.text())
+        seen.append(dialog.export_details.text() if dialog.export_check else "")
+        if dialog.export_check:
+            dialog.export_check.setChecked(export)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ProcessDialog, "exec", confirm)
+    win.process_files()
+    return seen
+
+
+def test_stop_during_a_move_stops_the_export_even_after_an_error(window, tmp_path, monkeypatch):
+    errors = []
+    statuses(window, keep=[0])
+    monkeypatch.setattr("tamis.app.execute_moves", lambda *_: MoveResult(errors=["IMG_0.jpg: boom"], cancelled=True))
+    monkeypatch.setattr("tamis.app.inform", lambda _parent, _title, _text, details=None: errors.extend(details))
+
+    process(window, monkeypatch, export=True)
+
+    assert errors == ["IMG_0.jpg: boom"]
+    assert not (tmp_path / "_EXPORTS").exists()
+
+
+def test_process_dialog_warns_about_a_missing_film_simulation(window, tmp_path, monkeypatch):
+    window.model.set_field([0], "edit", {"lut": "gone/film.png"})
+    _moves, exports = process_seeing_dialog(window, monkeypatch, export=False)
+    assert "1 photo(s) use a film simulation" in exports and "IMG_0.jpg" in exports
+    assert not (tmp_path / "_EXPORTS").exists()
+
+
+def test_process_dialog_has_no_warning_when_the_film_simulation_is_there(window, tmp_path, monkeypatch):
+    window.model.set_field([0], "edit", {"lut": "film.png"})
+    window.luts = {"film.png": str(tmp_path / "film.png")}
+    _moves, exports = process_seeing_dialog(window, monkeypatch, export=False)
+    assert "film simulation" not in exports
+
+
+@pytest.mark.parametrize("answer, exported", [(QDialog.DialogCode.Rejected, False), (QDialog.DialogCode.Accepted, True)])
+def test_export_asks_when_a_film_simulation_is_missing(window, tmp_path, monkeypatch, answer, exported):
+    seen = []
+    window.model.set_field([0], "edit", {"lut": "gone/film.png"})
+
+    def confirm(dialog):
+        seen.append(dialog.confirm_button.text())
+        return answer
+
+    monkeypatch.setattr(MessageDialog, "exec", confirm)
+    window.export_photos()
+
+    assert seen == ["Export anyway"]
+    assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").exists() == exported
+
+
+def test_process_dialog_names_photos_without_a_jpeg(window, tmp_path, monkeypatch):
+    image = QImage(30, 20, QImage.Format.Format_RGB32)
+    image.fill(QColor(90, 80, 120))
+    assert image.save(str(tmp_path / "other.png"))
+    window.load_folder(str(tmp_path))
+
+    _moves, exports = process_seeing_dialog(window, monkeypatch, export=False)
+
+    assert "1 photo(s) have no JPEG and won't be exported: other.png" in exports
+
+
+def test_photos_without_a_jpeg_are_mentioned_when_there_is_nothing_to_export(window, tmp_path, monkeypatch):
+    image = QImage(30, 20, QImage.Format.Format_RGB32)
+    image.fill(QColor(90, 80, 120))
+    for i in range(PHOTOS):
+        (tmp_path / f"IMG_{i}.jpg").unlink()
+    assert image.save(str(tmp_path / "other.png"))
+    window.load_folder(str(tmp_path))
+
+    window.model.set_status([0], KEEP)
+    moves, exports = process_seeing_dialog(window, monkeypatch)
+    assert "other.png" in moves and exports == ""
+
+    window.process_files()  # now sorted: no dialog
+    assert "1 photo(s) have no JPEG" in window.toast.text()
+
+
+def test_rejecting_an_exported_photo_removes_its_export(window, tmp_path, monkeypatch):
+    statuses(window, keep=[0, 1])
+    process(window, monkeypatch, export=True)
+    exports = tmp_path / "_EXPORTS"
+    assert (exports / "IMG_0.jpg").exists() and (exports / "IMG_1.jpg").exists()
+    (exports / "mine.jpg").write_text("added by the user")
+
+    window.model.set_status([window.model.row_of(str(tmp_path / "_KEEPS" / "IMG_0.jpg"))], REJECT)
+    _moves, details = process_seeing_dialog(window, monkeypatch)
+
+    assert "1 earlier export(s) of rejected photos" in details
+    assert not (exports / "IMG_0.jpg").exists()
+    assert (exports / "IMG_1.jpg").exists() and (exports / "mine.jpg").exists()
+
+
+def test_exports_stay_when_the_export_box_is_unticked(window, tmp_path, monkeypatch):
+    statuses(window, keep=[0])
+    process(window, monkeypatch, export=True)
+    window.model.set_status([window.model.row_of(str(tmp_path / "_KEEPS" / "IMG_0.jpg"))], REJECT)
+
+    process_seeing_dialog(window, monkeypatch, export=False)
+
+    assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").exists()
+
+
+def test_export_records_survive_reopening_the_folder(window, tmp_path, monkeypatch, tmp_path_factory):
+    window.export_photos()  # IMG_0, by the shortcut's way: not through Process Files
+    assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").exists()
+
+    window.load_folder(str(tmp_path_factory.mktemp("other")))
+    window.load_folder(str(tmp_path))
+    window.model.set_status([0], REJECT)
+    process_seeing_dialog(window, monkeypatch)
+
+    assert not (tmp_path / "_EXPORTS" / "IMG_0.jpg").exists()
+
+
+def test_export_removed_with_nothing_else_to_do_still_asks(window, tmp_path, monkeypatch):
+    statuses(window, reject=list(range(1, PHOTOS)), keep=[0])
+    process(window, monkeypatch, export=True)
+    window.model.set_status([window.model.row_of(str(tmp_path / "_KEEPS" / "IMG_0.jpg"))], REJECT)
+    process(window, monkeypatch, export=False)  # moved, and the export stays
+    assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").exists()
+
+    seen = process_seeing_dialog(window, monkeypatch)
+
+    assert "1 earlier export(s)" in seen[1]
+    assert os.listdir(tmp_path / "_EXPORTS") == []
+
+
+def test_photo_taking_over_a_removed_export_s_name_keeps_it(window, tmp_path, monkeypatch):
+    (tmp_path / "_REJECTS").mkdir()
+    image = QImage(30, 20, QImage.Format.Format_RGB32)
+    image.fill(QColor(90, 80, 120))
+    assert image.save(str(tmp_path / "_REJECTS" / "IMG_0.jpg"))  # same name, in another folder
+    window.load_folder(str(tmp_path))
+    first = window.model.row_of(str(tmp_path / "IMG_0.jpg"))
+    other = window.model.row_of(str(tmp_path / "_REJECTS" / "IMG_0.jpg"))
+    window.model.set_status([other], KEEP)
+    process(window, monkeypatch, export=True)  # IMG_0.jpg and IMG_0 (1).jpg
+
+    window.model.set_status([first], REJECT)
+    process(window, monkeypatch, export=True)
+
+    assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").exists()
+    window.model.set_status([window.model.row_of(str(tmp_path / "_REJECTS" / "IMG_0.jpg"))], None)
+    process_seeing_dialog(window, monkeypatch)
+    assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").exists()
+
+
+# -- thumbnails ----------------------------------------------------------------
+
+def failed_thumbnail(win, tmp_path, monkeypatch):
+    """A photo whose first decode failed, as when it is still being copied."""
+    path = str(tmp_path / "IMG_0.jpg")
+    decode = loader._decode
+    monkeypatch.setattr(loader, "_decode", lambda *_: (QImage(), QSize(), "still copying"))
+    win.loader.reset()
+    assert win.loader.thumbnail(path) is None
+    assert wait_until(lambda: win.loader.thumbnail_error(path))
+    monkeypatch.setattr(loader, "_decode", decode)
+    return path
+
+
+def test_failed_thumbnail_is_not_retried_while_the_file_is_the_same(window, tmp_path, monkeypatch):
+    path = failed_thumbnail(window, tmp_path, monkeypatch)
+    window.loader.thumbnail(path)
+    QTest.qWait(100)
+    assert window.loader.thumbnail(path) is None and window.loader.thumbnail_error(path)
+
+
+def test_failed_thumbnail_is_retried_when_the_file_changes(window, tmp_path, monkeypatch):
+    path = failed_thumbnail(window, tmp_path, monkeypatch)
+    with open(path, "ab") as file:
+        file.write(b"the rest of the file")
+
+    assert wait_until(lambda: window.loader.thumbnail(path) is not None)
+    assert not window.loader.thumbnail_error(path)
+
+
+def test_failed_thumbnail_is_retried_by_a_refresh(window, tmp_path, monkeypatch):
+    path = failed_thumbnail(window, tmp_path, monkeypatch)
+    window.refresh()
+    assert wait_until(lambda: window.loader.thumbnail(path) is not None)
+    assert not window.loader.thumbnail_error(path)
+
+
+def test_failed_thumbnail_follows_a_moved_file(window, tmp_path, monkeypatch):
+    path = failed_thumbnail(window, tmp_path, monkeypatch)
+    new_path = str(tmp_path / "moved.jpg")
+    os.rename(path, new_path)
+    window.loader.rename_paths({path: new_path})
+    assert window.loader.thumbnail_error(new_path) and not window.loader.thumbnail_error(path)
 
 
 # -- plugins -------------------------------------------------------------------

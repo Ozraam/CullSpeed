@@ -45,6 +45,8 @@ class Photo:
     # The rating and label could not be written to the XMP sidecar yet: until
     # they are, the session has the newer values and wins over the sidecar.
     xmp_pending: bool = False
+    # What was written to _EXPORTS for this photo, see fileops.export_record().
+    exports: list = field(default_factory=list)
 
     @property
     def name(self):
@@ -137,6 +139,7 @@ def scan_folder(folder, fallback_dir=None, problems=None):
             photo.status, photo.rating, photo.label = entry["status"], entry["rating"], entry["label"]
             photo.edit = entry["edit"]
             photo.xmp_pending = entry.get("xmp_pending", False)
+            photo.exports = entry.get("exports", [])
         # Sidecars are what other editors change, and Tamis writes them
         # whenever a rating changes: they are the fresher source, unless
         # that write failed.
@@ -167,6 +170,21 @@ def _session_paths(folder, fallback_dir):
     return paths
 
 
+def _export_records(value):
+    """The valid records in a session's "exports": plain file names only, as they get deleted by name."""
+    if not isinstance(value, list):
+        return []
+    return [
+        record for record in value
+        if isinstance(record, dict)
+        and isinstance(record.get("name"), str)
+        and record["name"] not in ("", ".", "..")
+        and os.path.basename(record["name"]) == record["name"]
+        and isinstance(record.get("size"), int)
+        and isinstance(record.get("mtime"), int)
+    ]
+
+
 def _entry(value):
     """A session value as {"status", "rating", "label", "edit"}, or None if it is not valid.
 
@@ -187,6 +205,9 @@ def _entry(value):
     entry = {"status": status, "rating": rating, "label": label, "edit": develop.clean(value.get("edit"))}
     if value.get("xmp_pending") is True:
         entry["xmp_pending"] = True
+    exports = _export_records(value.get("exports"))
+    if exports:
+        entry["exports"] = exports
     return entry
 
 
@@ -248,13 +269,15 @@ def _write_json(path, data):
 
 
 def _session_value(photo):
-    if not photo.rating and photo.label is None and not photo.edit and not photo.xmp_pending:
+    if not photo.rating and photo.label is None and not photo.edit and not photo.xmp_pending and not photo.exports:
         return photo.status  # same as older sessions
     value = {"status": photo.status, "rating": photo.rating, "label": photo.label}
     if photo.edit:
         value["edit"] = photo.edit
     if photo.xmp_pending:
         value["xmp_pending"] = True
+    if photo.exports:
+        value["exports"] = photo.exports
     return value
 
 
@@ -272,7 +295,7 @@ def _absent_entries(folder, stored, photos, known, forget):
         if "/" not in key and key in names:
             continue  # a legacy filename key (or a move made elsewhere): that photo has the entry now
         entry = _entry(value)
-        if entry is not None and (entry["status"] or entry["rating"] or entry["label"] or entry["edit"]):
+        if entry is not None and (entry["status"] or entry["rating"] or entry["label"] or entry["edit"] or "exports" in entry):
             kept[key] = value
     return kept
 

@@ -5,6 +5,7 @@ queued signals on this long-lived QObject, where they become QPixmaps.
 Superseded requests are skipped rather than terminated.
 """
 import math
+import os
 from collections import OrderedDict
 from contextlib import suppress
 from itertools import count
@@ -35,6 +36,15 @@ def _thumbnail_decode_size():
     return math.ceil(THUMBNAIL_MAX_SIZE * ratio)
 
 
+def _file_state(path):
+    """What tells that a file has changed: (size, modification time), None if it can't be read."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
 def _decode(path, max_size):
     """(image, native size, error message)."""
     try:
@@ -55,7 +65,7 @@ class ImageLoader(QObject):
     # Internal: emitted from worker threads, delivered on the GUI thread.
     _preview_done = pyqtSignal(int, str, QImage, QSize, object, str)
     _full_done = pyqtSignal(int, str, QImage, str)
-    _thumbnail_done = pyqtSignal(int, str, QImage)
+    _thumbnail_done = pyqtSignal(int, str, QImage, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -83,7 +93,7 @@ class ImageLoader(QObject):
 
         self._thumbnails = OrderedDict()  # path -> QPixmap, LRU order
         self._thumbnail_bytes = 0
-        self._thumbnail_failed = set()
+        self._thumbnail_failed = {}  # path -> the file's state when it failed: a change gets it another try
         self._thumbnail_pending = set()
 
         self._preview_done.connect(self._on_preview_done)
@@ -120,16 +130,15 @@ class ImageLoader(QObject):
     def rename_paths(self, mapping):
         """Carry cached images over after files have been moved."""
         caches = (self._previews, self._preview_errors, self._native_sizes, self._info, self._thumbnails,
-                  self._full, self._full_errors)
+                  self._thumbnail_failed, self._full, self._full_errors)
         for cache in caches:
             for old, new in mapping.items():
                 if old in cache:
                     cache[new] = cache.pop(old)
-        for paths in (self._thumbnail_failed, self._full_wanted):
-            for old, new in mapping.items():
-                if old in paths:
-                    paths.discard(old)
-                    paths.add(new)
+        for old, new in mapping.items():
+            if old in self._full_wanted:
+                self._full_wanted.discard(old)
+                self._full_wanted.add(new)
 
     # -- previews ----------------------------------------------------------
 
@@ -256,12 +265,20 @@ class ImageLoader(QObject):
         pixmap = self._thumbnails.get(path)
         if pixmap is not None:
             self._thumbnails.move_to_end(path)
-        elif path not in self._thumbnail_pending and path not in self._thumbnail_failed:
-            self._request_thumbnail(path)
+        elif path not in self._thumbnail_pending and (
+            path not in self._thumbnail_failed or self._thumbnail_failed[path] != _file_state(path)
+        ):
+            self._request_thumbnail(path)  # (a failed one keeps showing as failed until this one is done)
         return pixmap
 
     def thumbnail_error(self, path):
         return path in self._thumbnail_failed
+
+    def retry_failed_thumbnails(self):
+        """Try again the thumbnails that failed: the file may have been still copying."""
+        for path in self._thumbnail_failed:
+            if path not in self._thumbnail_pending:
+                self._request_thumbnail(path)
 
     def _request_thumbnail(self, path):
         self._thumbnail_pending.add(path)
@@ -271,20 +288,22 @@ class ImageLoader(QObject):
         def job():
             if generation != self._generation:
                 return
+            state = _file_state(path)  # before decoding: a file that changes meanwhile is tried again
             image, _native, _error = _decode(path, size)
-            _emit(self._thumbnail_done, generation, path, image)
+            _emit(self._thumbnail_done, generation, path, image, state)
 
         # Most recently requested first, so whatever is on screen now wins.
         self._thumbnail_pool.start(job, next(self._priority) % 2**30)
 
-    def _on_thumbnail_done(self, generation, path, image):
+    def _on_thumbnail_done(self, generation, path, image, state):
         if generation != self._generation:
             return
         self._thumbnail_pending.discard(path)
         if image.isNull():
-            self._thumbnail_failed.add(path)
+            self._thumbnail_failed[path] = state
             self.thumbnail_failed.emit(path)
             return
+        self._thumbnail_failed.pop(path, None)
         pixmap = QPixmap.fromImage(image)
         self._thumbnails[path] = pixmap
         self._thumbnail_bytes += _pixmap_bytes(pixmap)
