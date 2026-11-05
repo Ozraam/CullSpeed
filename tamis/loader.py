@@ -67,8 +67,9 @@ class ImageLoader(QObject):
     _full_done = pyqtSignal(int, str, QImage, str)
     _thumbnail_done = pyqtSignal(int, str, QImage, object)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, thumbnail_cache=None):
         super().__init__(parent)
+        self._disk_thumbnails = thumbnail_cache  # a ThumbnailCache, or None to only keep them in memory
         self._preview_pool = QThreadPool(self)
         self._preview_pool.setMaxThreadCount(2)
         self._thumbnail_pool = QThreadPool(self)
@@ -274,6 +275,18 @@ class ImageLoader(QObject):
     def thumbnail_error(self, path):
         return path in self._thumbnail_failed
 
+    def forget(self, paths):
+        """These files are gone: drop what is cached of them."""
+        self._wanted_previews -= set(paths)
+        for path in paths:
+            pixmap = self._thumbnails.pop(path, None)
+            if pixmap is not None:
+                self._thumbnail_bytes -= _pixmap_bytes(pixmap)
+            for cache in (self._previews, self._preview_errors, self._native_sizes, self._info,
+                          self._thumbnail_failed, self._full, self._full_errors):
+                cache.pop(path, None)
+            self._full_wanted.discard(path)
+
     def retry_failed_thumbnails(self):
         """Try again the thumbnails that failed: the file may have been still copying."""
         for path in self._thumbnail_failed:
@@ -289,7 +302,11 @@ class ImageLoader(QObject):
             if generation != self._generation:
                 return
             state = _file_state(path)  # before decoding: a file that changes meanwhile is tried again
-            image, _native, _error = _decode(path, size)
+            image = self._disk_thumbnails.load(path, state, size) if self._disk_thumbnails and state else None
+            if image is None:
+                image, _native, _error = _decode(path, size)
+                if self._disk_thumbnails and state and not image.isNull():
+                    self._disk_thumbnails.save(path, state, size, image)
             _emit(self._thumbnail_done, generation, path, image, state)
 
         # Most recently requested first, so whatever is on screen now wins.

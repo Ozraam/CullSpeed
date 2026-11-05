@@ -1,6 +1,9 @@
+import os
 import struct
 
-from tamis.exif import read_info, summary
+import pytest
+
+from tamis.exif import capture_time, read_info, summary
 
 
 def tiff(entries, exif_entries, endian="<"):
@@ -81,3 +84,31 @@ def test_unknown_or_broken_files_give_nothing(tmp_path):
     assert read_info(str(tmp_path / "b.jpg")) == {}
     assert read_info(str(tmp_path / "missing.jpg")) == {}
     assert summary({}) == []
+
+
+def test_capture_time_has_the_fraction_and_needs_no_time_zone(tmp_path):
+    path = tmp_path / "a.tif"
+    path.write_bytes(tiff([], [(0x9003, 2, "2024:06:01 14:30:15"), (0x9291, 2, "25")]))
+    later = tmp_path / "b.tif"
+    later.write_bytes(tiff([], [(0x9003, 2, "2024:06:01 14:30:16"), (0x9291, 2, "5")]))
+    assert capture_time([str(later)]) - capture_time([str(path)]) == pytest.approx(1.25)
+
+
+def test_capture_time_tries_every_file_then_the_modification_time(tmp_path):
+    raw = tmp_path / "a.cr2"
+    raw.write_bytes(b"unknown format")
+    jpeg = tmp_path / "a.tif"
+    jpeg.write_bytes(tiff([], [(0x9003, 2, "2024:06:01 14:30:15")]))
+    dated = capture_time([str(jpeg)])
+    assert capture_time([str(raw), str(jpeg)]) == dated
+
+    os.utime(raw, (1_000_000_000, 1_000_000_000))
+    assert capture_time([str(raw)]) != dated
+    assert capture_time([str(tmp_path / "missing.jpg")]) is None
+
+
+def test_capture_time_ignores_an_empty_date(tmp_path):
+    path = tmp_path / "a.tif"
+    path.write_bytes(tiff([], [(0x9003, 2, "0000:00:00 00:00:00")]))
+    os.utime(path, (1_000_000_000, 1_000_000_000))
+    assert capture_time([str(path)]) is not None

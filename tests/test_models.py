@@ -491,3 +491,21 @@ def test_session_exports_only_name_files_directly_in_exports(tmp_path):
         ]},
     }))
     assert [record["name"] for record in load_session(str(tmp_path))["a.jpg"]["exports"]] == ["ok.jpg"]
+
+
+# -- natural sort ------------------------------------------------------------
+
+def test_scan_sorts_numbers_in_names_as_numbers(tmp_path):
+    for name in ("IMG_10.jpg", "IMG_100.jpg", "IMG_9.jpg", "img_2.jpg", "A.jpg", "7.jpg", "IMG_09.jpg"):
+        (tmp_path / name).write_bytes(b"x")
+    names = [p.name for p in scan_folder(str(tmp_path))]
+    assert names == ["7.jpg", "A.jpg", "img_2.jpg", "IMG_09.jpg", "IMG_9.jpg", "IMG_10.jpg", "IMG_100.jpg"]
+
+
+def test_natural_sort_ties_fall_back_on_the_path(tmp_path):
+    (tmp_path / "_KEEPS").mkdir()
+    (tmp_path / "_REJECTS").mkdir()
+    for folder in ("_KEEPS", "_REJECTS"):
+        (tmp_path / folder / "a1.jpg").write_bytes(b"x")
+    paths = [p.path for p in scan_folder(str(tmp_path))]
+    assert paths == sorted(paths)

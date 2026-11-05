@@ -1,10 +1,14 @@
-"""Moving photos into _KEEPS / _REJECTS (or back to the root), and what goes to _EXPORTS."""
+"""Moving photos into _KEEPS / _REJECTS (or back to the root), what goes to _EXPORTS, the Trash and importing."""
+import errno
+import hashlib
 import os
 import shutil
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 
-from .constants import KEEP, KEEP_DIR, REJECT, REJECT_DIR
+from PyQt6.QtCore import QFile
+
+from .constants import EXPORT_DIR, KEEP, KEEP_DIR, REJECT, REJECT_DIR, SUPPORTED_EXTENSIONS
 from .imaging import is_raw
 
 
@@ -286,3 +290,191 @@ def copy_export(path, dest_dir, name=None):
     with atomic_write(dest) as tmp_path:
         shutil.copy2(path, tmp_path)
     return dest
+
+
+# -- the Trash -----------------------------------------------------------------
+
+@dataclass
+class TrashResult:
+    trashed: list = field(default_factory=list)  # primary paths of the photos now in the Trash
+    errors: list = field(default_factory=list)
+    cancelled: bool = False
+
+
+def plan_trash(photos):
+    """The photos sitting in _REJECTS and still marked reject: a photo marked otherwise since is on its way out."""
+    return [photo for photo in photos if photo.location == REJECT and photo.status == REJECT]
+
+
+def _photo_group(photo):
+    """The photo's files and sidecars, all in one folder."""
+    return [source for source, _name in _group(photo.files, os.listdir(os.path.dirname(photo.path)))]
+
+
+def trash_size(photos):
+    """Bytes the photos' files and sidecars take."""
+    total = 0
+    for photo in photos:
+        with suppress(OSError):
+            total += sum(os.path.getsize(path) for path in _photo_group(photo))
+    return total
+
+
+def _to_trash(path):
+    """Move a file to the system Trash; returns where it is now. Raises OSError, leaving the file, if that can't be done."""
+    done, location = QFile.moveToTrash(path)
+    if not done:
+        raise OSError(errno.EIO, "could not be moved to the Trash")
+    return location
+
+
+def execute_trash(photos, progress=None):
+    """Move photos to the Trash, never deleting anything. `progress(done)` may return False to stop.
+
+    A photo's files go together: when one can't, those already in the Trash come back.
+    """
+    result = TrashResult()
+    for done, photo in enumerate(photos):
+        if progress and progress(done) is False:
+            result.cancelled = True
+            break
+        trashed = {}
+        try:
+            for path in _photo_group(photo):
+                trashed[path] = _to_trash(path)
+            result.trashed.append(photo.path)
+        except OSError as exc:
+            for path, location in trashed.items():
+                with suppress(OSError):
+                    shutil.move(location, path)
+            result.errors.append(f"{photo.name}: {exc.strerror or exc}")
+    if progress:
+        progress(len(photos))
+    return result
+
+
+# -- importing -----------------------------------------------------------------
+
+@dataclass
+class ImportResult:
+    copied: int = 0  # files, sidecars included
+    skipped: int = 0  # files already at the destination
+    errors: list = field(default_factory=list)
+    cancelled: bool = False
+
+
+def plan_import(source):
+    """Photos found under `source`, as lists of paths: files with the same name in a folder stay together.
+
+    Hidden entries (`.Trashes`, macOS's `._IMG_1.jpg`) and _EXPORTS are left out.
+    """
+    groups = []
+    for folder, directories, files in os.walk(source):
+        directories[:] = sorted(d for d in directories if not d.startswith('.') and d != EXPORT_DIR)
+        by_stem = {}
+        for name in sorted(files):
+            stem, ext = os.path.splitext(name)
+            if not name.startswith('.') and ext.lower() in SUPPORTED_EXTENSIONS:
+                by_stem.setdefault(stem.casefold(), []).append(os.path.join(folder, name))
+        groups += by_stem.values()
+    return groups
+
+
+def find_card(roots=("/Volumes", "/media", "/run/media")):
+    """The first mounted volume with a DCIM folder, for what to import from; "" if none.
+
+    (On Linux, volumes are one level further down, in a folder per user.)
+    """
+    pending = list(roots)
+    while pending:
+        root = pending.pop(0)
+        with suppress(OSError):
+            for entry in sorted(os.scandir(root), key=lambda entry: entry.name):
+                if os.path.isdir(os.path.join(entry.path, "DCIM")):
+                    return entry.path
+                if root in ("/media", "/run/media") and entry.is_dir():
+                    pending.append(entry.path)
+    return ""
+
+
+def import_size(groups):
+    total = 0
+    for group in groups:
+        for path in group:
+            with suppress(OSError):
+                total += os.path.getsize(path)
+    return total
+
+
+def _digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        while chunk := file.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _same_file(a, b):
+    return os.path.getsize(a) == os.path.getsize(b) and _digest(a) == _digest(b)
+
+
+def _copy_verified(source, dest):
+    """Copy `source`, then read the copy back and compare; nothing is left at `dest` if they differ."""
+    digest = hashlib.sha256()
+    with atomic_write(dest) as tmp_path:
+        with open(source, "rb") as reader, open(tmp_path, "wb") as writer:
+            while chunk := reader.read(1 << 20):
+                digest.update(chunk)
+                writer.write(chunk)
+        shutil.copystat(source, tmp_path)
+        if _digest(tmp_path) != digest.hexdigest():
+            raise OSError(errno.EIO, "the copy differs from the original")
+
+
+def _already_imported(source, name, dest_dir):
+    """Whether this very file is at the destination, even if it was sorted since."""
+    candidates = (dest_dir, os.path.join(dest_dir, KEEP_DIR), os.path.join(dest_dir, REJECT_DIR))
+    return any(os.path.isfile(path := os.path.join(d, name)) and _same_file(source, path) for d in candidates)
+
+
+def _import_group(group, dest_dir, result):
+    """Copy a photo's files and sidecars, under a number free for all of them, never overwriting."""
+    folder = os.path.dirname(group[0])
+    files = _group(group, os.listdir(folder))
+    sidecars = {source for source, _name in files} - set(group)
+    n = 0
+    while True:
+        # A sidecar that exists already may have been edited since: it is kept, and is no reason for a new name.
+        names = [(source, os.path.join(dest_dir, name(n)), name(n)) for source, name in files]
+        taken = any(source not in sidecars and os.path.exists(dest) and not _same_file(source, dest) for source, dest, _ in names)
+        if not taken:
+            break
+        n += 1
+    for source, dest, name in names:
+        if os.path.exists(dest) or (source not in sidecars and _already_imported(source, name, dest_dir)):
+            result.skipped += 1
+        else:
+            _copy_verified(source, dest)
+            result.copied += 1
+
+
+def execute_import(groups, destinations, progress=None):
+    """Copy `groups` (see plan_import()) to every folder of `destinations`. Originals are never changed.
+
+    `progress(done)` may return False to stop. Files already there are skipped,
+    so importing a card again only brings what is new.
+    """
+    result = ImportResult()
+    for done, group in enumerate(groups):
+        if progress and progress(done) is False:
+            result.cancelled = True
+            break
+        for dest_dir in destinations:
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                _import_group(group, dest_dir, result)
+            except OSError as exc:
+                result.errors.append(f"{os.path.basename(group[0])} → {dest_dir}: {exc.strerror or exc}")
+    if progress:
+        progress(len(groups))
+    return result

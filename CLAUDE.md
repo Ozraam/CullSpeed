@@ -20,7 +20,7 @@ pip install -e ".[dev]"                      # setup
 
 After every code change (features, fixes, refactors), rebuild the app with `./scripts/build_app.sh` once tests and lint pass, so that `dist/Tamis.app` can be used straight away. Changes that only touch documentation don't need a rebuild. The script calls `python`, so activate `.venv` first; `dist/` is git-ignored, so the build is not committed.
 
-`tests/test_app.py` drives the real main window with its real shortcuts and mouse events, using Qt's `offscreen` platform on a throwaway folder. Its fixture redirects `QSettings` to a temp directory so tests never touch the real app's settings; new window-level tests should use that `window` fixture.
+`tests/test_app.py` drives the real main window with its real shortcuts and mouse events, using Qt's `offscreen` platform on a throwaway folder. Its fixture redirects `QSettings` to a temp directory and passes its own `cache_dir`, so tests never touch the real app's settings or caches; new window-level tests should use that `window` fixture. Anything that goes to the real Trash has to be replaced in tests (`fileops._to_trash`).
 
 ## Architecture
 
@@ -33,8 +33,10 @@ After every code change (features, fixes, refactors), rebuild the app with `./sc
 
 All changes to marks, ratings, labels and edits go through `PhotoModel.set_field` / `set_values`. These return the undo changes and keep the O(1) counters and signals correct. `Photo.edit` is always replaced, never mutated in place, because undo keeps a reference to the previous dict.
 
+The results of the background analysis (`capture_time`, `sharpness`, `image_hash`, `burst`) live on the `Photo` itself and aren't marks: they are set directly, never saved in the session, and only ever suggest. Rows change when the sort order does (`PhotoModel.reorder`, `TamisApp._apply_order`), so nothing may keep a row across that.
+
 ### Threading
-Two engines follow the same pattern, `ImageLoader` (`loader.py`, previews, thumbnails, full resolution) and `EditRenderer` (`editing.py`, live edit previews):
+Four engines follow the same pattern, `ImageLoader` (`loader.py`, previews, thumbnails, full resolution), `EditRenderer` (`editing.py`, live edit previews), `PhotoAnalyzer` (`analysis.py`, dates and scores) and `FocusPeaker` (`peaking.py`):
 
 - Workers only produce `QImage`; they send it through an internal queued signal, and the `QPixmap` is created on the GUI thread.
 - Each job captures a `_generation` number. `reset()` increments it, and stale results are ignored rather than the threads being terminated. Superseded requests are skipped the same way.
@@ -47,6 +49,8 @@ An edit is a plain dict holding only the non-default settings, as normalised by 
 
 `develop.render()` takes linear float32 RGB and must stay position-independent: each step may depend only on a pixel and its position in the full image (`origin` / `full_size`), so strip-based export gives the same result as a preview. The crop is applied before `render()`, so vignette and grain follow the final frame. When adding a setting, update `DEFAULTS` and `RANGES` in `develop.py` and the panel in `editpanel.py`.
 
+`PhotoAnalyzer` only reads what the current options need (`TamisApp._request_analysis`), since a card can be slow, and remembers results per folder by file name, size and modification time, in the app's cache folder, as does `ThumbnailCache` (`thumbcache.py`) for thumbnails, by path, size and modification time. Neither needs to follow moves: a moved file keeps its name and date, or is a miss. `StatusFilterProxy` filters on `FILTER_ROLE`, which any change a filter depends on must announce, since Qt only re-checks rows for that one role.
+
 RAWs are edited from LibRaw's 16-bit linear development, not their embedded JPEG (`editing._source`), whereas culling previews go through `imaging.load_image`.
 
 ### Persistence
@@ -55,10 +59,13 @@ RAWs are edited from LibRaw's 16-bit linear development, not their embedded JPEG
 - The app used to be called CullSpeed. `cullspeed_session.json` is still read and replaced on the next save in the folder, and `migration.py` copies the old settings and fallback sessions at startup.
 - Saved marks win over the folder a photo sits in, so marks changed since the last Process Files survive.
 - `save_session` keeps the entries of photos whose file is missing, so anything that moves photos has to `forget` their old keys (`TamisApp.moved_keys`). A session that can't be parsed is renamed `*.corrupt.json` and reported through `problems`, never overwritten.
+- `xmp:Rating="-1"` means rejected, not a number of stars: `xmp.read` gives `None` for it and the session's rating stays. Tamis writes it only with the opt-in in **Options** (`TamisApp.xmp_marks`, see `XMP_MARKS`), as no pick or reject flag is common to editors.
 - XMP sidecars win over the session for ratings and labels, so changes from other editors take effect. Writes are batched through `xmp_dirty` and flushed by `save_session`. A failed write stays in `xmp_dirty` and sets `Photo.xmp_pending`, stored in the session, which makes the session win until a write succeeds. Existing sidecars are edited in place, touching only `xmp:Rating` and `xmp:Label`.
 
 ### Process Files
 `fileops` keeps planning separate from execution: `plan_moves` / `execute_moves` and `plan_exports` / `copy_export`. Moves never overwrite (`IMG_1 (1).jpg`), while files in `_EXPORTS` are deliberately replaced so that reprocessing refreshes them. `process_files` plans exports a second time after moving, because the paths have changed. `execute_moves` moves a photo's files all together or not at all, and exports are written through `atomic_write`.
+
+`plan_import` / `execute_import` and `plan_trash` / `execute_trash` work the same way. Imports never change the source and verify every copy; the Trash takes a photo's files all together or not at all, and `TamisApp._forget_trashed` makes everything path-keyed follow. Nothing in the app deletes photos.
 
 `Photo.exports` records what was written to `_EXPORTS` for a photo (name, size, modification time), in the session. `remove_rejected_exports` only deletes files that still match their record, so files the user added or changed in `_EXPORTS` are safe.
 
