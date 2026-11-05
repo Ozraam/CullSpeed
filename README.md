@@ -51,7 +51,7 @@ tamis                  # or: python Tamis.py, python -m tamis
 | Edit panel | `E` |
 | Crop: open / apply, cancel | `R` or `Enter`, `Esc` |
 | Copy / paste edit (paste applies to the selection) | `⌘C` / `⌘V` or `⌘⇧C` / `⌘⇧V` (`Ctrl+C` / `V`, `Ctrl+Shift+C` / `V`) |
-| Export JPEG (current or selected photos) | `⌘⇧E` / `Ctrl+Shift+E` |
+| Export JPEG (current or selected photos: edited ones and those without a JPEG are rendered, others copied) | `⌘⇧E` / `Ctrl+Shift+E` |
 | Refresh the folder | `⌘R` / `Ctrl+R`, `F5` |
 | Switch Cull ↔ Gallery | `G` (Enter or double-click in the gallery opens a photo) |
 | Open folder | `⌘O` / `Ctrl+O` |
@@ -112,7 +112,9 @@ Good to know:
 - In the built `Tamis.app`, plugins can import `tamis`, numpy, PyQt6's `QtCore`, `QtGui` and `QtWidgets`, and the parts of the standard library the app itself uses. A plugin that needs more runs from source (`python -m tamis`) or adds it to `scripts/build_app.sh` with `--hidden-import`.
 
 ## Sessions
-`tamis_session.json` stores marks keyed by path relative to the photo folder (e.g. `_KEEPS/IMG_1.CR2`), so the folder can be moved or renamed without losing decisions. Older sessions keyed by filename are still read, and so are `cullspeed_session.json` files from when the app was called CullSpeed; the next save replaces them. Ratings and labels are stored there too; when a photo has an XMP sidecar, its rating and label are read from the sidecar instead, so changes made in another editor win.
+`tamis_session.json` stores marks keyed by path relative to the photo folder (e.g. `_KEEPS/IMG_1.CR2`), so the folder can be moved or renamed without losing decisions. Older sessions keyed by filename are still read, and so are `cullspeed_session.json` files from when the app was called CullSpeed; the next save replaces them. Ratings and labels are stored there too; when a photo has an XMP sidecar, its rating and label are read from the sidecar instead, so changes made in another editor win. If a rating can't be written to its sidecar, the session's value wins until a later save manages to write it.
+
+Marks of photos whose file is missing are kept, so a `_KEEPS` taken out of the folder and brought back gets them back. A session file that can't be read is never overwritten: it is renamed `tamis_session.corrupt.json`, the app says so, and the next most recent session is used if there is one.
 
 If the photo folder is read-only (locked SD card, read-only share), marks are saved in the app's own data folder instead and reloaded from there when the folder is reopened.
 

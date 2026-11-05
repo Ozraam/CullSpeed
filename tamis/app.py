@@ -49,7 +49,7 @@ from .constants import (
 from .editing import EditRenderer, export_photo
 from .editpanel import EditPanel
 from .exif import summary
-from .fileops import copy_export, execute_moves, plan_exports, plan_moves
+from .fileops import copy_export, execute_moves, is_jpeg, jpeg_file, plan_exports, plan_moves
 from .loader import ImageLoader
 from .models import PhotoModel, StatusFilterProxy, photo_files, relative_key, save_session, scan_folder
 from .plugins import PhotoInfo, PluginManager
@@ -101,7 +101,8 @@ class ExportThread(QThread):
 
     def __init__(self, jobs, dest_dir, parent=None):
         super().__init__(parent)
-        self.jobs = jobs  # [(path, edit, LUT path, name)]: edit {} copies; name None picks a free one
+        # [(path, edit, LUT path, name)]: an unedited JPEG is copied, anything else rendered; name None picks a free one
+        self.jobs = jobs
         self.dest_dir = dest_dir
         self.exported = []
         self.errors = []
@@ -117,7 +118,7 @@ class ExportThread(QThread):
                 break
             self.progressed.emit(done)
             try:
-                if edit:
+                if edit or not is_jpeg(path):
                     self.exported.append(export_photo(path, edit, lut_path, self.dest_dir, tables, name=name))
                 else:
                     self.exported.append(copy_export(path, self.dest_dir, name))
@@ -140,6 +141,8 @@ class TamisApp(QMainWindow):
         self.session_warning = None  # last session problem shown, so it is shown once
         self.xmp_warned = False
         self.xmp_dirty = set()  # photos whose rating/label still has to be written to XMP
+        self.moved_keys = set()  # session keys of moved photos, until a save has dropped them
+        self.damaged_sessions = set()  # session files the user was told about
         self.folder = ""
         self.current_row = -1
         self.compare_rows = []  # rows shown side by side; empty outside Compare
@@ -367,11 +370,13 @@ class TamisApp(QMainWindow):
             return
         self._finish_crop(apply=True)
         self.save_session()
+        problems = []
         try:
-            photos = scan_folder(folder, self.session_fallback_dir)
+            photos = scan_folder(folder, self.session_fallback_dir, problems)
         except OSError as exc:
             inform(self, "Cannot open folder", escape(f"{folder}: {exc}"))
             return
+        self._report_damaged_sessions(problems)
 
         self.live_edit = None
         same_folder = keep_state and folder == self.folder
@@ -382,6 +387,8 @@ class TamisApp(QMainWindow):
             self.xmp_warned = False
             self.undo_stack.clear()
             self.crop_cache.clear()
+            self.moved_keys.clear()
+        self.xmp_dirty = {photo.path for photo in photos if photo.xmp_pending}  # try those again
         self._end_compare(show=False)
         self.folder = folder
         self.current_row = -1
@@ -457,11 +464,15 @@ class TamisApp(QMainWindow):
         if not self.folder or not self.model.photos:
             return
         self._write_xmp()
+        problems = []
         try:
-            path = save_session(self.folder, self.model.photos, self.session_fallback_dir)
+            path = save_session(self.folder, self.model.photos, self.session_fallback_dir, self.moved_keys, problems)
         except OSError as exc:
             self._session_problem("failed", f"Could not save marks: {exc.strerror or exc}")
             return
+        finally:
+            self._report_damaged_sessions(problems)
+        self.moved_keys.clear()
         if path != os.path.join(self.folder, SESSION_FILENAME):
             self._session_problem("fallback", "This folder is read-only: marks are saved in the app's data folder")
         else:
@@ -473,8 +484,21 @@ class TamisApp(QMainWindow):
             self.session_warning = kind
             self.toast.show_message(message, 5000)
 
+    def _report_damaged_sessions(self, paths):
+        # In a read-only folder a damaged file stays where it is, and is found again.
+        paths = [path for path in paths if path not in self.damaged_sessions]
+        self.damaged_sessions.update(paths)
+        if paths:
+            # Once the current work is done: this can come up in the middle of opening or saving a folder.
+            QTimer.singleShot(0, lambda: inform(
+                self,
+                "Saved marks could not be read",
+                "A session file is damaged, so some marks, ratings or edits may be missing. It was kept here:",
+                details=paths,
+            ))
+
     def _write_xmp(self):
-        """Write pending ratings and labels to the photos' XMP sidecars."""
+        """Write pending ratings and labels to the photos' XMP sidecars; what fails is tried again at the next save."""
         dirty, self.xmp_dirty = self.xmp_dirty, set()
         listings = {}
         for path in dirty:
@@ -487,7 +511,10 @@ class TamisApp(QMainWindow):
                 if directory not in listings:
                     listings[directory] = {name.lower(): name for name in os.listdir(directory)}
                 xmp.write(photo.files, photo.rating, photo.label, listings[directory])
+                photo.xmp_pending = False
             except OSError as exc:
+                photo.xmp_pending = True
+                self.xmp_dirty.add(path)
                 if not self.xmp_warned:
                     self.xmp_warned = True
                     self.toast.show_message(
@@ -887,7 +914,10 @@ class TamisApp(QMainWindow):
         if not rows or self.moving:
             return
         self.save_session()
-        jobs = [(p.path, p.edit, self._lut_path(p.edit), None) for p in (self.model.photo(row) for row in rows)]
+        jobs = [
+            (p.path if p.edit else jpeg_file(p) or p.path, p.edit, self._lut_path(p.edit), None)
+            for p in (self.model.photo(row) for row in rows)
+        ]
         thread = self._run_export(jobs, "Export JPEG")
         if thread.errors:
             inform(
@@ -1208,6 +1238,8 @@ class TamisApp(QMainWindow):
         self.model.apply_moves({old: (new, locations[old]) for old, new in result.moved.items()})
         self.loader.rename_paths(result.moved)
         self.editor.rename_paths(result.moved)
+        self.xmp_dirty = {result.moved.get(path, path) for path in self.xmp_dirty}
+        self.moved_keys.update(relative_key(self.folder, old) for old in result.moved)
         self.undo_stack.clear()  # undo entries refer to the old paths
         self.save_session()
         self._on_statuses_changed([])

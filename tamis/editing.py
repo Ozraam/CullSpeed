@@ -21,6 +21,7 @@ from PyQt6.QtCore import QObject, Qt, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QImage, QImageReader, QPixmap
 
 from . import develop, lut
+from .fileops import free_name
 from .imaging import array_to_image, image_to_array, is_raw, resize_array
 
 EDIT_PREVIEW_SIZE = 2048  # longest edge of the image edits are previewed on
@@ -123,10 +124,7 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=N
 
     os.makedirs(dest_dir, exist_ok=True)
     if name is None:
-        stem = os.path.splitext(os.path.basename(path))[0]
-        name, n = f"{stem}.jpg", 1
-        while os.path.exists(os.path.join(dest_dir, name)):
-            name, n = f"{stem} ({n}).jpg", n + 1
+        name = free_name(dest_dir, os.path.splitext(os.path.basename(path))[0], ".jpg")
     dest = os.path.join(dest_dir, name)
     if not array_to_image(out).save(dest, "JPG", quality):
         raise EditError(f"could not write {name}")

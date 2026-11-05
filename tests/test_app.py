@@ -1,4 +1,5 @@
 """The main window, driven by its real shortcuts and mouse events, on a throwaway folder."""
+import json
 import os
 
 import pytest
@@ -9,8 +10,9 @@ from PyQt6.QtGui import QColor, QImage  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 
+from tamis import xmp  # noqa: E402
 from tamis.app import CULL_TAB, GALLERY_TAB, TamisApp  # noqa: E402
-from tamis.constants import KEEP, REJECT  # noqa: E402
+from tamis.constants import KEEP, REJECT, SESSION_FILENAME  # noqa: E402
 from tamis.fileops import plan_moves  # noqa: E402
 from tamis.plugins import PhotoInfo  # noqa: E402
 from tamis.widgets import ProcessDialog  # noqa: E402
@@ -651,3 +653,133 @@ def test_example_plugin_works(window):
     assert [window.model.photo(row).status for row in (0, 1, 2)] == [None, KEEP, KEEP]
     plugin.actions[0].trigger()
     assert QApplication.clipboard().text() == "IMG_1.jpg\nIMG_2.jpg"
+
+
+# -- exporting -----------------------------------------------------------------
+
+def test_export_shortcut_copies_an_unedited_jpeg(window, tmp_path):
+    source = (tmp_path / "IMG_0.jpg").read_bytes()
+    press(window, Qt.Key.Key_E, CTRL | Qt.KeyboardModifier.ShiftModifier)
+    assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").read_bytes() == source
+
+    window.export_photos()  # (offscreen, no window is active again after the progress dialog: no more shortcuts)
+    assert (tmp_path / "_EXPORTS" / "IMG_0 (1).jpg").read_bytes() == source
+
+
+def test_export_renders_an_edited_photo(window, tmp_path):
+    window.model.set_field([0], "edit", {"exposure": 1.0})
+    window.export_photos()
+    exported = QImage(str(tmp_path / "_EXPORTS" / "IMG_0.jpg"))
+    assert not exported.isNull()
+    assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").read_bytes() != (tmp_path / "IMG_0.jpg").read_bytes()
+
+
+def test_export_renders_an_unedited_photo_without_a_jpeg(window, tmp_path):
+    image = QImage(30, 20, QImage.Format.Format_RGB32)
+    image.fill(QColor(90, 80, 120))
+    assert image.save(str(tmp_path / "other.png"))
+    window.load_folder(str(tmp_path), select="other.png")
+
+    window.export_photos()
+
+    assert os.listdir(tmp_path / "_EXPORTS") == ["other.jpg"]
+    assert QImage(str(tmp_path / "_EXPORTS" / "other.jpg")).size() == image.size()
+
+
+def test_export_uses_the_jpeg_of_an_unedited_pair(window, tmp_path):
+    (tmp_path / "IMG_0.CR2").write_bytes(b"not developed: the JPEG is what gets copied")
+    window.load_folder(str(tmp_path), select="IMG_0.CR2")
+
+    window.export_photos()
+
+    assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").read_bytes() == (tmp_path / "IMG_0.jpg").read_bytes()
+
+
+# -- sessions ------------------------------------------------------------------
+
+def stored_session(tmp_path):
+    return json.loads((tmp_path / SESSION_FILENAME).read_text())
+
+
+def test_moved_photos_leave_no_entry_behind(window, tmp_path, monkeypatch):
+    statuses(window, keep=[0])
+    process(window, monkeypatch, export=False)
+    window.model.set_status([window.model.row_of(str(tmp_path / "_KEEPS" / "IMG_0.jpg"))], None)
+    process(window, monkeypatch, export=False)
+
+    window.save_session()
+
+    assert "_KEEPS/IMG_0.jpg" not in stored_session(tmp_path)
+    assert (tmp_path / "IMG_0.jpg").exists()
+
+
+def test_photo_taken_out_of_the_folder_gets_its_edit_back(window, tmp_path):
+    window.model.set_field([1], "edit", {"contrast": 30})
+    window.save_session()
+
+    (tmp_path / "IMG_1.jpg").rename(tmp_path.parent / f"{tmp_path.name}_IMG_1.jpg")
+    window.refresh()
+    window.model.set_status([0], KEEP)
+    window.save_session()
+    (tmp_path.parent / f"{tmp_path.name}_IMG_1.jpg").rename(tmp_path / "IMG_1.jpg")
+    window.refresh()
+
+    assert window.model.photo(1).edit == {"contrast": 30}
+
+
+def test_damaged_session_is_reported_once_and_kept(window, tmp_path, monkeypatch):
+    shown = []
+    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, _text, details=None: shown.append((title, details)))
+    (tmp_path / SESSION_FILENAME).write_text("{not json")
+
+    window.load_folder(str(tmp_path))
+
+    kept = tmp_path / "tamis_session.corrupt.json"
+    assert wait_until(lambda: shown)
+    assert shown == [("Saved marks could not be read", [str(kept)])]
+    assert kept.read_text() == "{not json"
+
+
+def test_rating_that_cannot_reach_the_sidecar_survives_and_is_written_later(window, tmp_path, monkeypatch):
+    sidecar = tmp_path / "IMG_0.jpg.xmp"
+    sidecar.write_text(xmp.update(xmp._TEMPLATE, 2, None))
+    window.load_folder(str(tmp_path))
+    real_write = xmp.write
+
+    def fail(*_args):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(xmp, "write", fail)
+    press(window, Qt.Key.Key_5, CTRL)
+    window.save_session()
+    assert window.model.photo(0).xmp_pending
+    assert stored_session(tmp_path)["IMG_0.jpg"]["xmp_pending"] is True
+
+    window.load_folder(str(tmp_path))  # still failing: the session's value is what counts
+    assert window.model.photo(0).rating == 5
+
+    monkeypatch.setattr(xmp, "write", real_write)
+    window.save_session()  # tried again without any new change
+    assert not window.model.photo(0).xmp_pending
+    assert xmp.parse(sidecar.read_text())[0] == 5
+    assert "xmp_pending" not in stored_session(tmp_path)["IMG_0.jpg"]
+
+
+def test_rating_still_waiting_for_its_sidecar_follows_a_move(window, tmp_path, monkeypatch):
+    (tmp_path / "IMG_0.jpg.xmp").write_text(xmp.update(xmp._TEMPLATE, 2, None))
+    window.load_folder(str(tmp_path))
+    real_write = xmp.write
+
+    def fail(*_args):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(xmp, "write", fail)
+    press(window, Qt.Key.Key_5, CTRL)
+    statuses(window, keep=[0])
+    process(window, monkeypatch, export=False)
+    moved = str(tmp_path / "_KEEPS" / "IMG_0.jpg")
+    assert window.xmp_dirty == {moved}
+
+    monkeypatch.setattr(xmp, "write", real_write)
+    window.save_session()
+    assert xmp.parse((tmp_path / "_KEEPS" / "IMG_0.jpg.xmp").read_text())[0] == 5

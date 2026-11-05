@@ -42,6 +42,9 @@ class Photo:
     # Quick edits, as develop.clean() keeps them: {} when not edited. Always
     # replaced, never changed in place, so undo can keep the previous one.
     edit: dict = field(default_factory=dict)
+    # The rating and label could not be written to the XMP sidecar yet: until
+    # they are, the session has the newer values and wins over the sidecar.
+    xmp_pending: bool = False
 
     @property
     def name(self):
@@ -105,8 +108,11 @@ def photo_files(folder):
     return {path for directory, _ in _photo_dirs(folder) for path in _list_dir(directory)[0]}
 
 
-def scan_folder(folder, fallback_dir=None):
-    """Photos in `folder`, `_KEEPS` and `_REJECTS`, with their saved marks and ratings."""
+def scan_folder(folder, fallback_dir=None, problems=None):
+    """Photos in `folder`, `_KEEPS` and `_REJECTS`, with their saved marks and ratings.
+
+    `problems`, a list, receives the path of any damaged session, see load_session().
+    """
     photos = []
     from_sidecars = {}
     for directory, location in _photo_dirs(folder):
@@ -120,7 +126,7 @@ def scan_folder(folder, fallback_dir=None):
 
     # Saved marks win over folder location, so marks changed after the last
     # "Process Files" are not lost.
-    session = load_session(folder, fallback_dir)
+    session = load_session(folder, fallback_dir, problems)
     name_counts = Counter(photo.name for photo in photos)
     for photo in photos:
         key = relative_key(folder, photo.path)
@@ -130,9 +136,11 @@ def scan_folder(folder, fallback_dir=None):
         if entry is not None:
             photo.status, photo.rating, photo.label = entry["status"], entry["rating"], entry["label"]
             photo.edit = entry["edit"]
+            photo.xmp_pending = entry.get("xmp_pending", False)
         # Sidecars are what other editors change, and Tamis writes them
-        # whenever a rating changes: they are the fresher source.
-        if photo.path in from_sidecars:
+        # whenever a rating changes: they are the fresher source, unless
+        # that write failed.
+        if photo.path in from_sidecars and not photo.xmp_pending:
             photo.rating, photo.label = from_sidecars[photo.path]
 
     photos.sort(key=lambda p: (p.name.casefold(), p.path))
@@ -176,23 +184,52 @@ def _entry(value):
         rating = 0
     if label not in xmp.LABELS:
         label = None
-    return {"status": status, "rating": rating, "label": label, "edit": develop.clean(value.get("edit"))}
+    entry = {"status": status, "rating": rating, "label": label, "edit": develop.clean(value.get("edit"))}
+    if value.get("xmp_pending") is True:
+        entry["xmp_pending"] = True
+    return entry
 
 
-def load_session(folder, fallback_dir=None):
-    """Saved marks, keyed by relative path; the newest of the folder, fallback and pre-rename sessions."""
+def _set_aside(path):
+    """Rename a damaged session so that saving doesn't replace it; returns where it is now."""
+    stem, ext = os.path.splitext(path)
+    target, n = f"{stem}.corrupt{ext}", 1
+    while os.path.exists(target):
+        target, n = f"{stem}.corrupt ({n}){ext}", n + 1
+    try:
+        os.replace(path, target)
+    except OSError:
+        return path  # a read-only folder: nothing will overwrite it there either
+    return target
+
+
+def _read_session(folder, fallback_dir, problems):
+    """The newest readable session as stored, {} if none. Damaged ones are set aside and listed in `problems`."""
     paths = [*_session_paths(folder, fallback_dir), os.path.join(folder, LEGACY_SESSION_FILENAME)]
     existing = [path for path in paths if os.path.isfile(path)]
-    if not existing:
-        return {}
-    try:
-        with open(max(existing, key=os.path.getmtime), encoding='utf-8') as file:
-            data = json.load(file)
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    entries = {key: _entry(value) for key, value in data.items()}
+    for path in sorted(existing, key=os.path.getmtime, reverse=True):
+        try:
+            with open(path, encoding='utf-8') as file:
+                data = json.load(file)
+        except OSError:
+            continue
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            return data
+        location = _set_aside(path)
+        if problems is not None:
+            problems.append(location)
+    return {}
+
+
+def load_session(folder, fallback_dir=None, problems=None):
+    """Saved marks, keyed by relative path; the newest of the folder, fallback and pre-rename sessions.
+
+    A damaged file is set aside as `….corrupt.json`, never overwritten, and the
+    next newest is used instead. `problems`, a list, receives where it now is.
+    """
+    entries = {key: _entry(value) for key, value in _read_session(folder, fallback_dir, problems).items()}
     return {key: entry for key, entry in entries.items() if entry is not None}
 
 
@@ -201,6 +238,8 @@ def _write_json(path, data):
     try:
         with open(tmp_path, 'w', encoding='utf-8') as file:
             json.dump(data, file, indent=2, ensure_ascii=False)
+            file.flush()
+            os.fsync(file.fileno())  # or a power cut can leave an empty file after the rename
         os.replace(tmp_path, path)
     except OSError:
         with suppress(OSError):
@@ -209,20 +248,44 @@ def _write_json(path, data):
 
 
 def _session_value(photo):
-    if not photo.rating and photo.label is None and not photo.edit:
+    if not photo.rating and photo.label is None and not photo.edit and not photo.xmp_pending:
         return photo.status  # same as older sessions
     value = {"status": photo.status, "rating": photo.rating, "label": photo.label}
     if photo.edit:
         value["edit"] = photo.edit
+    if photo.xmp_pending:
+        value["xmp_pending"] = True
     return value
 
 
-def save_session(folder, photos, fallback_dir=None):
+def _absent_entries(folder, stored, photos, known, forget):
+    """What `stored` says about photos that are not in `photos` for now, such as a `_KEEPS` taken out and brought back.
+
+    A file may be back already: a refresh saves before it scans the folder again.
+    """
+    names = {key.rsplit("/", 1)[-1] for key in known}
+    companions = {relative_key(folder, path) for photo in photos for path in photo.companions}
+    kept = {}
+    for key, value in stored.items():
+        if key in known or key in forget or key in companions:  # (the JPEG of a pair is not a photo of its own)
+            continue
+        if "/" not in key and key in names:
+            continue  # a legacy filename key (or a move made elsewhere): that photo has the entry now
+        entry = _entry(value)
+        if entry is not None and (entry["status"] or entry["rating"] or entry["label"] or entry["edit"]):
+            kept[key] = value
+    return kept
+
+
+def save_session(folder, photos, fallback_dir=None, forget=(), problems=None):
     """Save marks in `folder`, else in `fallback_dir`; returns the path written.
 
+    Entries of photos not in `photos` are kept, unless their relative path
+    is in `forget` (the photo was moved). `problems` is as in load_session().
     Raises OSError when neither can be written.
     """
     data = {relative_key(folder, photo.path): _session_value(photo) for photo in photos}
+    data.update(_absent_entries(folder, _read_session(folder, fallback_dir, problems), photos, data, forget))
     folder_path, *fallback = _session_paths(folder, fallback_dir)
     try:
         _write_json(folder_path, data)

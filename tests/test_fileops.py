@@ -190,3 +190,15 @@ def test_copy_export_replaces_earlier_export(tmp_path):
     dest = copy_export(source, str(tmp_path / "_EXPORTS"), "a.jpg")
     assert read(dest) == "new"
     assert listing(str(tmp_path), "_EXPORTS") == ["a.jpg"]
+
+
+def test_copy_export_without_a_name_picks_a_free_one(tmp_path):
+    from tamis.fileops import copy_export
+    source = touch(tmp_path / "a.jpg", "new")
+    touch(tmp_path / "_EXPORTS" / "a.jpg", "earlier")
+
+    dest = copy_export(source, str(tmp_path / "_EXPORTS"))
+
+    assert os.path.basename(dest) == "a (1).jpg"
+    assert read(dest) == "new"
+    assert read(tmp_path / "_EXPORTS" / "a.jpg") == "earlier"

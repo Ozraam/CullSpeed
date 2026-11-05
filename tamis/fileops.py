@@ -133,12 +133,21 @@ def execute_moves(moves, progress=None):
 JPEG_EXTENSIONS = frozenset({'.jpg', '.jpeg'})
 
 
-def _jpeg(photo):
+def is_jpeg(path):
+    return os.path.splitext(path)[1].lower() in JPEG_EXTENSIONS
+
+
+def jpeg_file(photo):
     """The photo's JPEG: itself, or the JPEG of a RAW+JPEG pair. None if it has none."""
-    for path in photo.files:
-        if os.path.splitext(path)[1].lower() in JPEG_EXTENSIONS:
-            return path
-    return None
+    return next(filter(is_jpeg, photo.files), None)
+
+
+def free_name(dest_dir, stem, ext):
+    """`stem + ext`, or `stem (n) + ext` if that is taken in `dest_dir`."""
+    name, n = stem + ext, 1
+    while os.path.exists(os.path.join(dest_dir, name)):
+        name, n = f"{stem} ({n}){ext}", n + 1
+    return name
 
 
 def plan_exports(photos):
@@ -163,14 +172,20 @@ def plan_exports(photos):
         if photo.edit:
             stem = os.path.splitext(photo.name)[0]
             jobs.append(ExportJob(photo.path, photo.edit, unique(stem, ".jpg")))
-        elif (jpeg := _jpeg(photo)) is not None:
+        elif (jpeg := jpeg_file(photo)) is not None:
             jobs.append(ExportJob(jpeg, {}, unique(*os.path.splitext(os.path.basename(jpeg)))))
     return jobs
 
 
-def copy_export(path, dest_dir, name):
-    """Copy `path` into `dest_dir` as `name`, replacing it; returns the new path."""
+def copy_export(path, dest_dir, name=None):
+    """Copy `path` into `dest_dir`; returns the new path.
+
+    With `name` the file is written under that name, replacing one already
+    there; without, it gets a free name (`IMG_1 (1).jpg`).
+    """
     os.makedirs(dest_dir, exist_ok=True)
+    if name is None:
+        name = free_name(dest_dir, *os.path.splitext(os.path.basename(path)))
     dest = os.path.join(dest_dir, name)
     shutil.copy2(path, dest)
     return dest

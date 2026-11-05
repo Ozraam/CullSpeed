@@ -54,7 +54,8 @@ RAWs are edited from LibRaw's 16-bit linear development, not their embedded JPEG
 - Older session formats must keep loading: bare status values and filename keys (`models._entry`, `scan_folder`).
 - The app used to be called CullSpeed. `cullspeed_session.json` is still read and replaced on the next save in the folder, and `migration.py` copies the old settings and fallback sessions at startup.
 - Saved marks win over the folder a photo sits in, so marks changed since the last Process Files survive.
-- XMP sidecars win over the session for ratings and labels, so changes from other editors take effect. Writes are batched through `xmp_dirty` and flushed by `save_session`. Existing sidecars are edited in place, touching only `xmp:Rating` and `xmp:Label`.
+- `save_session` keeps the entries of photos whose file is missing, so anything that moves photos has to `forget` their old keys (`TamisApp.moved_keys`). A session that can't be parsed is renamed `*.corrupt.json` and reported through `problems`, never overwritten.
+- XMP sidecars win over the session for ratings and labels, so changes from other editors take effect. Writes are batched through `xmp_dirty` and flushed by `save_session`. A failed write stays in `xmp_dirty` and sets `Photo.xmp_pending`, stored in the session, which makes the session win until a write succeeds. Existing sidecars are edited in place, touching only `xmp:Rating` and `xmp:Label`.
 
 ### Process Files
 `fileops` keeps planning separate from execution: `plan_moves` / `execute_moves` and `plan_exports` / `copy_export`. Moves never overwrite (`IMG_1 (1).jpg`), while files in `_EXPORTS` are deliberately replaced so that reprocessing refreshes them. `process_files` plans exports a second time after moving, because the paths have changed.
