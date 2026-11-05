@@ -89,7 +89,7 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 ## Development
 ```bash
 pip install -e ".[dev]"
-pytest                     # file moves, session file, model counters
+pytest                     # main window, edits, crop, LUTs, file moves, sessions, XMP, EXIF
 ruff check .
 ```
 CI runs both on every push and pull request (`.github/workflows/ci.yml`).
