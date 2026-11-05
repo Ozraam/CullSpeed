@@ -741,7 +741,7 @@ class HeaderBar(QFrame):
         super().__init__(parent)
         self.setObjectName("HeaderBar")
 
-        title = QLabel("CullSpeed")
+        title = QLabel("Tamis")
         title.setObjectName("AppTitle")
 
         self.lbl_folder = QLabel("No folder open")

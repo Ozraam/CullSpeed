@@ -3,8 +3,8 @@ import os
 import numpy as np
 from PyQt6.QtGui import QColor, QImage
 
-from cullspeed import editing
-from cullspeed.imaging import image_to_array
+from tamis import editing
+from tamis.imaging import image_to_array
 
 
 def jpeg(path, width=300, height=200, grey=100):

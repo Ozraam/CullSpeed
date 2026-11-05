@@ -2,10 +2,10 @@ import numpy as np
 import pytest
 from PyQt6.QtGui import QImage
 
-from cullspeed import cropping, develop
-from cullspeed.develop import clean, clean_crop, crop_array
-from cullspeed.editing import export_photo
-from cullspeed.imaging import array_to_image
+from tamis import cropping, develop
+from tamis.develop import clean, clean_crop, crop_array
+from tamis.editing import export_photo
+from tamis.imaging import array_to_image
 
 
 def test_clean_crop_keeps_only_a_real_frame():

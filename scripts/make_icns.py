@@ -1,4 +1,4 @@
-"""Render cullspeed/resources/icon.svg into a macOS .icns (uses Qt's SVG renderer and `iconutil`).
+"""Render tamis/resources/icon.svg into a macOS .icns (uses Qt's SVG renderer and `iconutil`).
 
 Usage: python scripts/make_icns.py OUTPUT.icns
 """
@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QGuiApplication, QImage, QPainter
 from PyQt6.QtSvg import QSvgRenderer
 
-SVG = Path(__file__).resolve().parent.parent / "cullspeed" / "resources" / "icon.svg"
+SVG = Path(__file__).resolve().parent.parent / "tamis" / "resources" / "icon.svg"
 SIZES = (16, 32, 128, 256, 512)
 
 

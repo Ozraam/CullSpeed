@@ -1,6 +1,6 @@
 import os
 
-from cullspeed import xmp
+from tamis import xmp
 
 LIGHTROOM = """<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">

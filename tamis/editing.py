@@ -25,7 +25,7 @@ from .imaging import array_to_image, image_to_array, is_raw, resize_array
 
 EDIT_PREVIEW_SIZE = 2048  # longest edge of the image edits are previewed on
 _STRIP_THREADS = max(1, min(8, (os.cpu_count() or 2)))
-_strip_pool = ThreadPoolExecutor(_STRIP_THREADS, thread_name_prefix="cullspeed-strip")
+_strip_pool = ThreadPoolExecutor(_STRIP_THREADS, thread_name_prefix="tamis-strip")
 
 
 class EditError(Exception):

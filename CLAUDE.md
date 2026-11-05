@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-CullSpeed is a PyQt6 desktop app for culling photo shoots: fast previews, keyboard-driven marking, then sorting files into `_KEEPS` / `_REJECTS` and exporting JPEGs to `_EXPORTS`. The README covers features, shortcuts and a module-by-module table; keep it up to date when behaviour or shortcuts change.
+Tamis is a PyQt6 desktop app for culling photo shoots: fast previews, keyboard-driven marking, then sorting files into `_KEEPS` / `_REJECTS` and exporting JPEGs to `_EXPORTS`. The README covers features, shortcuts and a module-by-module table; keep it up to date when behaviour or shortcuts change.
 
 ## Commands
 
@@ -10,12 +10,12 @@ The virtualenv lives in `.venv`. CI runs `ruff check .` and `pytest` on macOS wi
 
 ```bash
 pip install -e ".[dev]"                      # setup
-.venv/bin/python -m cullspeed                # run the app
+.venv/bin/python -m tamis                # run the app
 .venv/bin/python -m pytest                   # all tests
 .venv/bin/python -m pytest tests/test_fileops.py          # one file
 .venv/bin/python -m pytest tests/test_app.py -k undo      # tests matching a name
 .venv/bin/ruff check .                       # lint (line length 132)
-./scripts/build_app.sh                       # dist/CullSpeed.app; needs pip install -e ".[build]"
+./scripts/build_app.sh                       # dist/Tamis.app; needs pip install -e ".[build]"
 ```
 
 When a new feature is added, rebuild the app with `./scripts/build_app.sh` if that has not been done yet, once tests and lint pass. The script calls `python`, so activate `.venv` first; `dist/` is git-ignored, so the build is not committed.
@@ -24,10 +24,10 @@ When a new feature is added, rebuild the app with `./scripts/build_app.sh` if th
 
 ## Architecture
 
-`CullSpeedApp` (`app.py`) is the coordinator: it owns the model, both background engines and the views, and most features are wired together there.
+`TamisApp` (`app.py`) is the coordinator: it owns the model, both background engines and the views, and most features are wired together there.
 
 ### Photos are identified by path
-`Photo` (`models.py`) holds `status` (the mark), `location` (the folder it is actually in) and `edit`. Moving a file changes its identity, so every path-keyed structure has to follow. After a move, `CullSpeedApp._move_files` calls `model.apply_moves`, `loader.rename_paths` and `editor.rename_paths`, and clears the undo stack, whose entries hold old paths. Any new path-keyed cache needs the same treatment.
+`Photo` (`models.py`) holds `status` (the mark), `location` (the folder it is actually in) and `edit`. Moving a file changes its identity, so every path-keyed structure has to follow. After a move, `TamisApp._move_files` calls `model.apply_moves`, `loader.rename_paths` and `editor.rename_paths`, and clears the undo stack, whose entries hold old paths. Any new path-keyed cache needs the same treatment.
 
 `Photo.files` is the primary file plus its `companions` (the JPEG of a RAW+JPEG pair). Anything operating on a photo's files must include the companions; `fileops` also moves XMP sidecars and renames a whole group together.
 
@@ -50,8 +50,9 @@ An edit is a plain dict holding only the non-default settings, as normalised by 
 RAWs are edited from LibRaw's 16-bit linear development, not their embedded JPEG (`editing._source`), whereas culling previews go through `imaging.load_image`.
 
 ### Persistence
-- `cullspeed_session.json` in the photo folder is keyed by relative path (`_KEEPS/IMG_1.CR2`). If the folder is read-only, the session falls back to a file in the app's data folder, and the newer of the two wins on load.
+- `tamis_session.json` in the photo folder is keyed by relative path (`_KEEPS/IMG_1.CR2`). If the folder is read-only, the session falls back to a file in the app's data folder, and the newer of the two wins on load.
 - Older session formats must keep loading: bare status values and filename keys (`models._entry`, `scan_folder`).
+- The app used to be called CullSpeed. `cullspeed_session.json` is still read and replaced on the next save in the folder, and `migration.py` copies the old settings and fallback sessions at startup.
 - Saved marks win over the folder a photo sits in, so marks changed since the last Process Files survive.
 - XMP sidecars win over the session for ratings and labels, so changes from other editors take effect. Writes are batched through `xmp_dirty` and flushed by `save_session`. Existing sidecars are edited in place, touching only `xmp:Rating` and `xmp:Label`.
 

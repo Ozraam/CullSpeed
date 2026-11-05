@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from cullspeed import develop
-from cullspeed.develop import clean, encode, render, settings
+from tamis import develop
+from tamis.develop import clean, encode, render, settings
 
 
 def grey(value, size=(8, 8)):

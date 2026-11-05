@@ -2,9 +2,9 @@ import numpy as np
 import pytest
 from PyQt6.QtGui import QImage
 
-from cullspeed import lut
-from cullspeed.develop import render
-from cullspeed.imaging import array_to_image
+from tamis import lut
+from tamis.develop import render
+from tamis.imaging import array_to_image
 
 LEVEL = 4  # HaldCLUT level 4: 64×64 image, 16 steps per channel
 

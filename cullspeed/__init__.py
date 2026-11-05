@@ -1,1 +1,0 @@
-"""CullSpeed application package."""

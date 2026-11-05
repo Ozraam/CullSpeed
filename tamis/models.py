@@ -9,7 +9,16 @@ from itertools import groupby
 from PyQt6.QtCore import QAbstractListModel, QModelIndex, QSortFilterProxyModel, Qt, pyqtSignal
 
 from . import develop, xmp
-from .constants import KEEP, KEEP_DIR, RAW_EXTENSIONS, REJECT, REJECT_DIR, SESSION_FILENAME, SUPPORTED_EXTENSIONS
+from .constants import (
+    KEEP,
+    KEEP_DIR,
+    LEGACY_SESSION_FILENAME,
+    RAW_EXTENSIONS,
+    REJECT,
+    REJECT_DIR,
+    SESSION_FILENAME,
+    SUPPORTED_EXTENSIONS,
+)
 
 STATUS_ROLE = Qt.ItemDataRole.UserRole + 1
 PATH_ROLE = Qt.ItemDataRole.UserRole + 2
@@ -121,7 +130,7 @@ def scan_folder(folder, fallback_dir=None):
         if entry is not None:
             photo.status, photo.rating, photo.label = entry["status"], entry["rating"], entry["label"]
             photo.edit = entry["edit"]
-        # Sidecars are what other editors change, and CullSpeed writes them
+        # Sidecars are what other editors change, and Tamis writes them
         # whenever a rating changes: they are the fresher source.
         if photo.path in from_sidecars:
             photo.rating, photo.label = from_sidecars[photo.path]
@@ -171,8 +180,9 @@ def _entry(value):
 
 
 def load_session(folder, fallback_dir=None):
-    """Saved marks, keyed by relative path; the newest of the folder and fallback sessions."""
-    existing = [path for path in _session_paths(folder, fallback_dir) if os.path.isfile(path)]
+    """Saved marks, keyed by relative path; the newest of the folder, fallback and pre-rename sessions."""
+    paths = [*_session_paths(folder, fallback_dir), os.path.join(folder, LEGACY_SESSION_FILENAME)]
+    existing = [path for path in paths if os.path.isfile(path)]
     if not existing:
         return {}
     try:
@@ -222,9 +232,10 @@ def save_session(folder, photos, fallback_dir=None):
         os.makedirs(fallback_dir, exist_ok=True)
         _write_json(fallback[0], data)
         return fallback[0]
-    if fallback:
+    # Both are stale now that the folder's session has the marks.
+    for stale in (*fallback, os.path.join(folder, LEGACY_SESSION_FILENAME)):
         with suppress(OSError):
-            os.remove(fallback[0])  # stale now that the folder has the marks
+            os.remove(stale)
     return folder_path
 
 

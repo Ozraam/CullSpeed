@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 from . import cropping, develop, lut, xmp
 from .constants import (
     EXPORT_DIR,
+    FALLBACK_SESSIONS_DIR,
     KEEP,
     KEEP_DIR,
     LEGACY_GLOBAL_CONFIG_FILENAME,
@@ -123,17 +124,17 @@ class ExportThread(QThread):
         self.progressed.emit(len(self.jobs))
 
 
-class CullSpeedApp(QMainWindow):
+class TamisApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CullSpeed")
+        self.setWindowTitle("Tamis")
         self.setMinimumSize(900, 600)
         self.setAcceptDrops(True)
 
         self.settings = QSettings()
         # Where marks go when a photo folder is read-only.
         self.session_fallback_dir = os.path.join(
-            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation), "sessions"
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation), FALLBACK_SESSIONS_DIR
         )
         self.session_warning = None  # last session problem shown, so it is shown once
         self.xmp_warned = False
@@ -450,7 +451,7 @@ class CullSpeedApp(QMainWindow):
             self._session_problem("failed", f"Could not save marks: {exc.strerror or exc}")
             return
         if path != os.path.join(self.folder, SESSION_FILENAME):
-            self._session_problem("fallback", "This folder is read-only: marks are saved in CullSpeed's data folder")
+            self._session_problem("fallback", "This folder is read-only: marks are saved in the app's data folder")
         else:
             self.session_warning = None
 
@@ -478,7 +479,7 @@ class CullSpeedApp(QMainWindow):
                 if not self.xmp_warned:
                     self.xmp_warned = True
                     self.toast.show_message(
-                        f"Could not write XMP sidecars ({exc.strerror or exc}): ratings stay in CullSpeed only", 5000
+                        f"Could not write XMP sidecars ({exc.strerror or exc}): ratings stay in Tamis only", 5000
                     )
 
     # -- navigation --------------------------------------------------------

@@ -9,9 +9,9 @@ from PyQt6.QtGui import QColor, QImage  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 
-from cullspeed.app import CULL_TAB, GALLERY_TAB, CullSpeedApp  # noqa: E402
-from cullspeed.constants import KEEP, REJECT  # noqa: E402
-from cullspeed.widgets import ProcessDialog  # noqa: E402
+from tamis.app import CULL_TAB, GALLERY_TAB, TamisApp  # noqa: E402
+from tamis.constants import KEEP, REJECT  # noqa: E402
+from tamis.widgets import ProcessDialog  # noqa: E402
 
 CTRL = Qt.KeyboardModifier.ControlModifier
 PHOTOS = 6
@@ -32,7 +32,7 @@ def window(qapp, tmp_path):
         image = QImage(300, 200, QImage.Format.Format_RGB32)
         image.fill(QColor(40 * i, 80, 120))
         assert image.save(str(tmp_path / f"IMG_{i}.jpg"))
-    win = CullSpeedApp()
+    win = TamisApp()
     win.settings.clear()
     win.resize(1200, 800)
     win.show()
