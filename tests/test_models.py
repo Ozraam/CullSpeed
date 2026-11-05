@@ -344,3 +344,128 @@ def test_sidecar_rating_wins_over_session(tmp_path):
     [photo] = scan_folder(str(tmp_path))
 
     assert (photo.status, photo.rating, photo.label) == (KEEP, 5, "Blue")
+
+
+# -- photos that are away, damaged sessions, ratings not yet in the sidecar -------
+
+def test_session_keeps_the_marks_of_photos_that_are_away(tmp_path):
+    folder = str(tmp_path)
+    touch(tmp_path / KEEP_DIR / "a.jpg")
+    touch(tmp_path / "b.jpg")
+    photos = scan_folder(folder)
+    for photo in photos:
+        photo.edit = {"exposure": 1.0}
+    save_session(folder, photos)
+
+    os.rename(tmp_path / KEEP_DIR, tmp_path / "away")
+    save_session(folder, scan_folder(folder))
+    os.rename(tmp_path / "away", tmp_path / KEEP_DIR)
+
+    assert [photo.edit for photo in scan_folder(folder)] == [{"exposure": 1.0}, {"exposure": 1.0}]
+
+
+def test_session_forgets_moved_photos_and_entries_with_nothing_in_them(tmp_path):
+    folder = str(tmp_path)
+    write_session(tmp_path, {
+        "moved.jpg": KEEP, "gone.jpg": REJECT, "unmarked.jpg": None, "invalid.jpg": "maybe",
+    })
+    save_session(folder, [], forget={"moved.jpg"})
+    assert set(json.loads((tmp_path / SESSION_FILENAME).read_text())) == {"gone.jpg"}
+
+
+def test_session_drops_a_filename_key_once_a_photo_has_taken_it_over(tmp_path):
+    folder = str(tmp_path)
+    touch(tmp_path / KEEP_DIR / "a.jpg")
+    write_session(tmp_path, {"a.jpg": REJECT})
+    photos = scan_folder(folder)
+    assert photos[0].status == REJECT
+
+    save_session(folder, photos)
+
+    assert set(json.loads((tmp_path / SESSION_FILENAME).read_text())) == {f"{KEEP_DIR}/a.jpg"}
+
+
+def test_session_drops_the_entry_of_a_file_that_is_no_longer_a_photo_of_its_own(tmp_path):
+    folder = str(tmp_path)
+    touch(tmp_path / "IMG.jpg")
+    touch(tmp_path / "IMG.CR2")
+    write_session(tmp_path, {"IMG.jpg": KEEP})
+    save_session(folder, [Photo(f"{folder}/IMG.CR2", companions=[f"{folder}/IMG.jpg"])])
+    assert set(json.loads((tmp_path / SESSION_FILENAME).read_text())) == {"IMG.CR2"}
+
+
+@pytest.mark.parametrize("content", ["{not json", "[1, 2]", ""])
+def test_damaged_session_is_set_aside_and_reported(tmp_path, content):
+    folder = str(tmp_path)
+    (tmp_path / SESSION_FILENAME).write_text(content)
+    problems = []
+
+    assert load_session(folder, problems=problems) == {}
+
+    kept = tmp_path / "tamis_session.corrupt.json"
+    assert problems == [str(kept)]
+    assert kept.read_text() == content
+    save_session(folder, [Photo(f"{folder}/a.jpg", KEEP)])
+    assert kept.read_text() == content
+
+
+def test_damaged_session_does_not_replace_an_earlier_one_set_aside(tmp_path):
+    (tmp_path / "tamis_session.corrupt.json").write_text("first")
+    (tmp_path / SESSION_FILENAME).write_text("second")
+    problems = []
+    load_session(str(tmp_path), problems=problems)
+    assert problems == [str(tmp_path / "tamis_session.corrupt (1).json")]
+    assert (tmp_path / "tamis_session.corrupt.json").read_text() == "first"
+
+
+def test_damaged_session_falls_back_on_the_next_newest(tmp_path):
+    folder = str(tmp_path)
+    fallback = str(tmp_path / "fallback")
+    (tmp_path / LEGACY_SESSION_FILENAME).write_text(json.dumps({"a.jpg": KEEP}))
+    os.utime(tmp_path / LEGACY_SESSION_FILENAME, (1000, 1000))
+    (tmp_path / SESSION_FILENAME).write_text("{not json")
+    problems = []
+
+    assert statuses(load_session(folder, fallback, problems)) == {"a.jpg": KEEP}
+    assert problems == [str(tmp_path / "tamis_session.corrupt.json")]
+
+
+def test_damaged_session_in_a_read_only_folder_stays_put_and_is_reported(tmp_path):
+    folder = tmp_path / "card"
+    folder.mkdir()
+    (folder / SESSION_FILENAME).write_text("{not json")
+    read_only(folder)
+    try:
+        problems = []
+        assert load_session(str(folder), problems=problems) == {}
+        assert problems == [str(folder / SESSION_FILENAME)]
+    finally:
+        os.chmod(folder, 0o755)
+
+
+def test_rating_not_yet_in_the_sidecar_wins_over_it(tmp_path):
+    folder = str(tmp_path)
+    touch(tmp_path / "a.jpg")
+    (tmp_path / "a.jpg.xmp").write_text('<rdf:Description xmp:Rating="2"/>')
+    [photo] = scan_folder(folder)
+    assert photo.rating == 2
+    photo.rating, photo.label, photo.xmp_pending = 5, "Red", True
+    save_session(folder, [photo])
+
+    [again] = scan_folder(folder)
+    assert (again.rating, again.label, again.xmp_pending) == (5, "Red", True)
+
+    again.xmp_pending = False  # written at last: other editors win again
+    save_session(folder, [again])
+    [last] = scan_folder(folder)
+    assert (last.rating, last.xmp_pending) == (2, False)
+
+
+def test_removing_a_rating_is_remembered_until_the_sidecar_has_it(tmp_path):
+    folder = str(tmp_path)
+    touch(tmp_path / "a.jpg")
+    (tmp_path / "a.jpg.xmp").write_text('<rdf:Description xmp:Rating="2"/>')
+    [photo] = scan_folder(folder)
+    photo.rating, photo.xmp_pending = 0, True
+    save_session(folder, [photo])
+    assert scan_folder(folder)[0].rating == 0

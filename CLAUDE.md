@@ -18,7 +18,7 @@ pip install -e ".[dev]"                      # setup
 ./scripts/build_app.sh                       # dist/Tamis.app; needs pip install -e ".[build]"
 ```
 
-When a new feature is added, rebuild the app with `./scripts/build_app.sh` if that has not been done yet, once tests and lint pass. The script calls `python`, so activate `.venv` first; `dist/` is git-ignored, so the build is not committed.
+After every code change (features, fixes, refactors), rebuild the app with `./scripts/build_app.sh` once tests and lint pass, so that `dist/Tamis.app` can be used straight away. Changes that only touch documentation don't need a rebuild. The script calls `python`, so activate `.venv` first; `dist/` is git-ignored, so the build is not committed.
 
 `tests/test_app.py` drives the real main window with its real shortcuts and mouse events, using Qt's `offscreen` platform on a throwaway folder. Its fixture redirects `QSettings` to a temp directory so tests never touch the real app's settings; new window-level tests should use that `window` fixture.
 
@@ -54,10 +54,19 @@ RAWs are edited from LibRaw's 16-bit linear development, not their embedded JPEG
 - Older session formats must keep loading: bare status values and filename keys (`models._entry`, `scan_folder`).
 - The app used to be called CullSpeed. `cullspeed_session.json` is still read and replaced on the next save in the folder, and `migration.py` copies the old settings and fallback sessions at startup.
 - Saved marks win over the folder a photo sits in, so marks changed since the last Process Files survive.
-- XMP sidecars win over the session for ratings and labels, so changes from other editors take effect. Writes are batched through `xmp_dirty` and flushed by `save_session`. Existing sidecars are edited in place, touching only `xmp:Rating` and `xmp:Label`.
+- `save_session` keeps the entries of photos whose file is missing, so anything that moves photos has to `forget` their old keys (`TamisApp.moved_keys`). A session that can't be parsed is renamed `*.corrupt.json` and reported through `problems`, never overwritten.
+- XMP sidecars win over the session for ratings and labels, so changes from other editors take effect. Writes are batched through `xmp_dirty` and flushed by `save_session`. A failed write stays in `xmp_dirty` and sets `Photo.xmp_pending`, stored in the session, which makes the session win until a write succeeds. Existing sidecars are edited in place, touching only `xmp:Rating` and `xmp:Label`.
 
 ### Process Files
 `fileops` keeps planning separate from execution: `plan_moves` / `execute_moves` and `plan_exports` / `copy_export`. Moves never overwrite (`IMG_1 (1).jpg`), while files in `_EXPORTS` are deliberately replaced so that reprocessing refreshes them. `process_files` plans exports a second time after moving, because the paths have changed.
+
+### Plugins
+`plugins.py` loads `<name>.py` or `<name>/__init__.py` from `plugins/` in the app's data folder at startup and calls `register(tamis)` with a `PluginApi`; the README documents that API for plugin authors, so keep it up to date. `TamisApp(plugins_dir=...)` overrides the folder, and the tests' `window` fixture always does so they never run the real app's plugins.
+
+- Anything a plugin runs goes through `PluginManager._call`, because an exception escaping into a Qt slot aborts the process. `main()` also installs an excepthook when a plugin is active, for a plugin's own timers and widgets.
+- Plugins see `PhotoInfo` snapshots, not `Photo`, and change photos through the API, which uses `set_field` and pushes one undo step per call.
+- App events go through `self.plugins.emit(name, ...)`; a new event also needs an entry in `plugins.EVENTS` and the README.
+- Plugin shortcuts that are already taken are refused, since Qt fires neither of two ambiguous shortcuts. That relies on the app's own being bound before `plugins.load()`.
 
 ## Constraints
 
