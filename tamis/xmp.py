@@ -25,7 +25,7 @@ _LABEL_ELEMENT = re.compile(r'[ \t]*<xmp:Label>(.*?)</xmp:Label>[ \t]*\n?', re.S
 _DESCRIPTION = re.compile(r'<rdf:Description\b')
 
 _TEMPLATE = """<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="CullSpeed">
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Tamis">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description rdf:about=""/>
  </rdf:RDF>

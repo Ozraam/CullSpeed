@@ -1,6 +1,6 @@
 import struct
 
-from cullspeed.exif import read_info, summary
+from tamis.exif import read_info, summary
 
 
 def tiff(entries, exif_entries, endian="<"):

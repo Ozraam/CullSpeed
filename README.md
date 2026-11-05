@@ -1,6 +1,6 @@
-# CullSpeed
+# Tamis
 
-CullSpeed is a PyQt6 desktop application for rapidly reviewing and triaging large photo shoots. It focuses on fast image loading (embedded RAW previews, background decoding and prefetching), keyboard-driven marking, and one-click sorting of files into keep/reject folders.
+Tamis is a PyQt6 desktop application for rapidly reviewing and triaging large photo shoots. It focuses on fast image loading (embedded RAW previews, background decoding and prefetching), keyboard-driven marking, and one-click sorting of files into keep/reject folders.
 
 ## Features
 - Supports JPEG, PNG, WebP, TIFF, HEIC (when Qt has a plugin for it) and common RAW formats (ARW, CR2, CR3, NEF, DNG, ORF, RAF, RW2) via `rawpy`.
@@ -15,7 +15,7 @@ CullSpeed is a PyQt6 desktop application for rapidly reviewing and triaging larg
 - **Crop** (`R`): drag the frame's corners and edges, or inside it to move it, with a free or fixed shape (original, 1:1, 3:2, 4:5, 16:9…). `Enter`, `R` or a double-click applies it, `Esc` cancels; moving to another photo applies it too. Vignette and grain follow the final frame. A crop is part of the photo's edit (undoable, exported, cleared by Reset), but it stays with its photo: copying and pasting an edit carries the look over and leaves each photo's own crop alone.
 - New or removed files are picked up automatically while the folder is open (or with **Refresh**, `⌘R`).
 - Undo for every marking, rating and labelling action.
-- Marks are saved automatically in `cullspeed_session.json` inside each photo folder.
+- Marks are saved automatically in `tamis_session.json` inside each photo folder.
 - **Process Files** moves photos into `_KEEPS` / `_REJECTS` (or back to the root when unmarked). XMP sidecars move with their photo, and existing files are never overwritten (`IMG_1 (1).jpg` instead). Unless you untick the export box in its confirmation (ticked by default), it then fills `_EXPORTS`: edited photos are exported as JPEGs and unedited ones get their JPEG (the photo itself, or the JPEG of a RAW+JPEG pair) copied; rejected photos are left out. Earlier exports of the same photos are replaced, so processing again refreshes them.
 - Reopens the last folder and photo on launch. Drop a folder onto the window to open it.
 
@@ -28,7 +28,7 @@ CullSpeed is a PyQt6 desktop application for rapidly reviewing and triaging larg
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-cullspeed                  # or: python CullSpeed.py, python -m cullspeed
+tamis                  # or: python Tamis.py, python -m tamis
 ```
 
 ## Keyboard Shortcuts
@@ -58,33 +58,34 @@ cullspeed                  # or: python CullSpeed.py, python -m cullspeed
 In the Cull view, marking a photo as keep or reject moves on to the next one (in Compare, it stays on the same photos). In the Gallery, marks, stars and labels apply to every selected photo.
 
 ## Film simulations
-Film simulations are 3D LUTs, in the same HaldCLUT format RawTherapee uses (`.png` / `.tif`), or `.cube` files. CullSpeed does not ship any: choose a folder of them with **Folder…** in the edit panel (sub-folders become groups). RawTherapee's [film simulation collection](https://rawpedia.rawtherapee.com/Film_Simulation) (CC BY-SA) works as is, and gives the same looks as in RawTherapee. The base development of RAWs (LibRaw) is close to, but not identical with, RawTherapee's own.
+Film simulations are 3D LUTs, in the same HaldCLUT format RawTherapee uses (`.png` / `.tif`), or `.cube` files. Tamis does not ship any: choose a folder of them with **Folder…** in the edit panel (sub-folders become groups). RawTherapee's [film simulation collection](https://rawpedia.rawtherapee.com/Film_Simulation) (CC BY-SA) works as is, and gives the same looks as in RawTherapee. The base development of RAWs (LibRaw) is close to, but not identical with, RawTherapee's own.
 
 Things the first version does not do yet: the 1:1 zoom shows the original inside the crop (for focus checking), thumbnails show the original, uncropped, and exported JPEGs carry no EXIF.
 
 ## Sessions
-`cullspeed_session.json` stores marks keyed by path relative to the photo folder (e.g. `_KEEPS/IMG_1.CR2`), so the folder can be moved or renamed without losing decisions. Older sessions keyed by filename are still read. Ratings and labels are stored there too; when a photo has an XMP sidecar, its rating and label are read from the sidecar instead, so changes made in another editor win.
+`tamis_session.json` stores marks keyed by path relative to the photo folder (e.g. `_KEEPS/IMG_1.CR2`), so the folder can be moved or renamed without losing decisions. Older sessions keyed by filename are still read, and so are `cullspeed_session.json` files from when the app was called CullSpeed; the next save replaces them. Ratings and labels are stored there too; when a photo has an XMP sidecar, its rating and label are read from the sidecar instead, so changes made in another editor win.
 
-If the photo folder is read-only (locked SD card, read-only share), marks are saved in CullSpeed's own data folder instead and reloaded from there when the folder is reopened.
+If the photo folder is read-only (locked SD card, read-only share), marks are saved in the app's own data folder instead and reloaded from there when the folder is reopened.
 
 ## Code Layout
 | Module | Role |
 | --- | --- |
-| `cullspeed/main.py` | Application entry point |
-| `cullspeed/app.py` | Main window: navigation, marking, processing |
-| `cullspeed/models.py` | Photo list model, gallery filter, folder scan and session file |
-| `cullspeed/loader.py` | Background preview/thumbnail loading, caching and prefetching |
-| `cullspeed/imaging.py` | Thread-safe decoding of RAW and standard images (QImage only) |
-| `cullspeed/exif.py` | Minimal EXIF reader for shooting info |
-| `cullspeed/xmp.py` | Reading and editing ratings and labels in XMP sidecars |
-| `cullspeed/develop.py` | Edit pipeline (numpy): exposure, tone, colour, LUT, grain, vignette |
-| `cullspeed/cropping.py` | Geometry of the crop frame while it is dragged |
-| `cullspeed/lut.py` | HaldCLUT / `.cube` loading and fast 256³ lookup tables |
-| `cullspeed/editing.py` | Developing photos for editing, background previews, JPEG export |
-| `cullspeed/editpanel.py` | The edit panel |
-| `cullspeed/fileops.py` | Planning and executing file moves |
-| `cullspeed/widgets.py` | Image and compare views, thumbnail delegate, bars, toast and dialogs |
-| `cullspeed/theme.py` | Dark palette and stylesheet |
+| `tamis/main.py` | Application entry point |
+| `tamis/migration.py` | Brings over settings and sessions from when the app was called CullSpeed |
+| `tamis/app.py` | Main window: navigation, marking, processing |
+| `tamis/models.py` | Photo list model, gallery filter, folder scan and session file |
+| `tamis/loader.py` | Background preview/thumbnail loading, caching and prefetching |
+| `tamis/imaging.py` | Thread-safe decoding of RAW and standard images (QImage only) |
+| `tamis/exif.py` | Minimal EXIF reader for shooting info |
+| `tamis/xmp.py` | Reading and editing ratings and labels in XMP sidecars |
+| `tamis/develop.py` | Edit pipeline (numpy): exposure, tone, colour, LUT, grain, vignette |
+| `tamis/cropping.py` | Geometry of the crop frame while it is dragged |
+| `tamis/lut.py` | HaldCLUT / `.cube` loading and fast 256³ lookup tables |
+| `tamis/editing.py` | Developing photos for editing, background previews, JPEG export |
+| `tamis/editpanel.py` | The edit panel |
+| `tamis/fileops.py` | Planning and executing file moves |
+| `tamis/widgets.py` | Image and compare views, thumbnail delegate, bars, toast and dialogs |
+| `tamis/theme.py` | Dark palette and stylesheet |
 
 ## Development
 ```bash
@@ -94,7 +95,7 @@ ruff check .
 ```
 CI runs both on every push and pull request (`.github/workflows/ci.yml`).
 
-To build a standalone app (`dist/CullSpeed.app` on macOS):
+To build a standalone app (`dist/Tamis.app` on macOS):
 ```bash
 pip install -e ".[build]"
 ./scripts/build_app.sh

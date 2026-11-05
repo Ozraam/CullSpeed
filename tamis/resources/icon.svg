@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
-  <!-- CullSpeed app icon. Source of the window icon and of the macOS .icns built by scripts/build_app.sh.
+  <!-- Tamis app icon. Source of the window icon and of the macOS .icns built by scripts/build_app.sh.
        Follows the macOS grid: an 824px rounded square centred on a 1024px canvas. -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">

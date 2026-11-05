@@ -1,8 +1,8 @@
 import os
 
-from cullspeed.constants import KEEP, KEEP_DIR, REJECT, REJECT_DIR
-from cullspeed.fileops import execute_moves, plan_moves
-from cullspeed.models import Photo
+from tamis.constants import KEEP, KEEP_DIR, REJECT, REJECT_DIR
+from tamis.fileops import execute_moves, plan_moves
+from tamis.models import Photo
 
 
 def touch(path, content="x"):
@@ -162,7 +162,7 @@ def test_raw_jpeg_pair_moves_and_renames_together(tmp_path):
 
 
 def test_plan_exports_renders_edited_and_copies_jpegs(tmp_path):
-    from cullspeed.fileops import plan_exports
+    from tamis.fileops import plan_exports
 
     folder = str(tmp_path)
     photos = [
@@ -183,7 +183,7 @@ def test_plan_exports_renders_edited_and_copies_jpegs(tmp_path):
 
 
 def test_copy_export_replaces_earlier_export(tmp_path):
-    from cullspeed.fileops import copy_export
+    from tamis.fileops import copy_export
 
     source = touch(tmp_path / "a.jpg", "new")
     touch(tmp_path / "_EXPORTS" / "a.jpg", "old")

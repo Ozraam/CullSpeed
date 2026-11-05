@@ -9,7 +9,13 @@ KEEP_DIR = "_KEEPS"
 REJECT_DIR = "_REJECTS"
 EXPORT_DIR = "_EXPORTS"
 
-SESSION_FILENAME = "cullspeed_session.json"
+APP_NAME = "Tamis"
+SESSION_FILENAME = "tamis_session.json"
+FALLBACK_SESSIONS_DIR = "sessions"
+
+# The app used to be called CullSpeed: what it left behind is still read.
+LEGACY_APP_NAME = "CullSpeed"
+LEGACY_SESSION_FILENAME = "cullspeed_session.json"
 LEGACY_GLOBAL_CONFIG_FILENAME = ".cullspeed_global.json"
 
 # Longest edge, in pixels, of decoded images.

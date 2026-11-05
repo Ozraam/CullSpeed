@@ -1,6 +1,6 @@
 import sys
 
-from cullspeed.main import main
+from tamis.main import main
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -3,8 +3,8 @@ import os
 
 import pytest
 
-from cullspeed.constants import KEEP, KEEP_DIR, REJECT, REJECT_DIR, SESSION_FILENAME
-from cullspeed.models import Photo, PhotoModel, load_session, save_session, scan_folder
+from tamis.constants import KEEP, KEEP_DIR, LEGACY_SESSION_FILENAME, REJECT, REJECT_DIR, SESSION_FILENAME
+from tamis.models import Photo, PhotoModel, load_session, save_session, scan_folder
 
 
 def touch(path):
@@ -123,6 +123,52 @@ def test_read_only_folder_saves_to_fallback(locked_folder, tmp_path):
 def test_without_fallback_a_read_only_folder_raises(locked_folder):
     with pytest.raises(OSError):
         save_session(locked_folder, [Photo(f"{locked_folder}/a.jpg", KEEP)])
+
+
+def test_session_from_before_the_rename_is_loaded(tmp_path):
+    touch(tmp_path / "a.jpg")
+    (tmp_path / LEGACY_SESSION_FILENAME).write_text(json.dumps({"a.jpg": KEEP}))
+
+    assert [p.status for p in scan_folder(str(tmp_path))] == [KEEP]
+
+
+def test_newer_session_wins_over_the_one_from_before_the_rename(tmp_path):
+    legacy = tmp_path / LEGACY_SESSION_FILENAME
+    legacy.write_text(json.dumps({"a.jpg": KEEP}))
+    os.utime(legacy, (1000, 1000))
+    (tmp_path / SESSION_FILENAME).write_text(json.dumps({"a.jpg": REJECT}))
+
+    assert statuses(load_session(str(tmp_path))) == {"a.jpg": REJECT}
+
+
+def test_saving_replaces_the_session_from_before_the_rename(tmp_path):
+    folder = str(tmp_path)
+    legacy = tmp_path / LEGACY_SESSION_FILENAME
+    legacy.write_text(json.dumps({"a.jpg": REJECT}))
+
+    save_session(folder, [Photo(f"{folder}/a.jpg", KEEP)])
+
+    assert not legacy.exists()
+    assert statuses(load_session(folder)) == {"a.jpg": KEEP}
+
+
+def test_read_only_folder_with_a_session_from_before_the_rename(tmp_path):
+    folder = tmp_path / "card"
+    legacy = folder / LEGACY_SESSION_FILENAME
+    touch(legacy)
+    legacy.write_text(json.dumps({"a.jpg": REJECT}))
+    os.utime(legacy, (1000, 1000))
+    fallback = str(tmp_path / "fallback")
+    read_only(folder)
+    try:
+        assert statuses(load_session(str(folder), fallback)) == {"a.jpg": REJECT}
+
+        save_session(str(folder), [Photo(f"{folder}/a.jpg", KEEP)], fallback)
+
+        assert legacy.exists()
+        assert statuses(load_session(str(folder), fallback)) == {"a.jpg": KEEP}
+    finally:
+        os.chmod(folder, 0o755)
 
 
 def test_saving_in_the_folder_removes_the_stale_fallback(tmp_path):

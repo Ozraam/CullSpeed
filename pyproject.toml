@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cullspeed"
+name = "tamis"
 version = "0.1.0"
 description = "Fast keyboard-driven photo culling: sort a shoot into keeps and rejects."
 readme = "README.md"
@@ -19,13 +19,13 @@ dev = ["pytest>=8", "ruff>=0.6"]
 build = ["pyinstaller>=6"]
 
 [project.gui-scripts]
-cullspeed = "cullspeed.main:main"
+tamis = "tamis.main:main"
 
 [tool.setuptools]
-packages = ["cullspeed"]
+packages = ["tamis"]
 
 [tool.setuptools.package-data]
-cullspeed = ["resources/*.svg"]
+tamis = ["resources/*.svg"]
 
 [tool.ruff]
 line-length = 132

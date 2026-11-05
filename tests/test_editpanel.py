@@ -5,7 +5,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
-from cullspeed.editpanel import EditPanel  # noqa: E402
+from tamis.editpanel import EditPanel  # noqa: E402
 
 
 @pytest.fixture(scope="module")
