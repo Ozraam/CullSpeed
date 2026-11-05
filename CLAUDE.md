@@ -18,7 +18,7 @@ pip install -e ".[dev]"                      # setup
 ./scripts/build_app.sh                       # dist/Tamis.app; needs pip install -e ".[build]"
 ```
 
-When a new feature is added, rebuild the app with `./scripts/build_app.sh` if that has not been done yet, once tests and lint pass. The script calls `python`, so activate `.venv` first; `dist/` is git-ignored, so the build is not committed.
+After every code change (features, fixes, refactors), rebuild the app with `./scripts/build_app.sh` once tests and lint pass, so that `dist/Tamis.app` can be used straight away. Changes that only touch documentation don't need a rebuild. The script calls `python`, so activate `.venv` first; `dist/` is git-ignored, so the build is not committed.
 
 `tests/test_app.py` drives the real main window with its real shortcuts and mouse events, using Qt's `offscreen` platform on a throwaway folder. Its fixture redirects `QSettings` to a temp directory so tests never touch the real app's settings; new window-level tests should use that `window` fixture.
 
