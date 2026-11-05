@@ -18,6 +18,7 @@ Tamis is a PyQt6 desktop application for rapidly reviewing and triaging large ph
 - Marks are saved automatically in `tamis_session.json` inside each photo folder.
 - **Process Files** moves photos into `_KEEPS` / `_REJECTS` (or back to the root when unmarked). XMP sidecars move with their photo, and existing files are never overwritten (`IMG_1 (1).jpg` instead). Unless you untick the export box in its confirmation (ticked by default), it then fills `_EXPORTS`: edited photos are exported as JPEGs and unedited ones get their JPEG (the photo itself, or the JPEG of a RAW+JPEG pair) copied; rejected photos are left out. Earlier exports of the same photos are replaced, so processing again refreshes them.
 - Reopens the last folder and photo on launch. Drop a folder onto the window to open it.
+- **Plugins**: add your own actions and shortcuts with a small Python file (see [Plugins](#plugins)).
 
 ## Requirements
 - Python 3.10+
@@ -62,6 +63,54 @@ Film simulations are 3D LUTs, in the same HaldCLUT format RawTherapee uses (`.pn
 
 Things the first version does not do yet: the 1:1 zoom shows the original inside the crop (for focus checking), thumbnails show the original, uncropped, and exported JPEGs carry no EXIF.
 
+## Plugins
+A plugin is a Python file (or a package folder) in the plugins folder, which **Plugins ▾ > Open Plugins Folder** creates and opens. Plugins load at launch, so restart Tamis after adding one. This is all it takes:
+
+```python
+NAME = "Keep the 5-star photos"  # optional: the name shown in the menu
+
+def register(tamis):
+    def keep_best():
+        best = [photo for photo in tamis.photos() if photo.rating == 5]
+        tamis.set_status(best, tamis.KEEP)  # one undo step
+        tamis.toast(f"{len(best)} photo(s) kept")
+
+    tamis.add_action("Keep 5-Star Photos", keep_best, shortcut="Ctrl+Shift+J")
+    tamis.on("photo_changed", lambda photo: print(photo.path))
+```
+
+[`examples/plugins/keeps_list.py`](examples/plugins/keeps_list.py) is a complete example to copy.
+
+| `tamis.` | What it does |
+| --- | --- |
+| `add_action(title, callback, shortcut=None)` | Adds an entry to the Plugins menu; returns its `QAction`. A shortcut that is invalid or already taken is dropped and reported |
+| `on(event, callback)` | Calls `callback` when an event happens (below) |
+| `folder`, `photos()`, `current_photo()`, `selected_photos()` | The open folder and its photos. The current photo can be `None`; `selected_photos()` is what a mark would apply to |
+| `go_to(photo)` | Shows that photo |
+| `set_status(photos, status)` | `tamis.KEEP`, `tamis.REJECT` or `None` |
+| `set_rating(photos, stars)`, `set_label(photos, label)` | 0–5 stars; a colour label (`xmp.LABELS`) or `None` |
+| `set_edit(photos, edit)` | Replaces the edit with the settings of `develop.DEFAULTS`; `{}` removes it |
+| `toast(text)`, `message(title, text, details=None)` | A short message, or a dialog |
+| `get_setting(key, default=None)`, `set_setting(key, value)` | Values kept across launches, private to the plugin; anything JSON can represent |
+| `window` | The main window, for anything else. It is not a stable interface: it may change between versions |
+
+`photos` is a photo or a path, or a list of them, and every `set_…` call is one undo step. A photo is a read-only snapshot with `path`, `name`, `files` (with its companions), `status`, `location`, `rating`, `label` and `edit`.
+
+| Event | Arguments | When |
+| --- | --- | --- |
+| `folder_opened` / `folder_refreshed` | `folder` | A folder was opened / the open one was scanned again |
+| `photo_changed` | `photo` | Another photo became the current one |
+| `photos_edited` | `[photos]` | Marks, ratings, labels or edits changed, undo included |
+| `files_moved` | `{old path: new path}` | Process Files moved photos. Photos are identified by path, so a plugin keeping data per photo must follow this |
+| `photos_exported` | `[paths]` | JPEGs were written to `_EXPORTS` |
+| `closing` | | The window is closing; changes made now are still saved |
+
+Good to know:
+- **Plugins run with your rights**, like any program: they can read and delete your files. Only install those you trust. They are only loaded from the plugins folder, never from a photo folder.
+- Everything runs on the window's thread, so slow work in a plugin freezes the window: use a `QThread` for it.
+- A failing plugin doesn't stop the app: the error appears in a toast and in **Plugins ▾ > Show Problems…**. **Plugins ▾ > Installed** turns a plugin off or on, from the next launch.
+- In the built `Tamis.app`, plugins can import `tamis`, numpy, PyQt6's `QtCore`, `QtGui` and `QtWidgets`, and the parts of the standard library the app itself uses. A plugin that needs more runs from source (`python -m tamis`) or adds it to `scripts/build_app.sh` with `--hidden-import`.
+
 ## Sessions
 `tamis_session.json` stores marks keyed by path relative to the photo folder (e.g. `_KEEPS/IMG_1.CR2`), so the folder can be moved or renamed without losing decisions. Older sessions keyed by filename are still read, and so are `cullspeed_session.json` files from when the app was called CullSpeed; the next save replaces them. Ratings and labels are stored there too; when a photo has an XMP sidecar, its rating and label are read from the sidecar instead, so changes made in another editor win.
 
@@ -84,13 +133,14 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `tamis/editing.py` | Developing photos for editing, background previews, JPEG export |
 | `tamis/editpanel.py` | The edit panel |
 | `tamis/fileops.py` | Planning and executing file moves |
+| `tamis/plugins.py` | Loading plugins, the API they receive and the Plugins menu |
 | `tamis/widgets.py` | Image and compare views, thumbnail delegate, bars, toast and dialogs |
 | `tamis/theme.py` | Dark palette and stylesheet |
 
 ## Development
 ```bash
 pip install -e ".[dev]"
-pytest                     # main window, edits, crop, LUTs, file moves, sessions, XMP, EXIF
+pytest                     # main window, plugins, edits, crop, LUTs, file moves, sessions, XMP, EXIF
 ruff check .
 ```
 CI runs both on every push and pull request (`.github/workflows/ci.yml`).

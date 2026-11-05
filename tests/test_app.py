@@ -11,6 +11,8 @@ from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 
 from tamis.app import CULL_TAB, GALLERY_TAB, TamisApp  # noqa: E402
 from tamis.constants import KEEP, REJECT  # noqa: E402
+from tamis.fileops import plan_moves  # noqa: E402
+from tamis.plugins import PhotoInfo  # noqa: E402
 from tamis.widgets import ProcessDialog  # noqa: E402
 
 CTRL = Qt.KeyboardModifier.ControlModifier
@@ -27,12 +29,12 @@ def qapp(tmp_path_factory):
 
 
 @pytest.fixture
-def window(qapp, tmp_path):
+def window(qapp, tmp_path, tmp_path_factory):
     for i in range(PHOTOS):
         image = QImage(300, 200, QImage.Format.Format_RGB32)
         image.fill(QColor(40 * i, 80, 120))
         assert image.save(str(tmp_path / f"IMG_{i}.jpg"))
-    win = TamisApp()
+    win = TamisApp(plugins_dir=str(tmp_path_factory.mktemp("plugins")))  # never the real app's plugins
     win.settings.clear()
     win.resize(1200, 800)
     win.show()
@@ -415,3 +417,237 @@ def test_process_dialog_needs_something_to_do(qapp):
     moves_only = ProcessDialog(None, "1 photo will be moved")
     assert moves_only.export_check is None
     assert not moves_only.export_requested
+
+
+# -- plugins -------------------------------------------------------------------
+
+def load_plugin(win, code, name="sample"):
+    """Load `code` as a plugin of `win`; returns its Plugin."""
+    directory = win.plugins.directory
+    with open(os.path.join(directory, f"{name}.py"), "w", encoding="utf-8") as file:
+        file.write(code)
+    known = len(win.plugins.plugins)
+    win.plugins.load()
+    return next(plugin for plugin in win.plugins.plugins[known:] if plugin.id == name)
+
+
+def test_plugin_action_runs_from_its_shortcut_and_the_menu(window):
+    plugin = load_plugin(window, """
+NAME = "Sample"
+def register(tamis):
+    tamis.add_action("Keep it", lambda: tamis.set_status(tamis.current_photo(), tamis.KEEP), shortcut="Ctrl+Shift+J")
+""")
+    assert plugin.loaded and plugin.name == "Sample"
+    press(window, Qt.Key.Key_J, CTRL | Qt.KeyboardModifier.ShiftModifier)
+    assert window.model.photo(0).status == KEEP
+
+    window.plugins_button.menu().aboutToShow.emit()
+    assert plugin.actions[0] in window.plugins_button.menu().actions()
+    window.go_to(1)
+    plugin.actions[0].trigger()
+    assert window.model.photo(1).status == KEEP
+
+
+def test_plugin_changes_can_be_undone_in_one_step(window):
+    captured = {}
+    window.plugin_test_capture = captured
+    load_plugin(window, """
+def register(tamis):
+    tamis.window.plugin_test_capture["api"] = tamis
+""")
+    api = captured["api"]
+    photos = api.photos()
+    api.set_status(photos[:3], api.REJECT)
+    api.set_rating(photos[0].path, 4)
+    api.set_label(photos[1], "Red")
+    assert window.model.photo(0).rating == 4
+    assert window.model.photo(1).label == "Red"
+    press(window, Qt.Key.Key_Z, CTRL)
+    press(window, Qt.Key.Key_Z, CTRL)
+    assert window.model.photo(0).rating == 0 and window.model.photo(1).label is None
+    assert window.model.counts()[1] == 3
+    press(window, Qt.Key.Key_Z, CTRL)
+    assert window.model.counts()[1] == 0
+
+
+def test_plugin_cannot_corrupt_photos_through_what_it_reads(window):
+    window.model.set_field([0], "edit", {"crop": [0.1, 0.1, 0.9, 0.9]})
+    photo = PhotoInfo.of(window.model.photo(0))
+    photo.edit["crop"][0] = 0.5
+    assert window.model.photo(0).edit["crop"][0] == 0.1
+    with pytest.raises(AttributeError):
+        photo.status = KEEP
+
+
+def test_plugin_set_edit_is_cleaned_and_values_are_checked(window):
+    captured = {}
+    window.plugin_test_capture = captured
+    load_plugin(window, """
+def register(tamis):
+    tamis.window.plugin_test_capture["api"] = tamis
+""")
+    api = captured["api"]
+    api.set_edit(api.current_photo(), {"contrast": 30, "nonsense": 1})
+    assert window.model.photo(0).edit == {"contrast": 30}
+    assert window.edit_panel.edit() == {"contrast": 30}
+    for call, value in ((api.set_status, "maybe"), (api.set_rating, 9), (api.set_rating, True), (api.set_label, "Mauve")):
+        with pytest.raises(ValueError):
+            call(api.current_photo(), value)
+
+
+def test_plugin_events(window):
+    seen = []
+    window.plugin_test_capture = seen
+    load_plugin(window, """
+def register(tamis):
+    log = tamis.window.plugin_test_capture
+    tamis.on("photo_changed", lambda photo: log.append(("photo", photo.name)))
+    tamis.on("photos_edited", lambda photos: log.append(("edited", [p.status for p in photos])))
+    tamis.on("files_moved", lambda moved: log.append(("moved", len(moved))))
+    tamis.on("folder_opened", lambda folder: log.append(("opened", folder)))
+    tamis.on("folder_refreshed", lambda folder: log.append(("refreshed", folder)))
+    tamis.on("closing", lambda: log.append(("closing",)))
+""")
+    press(window, Qt.Key.Key_Right)
+    assert seen == [("photo", "IMG_1.jpg")]
+    seen.clear()
+
+    press(window, Qt.Key.Key_U)  # already unmarked: no change, and no move to another photo
+    assert seen == []
+
+    press(window, Qt.Key.Key_P)
+    assert seen == [("edited", [KEEP]), ("photo", "IMG_2.jpg")]
+    seen.clear()
+
+    press(window, Qt.Key.Key_Z, CTRL)
+    assert seen == [("edited", [None]), ("photo", "IMG_1.jpg")]  # undo goes back to the photo
+    seen.clear()
+
+    window.load_folder(window.folder)
+    assert seen[-1] == ("opened", window.folder)
+    assert not any(entry[0] == "edited" for entry in seen)  # loading photos is not editing them
+    seen.clear()
+
+    window.load_folder(window.folder, keep_state=True)
+    assert seen[-1] == ("refreshed", window.folder)
+    seen.clear()
+
+    window.model.set_status([0], KEEP)
+    seen.clear()
+    moves = plan_moves(window.folder, window.model.photos)
+    window._move_files(moves)
+    assert ("moved", 1) in seen
+    seen.clear()
+
+    window.close()
+    assert seen == [("closing",)]
+
+
+def test_plugin_failures_never_reach_qt(window):
+    plugin = load_plugin(window, """
+def boom(*args):
+    raise RuntimeError("kaboom")
+
+def register(tamis):
+    tamis.add_action("Boom", boom)
+    tamis.on("photo_changed", boom)
+""")
+    assert plugin.loaded
+    plugin.actions[0].trigger()
+    assert window.toast.isVisible() and "kaboom" in window.toast.text()
+    press(window, Qt.Key.Key_Right)
+    press(window, Qt.Key.Key_Right)
+    assert window.current_row == 2  # the app carried on
+    assert len(plugin.problems) == 1  # the same failure is said once
+    assert "kaboom" in window.plugins.problems()[0]
+
+
+@pytest.mark.parametrize("code, expected", [
+    ("def (", "SyntaxError"),
+    ("raise ValueError('at import')", "at import"),
+    ("import sys\nsys.exit(3)", "SystemExit"),
+    ("NAME = 'No entry point'", "no register"),
+    ("def register(tamis):\n    tamis.on('nope', print)", "Unknown event"),
+])
+def test_plugin_that_fails_to_load_is_reported_and_inactive(window, code, expected):
+    plugin = load_plugin(window, code)
+    assert not plugin.loaded
+    assert expected in plugin.problems[0]
+    assert not window.plugins.active
+
+
+def test_plugin_failing_midway_leaves_nothing_behind(window):
+    plugin = load_plugin(window, """
+def register(tamis):
+    tamis.add_action("Half done", print, shortcut="Ctrl+Shift+J")
+    tamis.on("photo_changed", print)
+    raise RuntimeError("stop")
+""")
+    assert not plugin.loaded and not plugin.actions
+    assert not window.plugins._handlers["photo_changed"]
+    assert "Ctrl+Shift+J" not in window.plugins._taken_shortcuts()
+
+
+@pytest.mark.parametrize("shortcut, problem", [
+    ("P", "already taken"),  # a built-in one
+    ("Ctrl+Z", "already taken"),  # a standard key
+    ("Ctrl+Nope", "Invalid shortcut"),
+])
+def test_plugin_shortcut_cannot_break_a_builtin_one(window, shortcut, problem):
+    plugin = load_plugin(window, f"""
+def register(tamis):
+    tamis.add_action("Mine", print, shortcut={shortcut!r})
+""")
+    assert plugin.loaded and plugin.actions[0].shortcut().isEmpty()
+    assert problem in plugin.problems[0]
+    press(window, Qt.Key.Key_P)
+    assert window.model.photo(0).status == KEEP
+
+
+def test_plugin_shortcut_conflict_between_plugins(window):
+    load_plugin(window, "def register(tamis):\n    tamis.add_action('A', print, shortcut='Ctrl+Shift+J')", name="a")
+    second = load_plugin(window, "def register(tamis):\n    tamis.add_action('B', print, shortcut='Ctrl+Shift+J')", name="b")
+    assert second.actions[0].shortcut().isEmpty()
+    assert "already taken" in second.problems[0]
+
+
+def test_disabled_plugin_is_not_run(window):
+    plugin = load_plugin(window, "def register(tamis):\n    pass")
+    window.plugins._set_enabled(plugin, False)
+    window.plugins.plugins.clear()
+    window.plugins.load()
+    assert not window.plugins.plugins[0].loaded and not window.plugins.plugins[0].enabled
+
+    window.plugins._set_enabled(window.plugins.plugins[0], True)
+    window.plugins.plugins.clear()
+    window.plugins.load()
+    assert window.plugins.plugins[0].loaded
+
+
+def test_plugin_settings_keep_their_type_and_stay_separate(window):
+    captured = {}
+    window.plugin_test_capture = captured
+    for name in ("a", "b"):
+        load_plugin(window, f"""
+def register(tamis):
+    tamis.window.plugin_test_capture["{name}"] = tamis
+""", name=name)
+    captured["a"].set_setting("stars", 4)
+    captured["a"].set_setting("names", ["x"])
+    assert captured["a"].get_setting("stars") == 4
+    assert captured["a"].get_setting("names") == ["x"]
+    assert captured["b"].get_setting("stars", "none") == "none"
+
+
+def test_example_plugin_works(window):
+    example = os.path.join(os.path.dirname(__file__), "..", "examples", "plugins", "keeps_list.py")
+    window.plugins.directory = os.path.dirname(example)
+    window.plugins.load()
+    plugin = window.plugins.plugins[-1]
+    assert plugin.loaded and not plugin.problems
+
+    window.model.set_field([1, 2], "rating", 5)
+    plugin.actions[1].trigger()
+    assert [window.model.photo(row).status for row in (0, 1, 2)] == [None, KEEP, KEEP]
+    plugin.actions[0].trigger()
+    assert QApplication.clipboard().text() == "IMG_1.jpg\nIMG_2.jpg"

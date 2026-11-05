@@ -38,6 +38,7 @@ from .constants import (
     KEEP,
     KEEP_DIR,
     LEGACY_GLOBAL_CONFIG_FILENAME,
+    PLUGINS_DIR,
     PREFETCH_AHEAD,
     PREFETCH_BEHIND,
     REJECT,
@@ -51,6 +52,7 @@ from .exif import summary
 from .fileops import copy_export, execute_moves, plan_exports, plan_moves
 from .loader import ImageLoader
 from .models import PhotoModel, StatusFilterProxy, photo_files, relative_key, save_session, scan_folder
+from .plugins import PhotoInfo, PluginManager
 from .widgets import (
     CompareView,
     GalleryToolbar,
@@ -125,7 +127,7 @@ class ExportThread(QThread):
 
 
 class TamisApp(QMainWindow):
-    def __init__(self):
+    def __init__(self, plugins_dir=None):
         super().__init__()
         self.setWindowTitle("Tamis")
         self.setMinimumSize(900, 600)
@@ -133,9 +135,8 @@ class TamisApp(QMainWindow):
 
         self.settings = QSettings()
         # Where marks go when a photo folder is read-only.
-        self.session_fallback_dir = os.path.join(
-            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation), FALLBACK_SESSIONS_DIR
-        )
+        data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+        self.session_fallback_dir = os.path.join(data_dir, FALLBACK_SESSIONS_DIR)
         self.session_warning = None  # last session problem shown, so it is shown once
         self.xmp_warned = False
         self.xmp_dirty = set()  # photos whose rating/label still has to be written to XMP
@@ -188,6 +189,9 @@ class TamisApp(QMainWindow):
         self._build_shortcuts()
         self._load_luts(quiet=True)
         self._restore_window()
+        self.plugins = PluginManager(self, plugins_dir or os.path.join(data_dir, PLUGINS_DIR))
+        self.plugins_button.setMenu(self.plugins.menu)
+        self.plugins.load()
         QTimer.singleShot(0, self._restore_last_folder)
 
     # -- UI ----------------------------------------------------------------
@@ -274,12 +278,17 @@ class TamisApp(QMainWindow):
         self.keeps_button.setToolTip("Only show and step through the photos you keep (K)")
         self.keeps_button.clicked.connect(lambda _checked: self.toggle_keeps_only())
         self.keeps_button.setFixedHeight(24)  # tall enough for the chip's rounded ends, which Qt drops otherwise
+        self.plugins_button = QPushButton("Plugins ▾")
+        self.plugins_button.setObjectName("Chip")
+        self.plugins_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.plugins_button.setFixedHeight(24)
         corner = QWidget()
         corner.setObjectName("TabCorner")
         corner_layout = QHBoxLayout(corner)
         corner_layout.setContentsMargins(0, 0, 10, 0)
         corner_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         corner_layout.addWidget(self.keeps_button)
+        corner_layout.addWidget(self.plugins_button)
         self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
         self.tabs.tabBar().setDrawBase(False)
 
@@ -382,10 +391,12 @@ class TamisApp(QMainWindow):
         self.settings.setValue("last_folder", folder)
         self.header.set_folder(folder)
         self._watch(folder)
+        event = "folder_refreshed" if same_folder else "folder_opened"
 
         if not photos:
             self.image_view.set_image(None, "No photos in this folder")
             self.header.set_counter("")
+            self.plugins.emit(event, folder)
             return
 
         keys = [relative_key(folder, photo.path) for photo in photos]
@@ -395,6 +406,7 @@ class TamisApp(QMainWindow):
         else:
             self.go_to(names.index(select) if select in names else 0)
         self._keep_current_in_filter()
+        self.plugins.emit(event, folder)
 
     def refresh(self, auto=False):
         """Pick up photos added to or removed from the folder, keeping marks and the current photo."""
@@ -487,7 +499,8 @@ class TamisApp(QMainWindow):
     def go_to(self, row):
         if not 0 <= row < self.model.rowCount():
             return
-        if row != self.current_row:
+        moved_on = row != self.current_row
+        if moved_on:
             self._finish_crop(apply=True)  # moving on keeps the frame, like any other edit
         if self.compare_rows and row not in self.compare_rows:
             self._end_compare(show=False)
@@ -511,6 +524,8 @@ class TamisApp(QMainWindow):
         self.live_edit = None
         self.edit_panel.set_edit(photo.edit)
         self._refresh_view()
+        if moved_on:
+            self.plugins.emit("photo_changed", PhotoInfo.of(photo))
 
     def _in_cull(self, row):
         """Whether the Cull view's filter lets this photo through."""
@@ -902,6 +917,8 @@ class TamisApp(QMainWindow):
         self.moving = False
         progress.close()
         thread.deleteLater()
+        if thread.exported:
+            self.plugins.emit("photos_exported", list(thread.exported))
         return thread
 
     # -- compare -----------------------------------------------------------
@@ -1197,6 +1214,8 @@ class TamisApp(QMainWindow):
         self._watch(self.folder)  # _KEEPS / _REJECTS may have just been created
         if self.current_row >= 0:
             self.header.set_folder(self.folder, self.model.photo(self.current_row).display_name)
+        if result.moved:
+            self.plugins.emit("files_moved", dict(result.moved))
         return result
 
     # -- window ------------------------------------------------------------
@@ -1211,6 +1230,7 @@ class TamisApp(QMainWindow):
             event.ignore()  # files are being moved; the progress dialog has a Stop button
             return
         self._finish_crop(apply=True)
+        self.plugins.emit("closing")
         self.save_session()
         self.settings.setValue("geometry", self.saveGeometry())
         if self.current_row >= 0:

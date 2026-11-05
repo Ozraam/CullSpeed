@@ -1,5 +1,6 @@
 import faulthandler
 import sys
+import traceback
 from pathlib import Path
 
 from PyQt6.QtGui import QIcon
@@ -23,6 +24,10 @@ def main():
     migrate_from_cullspeed()
 
     window = TamisApp()
+    if window.plugins.active:
+        # A plugin's own widgets and timers run outside the plugin manager's guard, and
+        # PyQt aborts on an uncaught exception in a slot unless a hook is installed.
+        sys.excepthook = traceback.print_exception
     app.aboutToQuit.connect(window.loader.shutdown)
     app.aboutToQuit.connect(window.editor.shutdown)
     window.show()

@@ -246,6 +246,7 @@ class PhotoModel(QAbstractListModel):
 
     statuses_changed = pyqtSignal(list)  # rows whose status, rating, label or edit changed
     ratings_changed = pyqtSignal(list)  # paths whose rating or label changed
+    photos_edited = pyqtSignal(list)  # like statuses_changed, but not when a folder's photos are loaded
 
     def __init__(self, loader, parent=None):
         super().__init__(parent)
@@ -385,6 +386,7 @@ class PhotoModel(QAbstractListModel):
         rated = [path for path, name, _ in changes if name in ("rating", "label")]
         if rated:
             self.ratings_changed.emit(list(dict.fromkeys(rated)))
+        self.photos_edited.emit(sorted({self.row_of(path) for path, _, _ in changes}))
 
     def _on_thumbnail_loaded(self, path):
         row = self.row_of(path)

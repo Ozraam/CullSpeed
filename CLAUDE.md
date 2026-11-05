@@ -59,6 +59,14 @@ RAWs are edited from LibRaw's 16-bit linear development, not their embedded JPEG
 ### Process Files
 `fileops` keeps planning separate from execution: `plan_moves` / `execute_moves` and `plan_exports` / `copy_export`. Moves never overwrite (`IMG_1 (1).jpg`), while files in `_EXPORTS` are deliberately replaced so that reprocessing refreshes them. `process_files` plans exports a second time after moving, because the paths have changed.
 
+### Plugins
+`plugins.py` loads `<name>.py` or `<name>/__init__.py` from `plugins/` in the app's data folder at startup and calls `register(tamis)` with a `PluginApi`; the README documents that API for plugin authors, so keep it up to date. `TamisApp(plugins_dir=...)` overrides the folder, and the tests' `window` fixture always does so they never run the real app's plugins.
+
+- Anything a plugin runs goes through `PluginManager._call`, because an exception escaping into a Qt slot aborts the process. `main()` also installs an excepthook when a plugin is active, for a plugin's own timers and widgets.
+- Plugins see `PhotoInfo` snapshots, not `Photo`, and change photos through the API, which uses `set_field` and pushes one undo step per call.
+- App events go through `self.plugins.emit(name, ...)`; a new event also needs an entry in `plugins.EVENTS` and the README.
+- Plugin shortcuts that are already taken are refused, since Qt fires neither of two ambiguous shortcuts. That relies on the app's own being bound before `plugins.load()`.
+
 ## Constraints
 
 - Do not use `QMessageBox`: with Qt 6.11 on recent macOS its native `NSAlert` crashes AppKit (`trace trap`). Use `inform` / `MessageDialog` from `widgets.py`.
