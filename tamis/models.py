@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -26,8 +27,31 @@ THUMBNAIL_FAILED_ROLE = Qt.ItemDataRole.UserRole + 3
 RATING_ROLE = Qt.ItemDataRole.UserRole + 4
 LABEL_ROLE = Qt.ItemDataRole.UserRole + 5
 EDITED_ROLE = Qt.ItemDataRole.UserRole + 6
+BURST_ROLE = Qt.ItemDataRole.UserRole + 7  # the photo's Burst, or None
+SOFT_ROLE = Qt.ItemDataRole.UserRole + 8  # whether the photo looks out of focus
+# Never read: announced with every change a filter depends on, because Qt
+# only re-checks a row when the one role it filters on has changed.
+FILTER_ROLE = Qt.ItemDataRole.UserRole + 9
 
-_FIELD_ROLES = {"status": STATUS_ROLE, "rating": RATING_ROLE, "label": LABEL_ROLE, "edit": EDITED_ROLE}
+_FIELD_ROLES = {
+    "status": [STATUS_ROLE, FILTER_ROLE],
+    "rating": [RATING_ROLE, FILTER_ROLE],
+    "label": [LABEL_ROLE, FILTER_ROLE],
+    "edit": [EDITED_ROLE],
+}
+
+# Below this share of the folder's median sharpness, a photo is suggested as soft.
+SOFT_RATIO = 0.4
+
+
+@dataclass(frozen=True)
+class Burst:
+    """A photo's place in a group of shots taken in quick succession, see bursts.py."""
+
+    id: int
+    position: int  # 0-based, in capture order
+    size: int
+    sharpest: bool = False
 
 
 @dataclass
@@ -47,6 +71,11 @@ class Photo:
     xmp_pending: bool = False
     # What was written to _EXPORTS for this photo, see fileops.export_record().
     exports: list = field(default_factory=list)
+    # From the background analysis (analysis.py), not saved in the session: None until known.
+    capture_time: float | None = None  # seconds, on the camera's clock
+    sharpness: float | None = None  # only a suggestion: marks stay the user's
+    image_hash: int | None = None  # perceptual hash, see analysis.difference_hash()
+    burst: Burst | None = None
 
     @property
     def name(self):
@@ -65,6 +94,31 @@ class Photo:
 
 def _is_raw(path):
     return os.path.splitext(path)[1].lower() in RAW_EXTENSIONS
+
+
+def natural_key(name):
+    """Sort key comparing runs of digits as numbers: IMG_9 comes before IMG_10.
+
+    Text and numbers alternate from a text part (maybe empty), so keys always compare.
+    """
+    return [int(part) if i % 2 else part for i, part in enumerate(re.split(r"(\d+)", name.casefold()))]
+
+
+def by_name(photo):
+    return natural_key(photo.name), photo.name.casefold(), photo.path
+
+
+def by_capture_date(photo):
+    """Oldest first; photos without a date last."""
+    return photo.capture_time is None, photo.capture_time or 0, by_name(photo)
+
+
+def by_sharpness(photo):
+    """Sharpest first; photos without a score last."""
+    return photo.sharpness is None, -(photo.sharpness or 0), by_name(photo)
+
+
+SORT_KEYS = {"name": by_name, "date": by_capture_date, "sharpness": by_sharpness}
 
 
 # -- folder & session ------------------------------------------------------
@@ -144,9 +198,11 @@ def scan_folder(folder, fallback_dir=None, problems=None):
         # whenever a rating changes: they are the fresher source, unless
         # that write failed.
         if photo.path in from_sidecars and not photo.xmp_pending:
-            photo.rating, photo.label = from_sidecars[photo.path]
+            rating, photo.label = from_sidecars[photo.path]
+            if rating is not None:  # (None: the sidecar says "rejected", which is not a number of stars)
+                photo.rating = rating
 
-    photos.sort(key=lambda p: (p.name.casefold(), p.path))
+    photos.sort(key=by_name)
     return photos
 
 
@@ -254,7 +310,7 @@ def load_session(folder, fallback_dir=None, problems=None):
     return {key: entry for key, entry in entries.items() if entry is not None}
 
 
-def _write_json(path, data):
+def write_json(path, data):
     tmp_path = path + ".tmp"
     try:
         with open(tmp_path, 'w', encoding='utf-8') as file:
@@ -311,12 +367,12 @@ def save_session(folder, photos, fallback_dir=None, forget=(), problems=None):
     data.update(_absent_entries(folder, _read_session(folder, fallback_dir, problems), photos, data, forget))
     folder_path, *fallback = _session_paths(folder, fallback_dir)
     try:
-        _write_json(folder_path, data)
+        write_json(folder_path, data)
     except OSError:
         if not fallback:
             raise
         os.makedirs(fallback_dir, exist_ok=True)
-        _write_json(fallback[0], data)
+        write_json(fallback[0], data)
         return fallback[0]
     # Both are stale now that the folder's session has the marks.
     for stale in (*fallback, os.path.join(folder, LEGACY_SESSION_FILENAME)):
@@ -333,6 +389,7 @@ class PhotoModel(QAbstractListModel):
     statuses_changed = pyqtSignal(list)  # rows whose status, rating, label or edit changed
     ratings_changed = pyqtSignal(list)  # paths whose rating or label changed
     photos_edited = pyqtSignal(list)  # like statuses_changed, but not when a folder's photos are loaded
+    marks_changed = pyqtSignal(list)  # paths whose keep / reject mark changed
 
     def __init__(self, loader, parent=None):
         super().__init__(parent)
@@ -341,6 +398,7 @@ class PhotoModel(QAbstractListModel):
         self._rows = {}
         # Kept up to date on every change so per-keystroke updates stay O(1).
         self._keeps = self._rejects = self._unsorted = 0
+        self._median_sharpness = None
         loader.thumbnail_loaded.connect(self._on_thumbnail_loaded)
         loader.thumbnail_failed.connect(self._on_thumbnail_loaded)
 
@@ -369,6 +427,10 @@ class PhotoModel(QAbstractListModel):
             return photo.label
         if role == EDITED_ROLE:
             return bool(photo.edit)
+        if role == BURST_ROLE:
+            return photo.burst
+        if role == SOFT_ROLE:
+            return self.is_soft(index.row())
         return None
 
     @property
@@ -390,6 +452,39 @@ class PhotoModel(QAbstractListModel):
             self._tally(photo, 1)
         self.endResetModel()
         self.statuses_changed.emit(list(range(len(photos))))
+
+    def reorder(self, key):
+        """Sort the photos by `key`, keeping selections on their photos; returns whether anything moved."""
+        photos = sorted(self._photos, key=key)
+        if all(a is b for a, b in zip(photos, self._photos, strict=True)):
+            return False
+        self.layoutAboutToBeChanged.emit()
+        persistent = self.persistentIndexList()
+        followed = [self._photos[index.row()] for index in persistent]
+        self._photos = photos
+        self._reindex()
+        self.changePersistentIndexList(persistent, [self.index(self._rows[photo.path]) for photo in followed])
+        self.layoutChanged.emit()
+        return True
+
+    def remove_paths(self, paths):
+        """Forget the photos whose primary file is in `paths`: they are gone from the folder."""
+        self.set_photos([photo for photo in self._photos if photo.path not in paths])
+
+    def analysis_changed(self):
+        """Sharpness or bursts changed: repaint, and filter again."""
+        scores = sorted(photo.sharpness for photo in self._photos if photo.sharpness is not None)
+        self._median_sharpness = scores[len(scores) // 2] if scores else None
+        if self._photos:
+            self.dataChanged.emit(self.index(0), self.index(len(self._photos) - 1), [BURST_ROLE, SOFT_ROLE, FILTER_ROLE])
+
+    def median_sharpness(self):
+        return self._median_sharpness
+
+    def is_soft(self, row):
+        """Whether this photo is far less sharp than the folder's median: a suggestion, False until known."""
+        score = self._photos[row].sharpness
+        return score is not None and self._median_sharpness is not None and score < self._median_sharpness * SOFT_RATIO
 
     def set_field(self, rows, name, value):
         """Set `name` ("status", "rating", "label" or "edit") on `rows`; returns undo changes."""
@@ -467,11 +562,14 @@ class PhotoModel(QAbstractListModel):
             # would otherwise re-filter the gallery once per photo.
             for _, run in groupby(enumerate(rows), lambda item: item[1] - item[0]):
                 run = [row for _, row in run]
-                self.dataChanged.emit(self.index(run[0]), self.index(run[-1]), [_FIELD_ROLES[name]])
+                self.dataChanged.emit(self.index(run[0]), self.index(run[-1]), _FIELD_ROLES[name])
         self.statuses_changed.emit(sorted({self.row_of(path) for path, _, _ in changes}))
         rated = [path for path, name, _ in changes if name in ("rating", "label")]
         if rated:
             self.ratings_changed.emit(list(dict.fromkeys(rated)))
+        marked = [path for path, name, _ in changes if name == "status"]
+        if marked:
+            self.marks_changed.emit(list(dict.fromkeys(marked)))
         self.photos_edited.emit(sorted({self.row_of(path) for path, _, _ in changes}))
 
     def _on_thumbnail_loaded(self, path):
@@ -482,27 +580,51 @@ class PhotoModel(QAbstractListModel):
 
 
 class StatusFilterProxy(QSortFilterProxyModel):
-    """Gallery filter: all / unmarked / keep / reject."""
+    """Gallery filter: a status (all / unmarked / keep / reject), minimum stars, colour labels and focus, combined."""
 
     ALL = "all"
     UNMARKED = "unmarked"
+    SHARP = "sharp"
+    SOFT = "soft"
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._filter = self.ALL
-        # Re-filter live when a status changes (Qt only re-checks for this role).
-        self.setFilterRole(STATUS_ROLE)
+        self._min_rating = 0
+        self._labels = frozenset()  # any of these; empty: whatever the label
+        self._focus = self.ALL
+        # Re-filter live when something changes (see FILTER_ROLE).
+        self.setFilterRole(FILTER_ROLE)
 
-    def set_filter(self, value):
-        if value != self._filter:
+    def _change(self, name, value):
+        if value != getattr(self, name):
             self.beginFilterChange()
-            self._filter = value
+            setattr(self, name, value)
             self.endFilterChange()
 
+    def set_filter(self, value):
+        self._change("_filter", value)
+
+    def set_min_rating(self, stars):
+        self._change("_min_rating", stars)
+
+    def set_labels(self, labels):
+        self._change("_labels", frozenset(labels))
+
+    def set_focus(self, value):
+        self._change("_focus", value)
+
     def filterAcceptsRow(self, source_row, source_parent):
-        if self._filter == self.ALL:
-            return True
-        status = self.sourceModel().photo(source_row).status
+        model = self.sourceModel()
+        photo = model.photo(source_row)
         if self._filter == self.UNMARKED:
-            return status is None
-        return status == self._filter
+            if photo.status is not None:
+                return False
+        elif self._filter != self.ALL and photo.status != self._filter:
+            return False
+        if photo.rating < self._min_rating or (self._labels and photo.label not in self._labels):
+            return False
+        if self._focus == self.ALL:
+            return True
+        soft = model.is_soft(source_row)
+        return soft if self._focus == self.SOFT else not soft

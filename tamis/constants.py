@@ -33,6 +33,13 @@ PREFETCH_BEHIND = 1
 # screen of the smallest grid size on large displays.
 THUMBNAIL_CACHE_BYTES = 384 * 2**20
 
+# Thumbnails kept on disk, and the longest edge photos are analysed at.
+THUMBNAIL_DISK_CACHE_BYTES = 512 * 2**20
+ANALYSIS_MAX_SIZE = 1024
+
+# Shots this close together (seconds) are a burst.
+BURST_GAP_SECONDS = 2.0
+
 UNDO_LIMIT = 500
 
 # Colors

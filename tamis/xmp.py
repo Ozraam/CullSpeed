@@ -1,7 +1,9 @@
 """Star ratings and colour labels in XMP sidecars (xmp:Rating, xmp:Label).
 
 These are the properties Lightroom, Bridge and Capture One read from
-sidecars, and darktable reads xmp:Rating. Existing sidecars are edited in
+sidecars, and darktable reads xmp:Rating. There is no pick or reject flag that
+they share: Lightroom keeps its flags in its catalog only, so keep and reject
+can only be passed on through these two properties (app.XMP_MARKS). Existing sidecars are edited in
 place, changing only those two properties; a sidecar that cannot be
 understood is left untouched. New sidecars are only created for RAWs, as
 `IMG.xmp`: editors read JPEG metadata from the file itself, not a sidecar.
@@ -16,6 +18,9 @@ from html import escape, unescape
 from .constants import RAW_EXTENSIONS
 
 LABELS = ("Red", "Yellow", "Green", "Blue", "Purple")
+
+# What "rejected" is in xmp:Rating for darktable and Bridge. Lightroom ignores it.
+REJECTED_RATING = -1
 
 _NAMESPACE = "http://ns.adobe.com/xap/1.0/"
 _RATING_ATTR = re.compile(r'\s+xmp:Rating\s*=\s*(["\'])(-?\d+)\1')
@@ -68,13 +73,28 @@ def parse(text):
     return min(5, max(0, int(rating))), label or None  # Lightroom's "-1 = rejected" is not a rating
 
 
+def _rejected(text):
+    """Whether the sidecar's rating is the -1 that darktable and Bridge use for a rejected photo."""
+    match = _RATING_ATTR.search(text)
+    if match:
+        return int(match.group(2)) < 0
+    match = _RATING_ELEMENT.search(text)
+    return bool(match) and int(match.group(1)) < 0
+
+
 def read(paths, names):
-    """(rating, label) from the first readable sidecar of any of `paths`, or None."""
+    """(rating, label) from the first readable sidecar of any of `paths`, or None.
+
+    The rating is None when the sidecar says "rejected": a -1 says nothing about
+    the stars, which Tamis may have replaced with it, see REJECTED_RATING.
+    """
     for path in paths:
         for sidecar in _existing(path, names):
             try:
                 with open(sidecar, encoding='utf-8') as file:
-                    return parse(file.read())
+                    text = file.read()
+                rating, label = parse(text)
+                return (None if _rejected(text) else rating), label
             except (OSError, UnicodeDecodeError, ValueError):
                 continue
     return None

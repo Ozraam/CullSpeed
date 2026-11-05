@@ -10,12 +10,12 @@ from PyQt6.QtGui import QColor, QImage  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 
-from tamis import loader, xmp  # noqa: E402
+from tamis import fileops, loader, xmp  # noqa: E402
 from tamis.app import CULL_TAB, GALLERY_TAB, TamisApp  # noqa: E402
 from tamis.constants import KEEP, REJECT, SESSION_FILENAME  # noqa: E402
 from tamis.fileops import MoveResult, plan_moves  # noqa: E402
-from tamis.plugins import PhotoInfo  # noqa: E402
-from tamis.widgets import MessageDialog, ProcessDialog  # noqa: E402
+from tamis.plugins import PhotoInfo, Plugin, PluginApi  # noqa: E402
+from tamis.widgets import ImportDialog, MessageDialog, ProcessDialog  # noqa: E402
 
 CTRL = Qt.KeyboardModifier.ControlModifier
 PHOTOS = 6
@@ -36,7 +36,9 @@ def window(qapp, tmp_path, tmp_path_factory):
         image = QImage(300, 200, QImage.Format.Format_RGB32)
         image.fill(QColor(40 * i, 80, 120))
         assert image.save(str(tmp_path / f"IMG_{i}.jpg"))
-    win = TamisApp(plugins_dir=str(tmp_path_factory.mktemp("plugins")))  # never the real app's plugins
+    QSettings().clear()  # before the window reads them
+    # Never the real app's plugins or caches.
+    win = TamisApp(plugins_dir=str(tmp_path_factory.mktemp("plugins")), cache_dir=str(tmp_path_factory.mktemp("cache")))
     win.settings.clear()
     win.resize(1200, 800)
     win.show()
@@ -583,6 +585,7 @@ def failed_thumbnail(win, tmp_path, monkeypatch):
     path = str(tmp_path / "IMG_0.jpg")
     decode = loader._decode
     monkeypatch.setattr(loader, "_decode", lambda *_: (QImage(), QSize(), "still copying"))
+    monkeypatch.setattr(win.loader, "_disk_thumbnails", None)  # it was never read whole, so it can't be in there
     win.loader.reset()
     assert win.loader.thumbnail(path) is None
     assert wait_until(lambda: win.loader.thumbnail_error(path))
@@ -983,3 +986,406 @@ def test_rating_still_waiting_for_its_sidecar_follows_a_move(window, tmp_path, m
     monkeypatch.setattr(xmp, "write", real_write)
     window.save_session()
     assert xmp.parse((tmp_path / "_KEEPS" / "IMG_0.jpg.xmp").read_text())[0] == 5
+
+
+# -- filters by stars and labels -------------------------------------------------
+
+def shown_names(win):
+    return [win.proxy.index(row, 0).data(Qt.ItemDataRole.DisplayRole) for row in range(win.proxy.rowCount())]
+
+
+def test_rating_and_label_filters_combine_with_the_status_filter(window):
+    window.model.set_field([0, 1], "rating", 4)
+    window.model.set_field([2], "rating", 2)
+    window.model.set_field([0, 2], "label", "Green")
+    statuses(window, keep=[0, 2], reject=[1])
+
+    window.gallery_toolbar.rating_combo.setCurrentIndex(3)  # 3 stars or more
+    assert shown_names(window) == ["IMG_0.jpg", "IMG_1.jpg"]
+    window.gallery_toolbar.label_buttons["Green"].click()
+    assert shown_names(window) == ["IMG_0.jpg"]
+    window.gallery_toolbar.rating_combo.setCurrentIndex(0)
+    assert shown_names(window) == ["IMG_0.jpg", "IMG_2.jpg"]
+    window.gallery_toolbar.label_buttons["Blue"].click()  # several labels: any of them
+    window.model.set_field([3], "label", "Blue")
+    assert shown_names(window) == ["IMG_0.jpg", "IMG_2.jpg", "IMG_3.jpg"]
+    window.gallery_toolbar._buttons[KEEP][0].click()
+    assert shown_names(window) == ["IMG_0.jpg", "IMG_2.jpg"]
+
+
+def test_rating_and_label_changes_refilter_live(window):
+    window.gallery_toolbar.rating_combo.setCurrentIndex(1)
+    assert window.proxy.rowCount() == 0
+    window.model.set_field([1], "rating", 1)
+    assert shown_names(window) == ["IMG_1.jpg"]
+    window.model.set_field([1], "rating", 0)
+    assert window.proxy.rowCount() == 0
+
+    window.gallery_toolbar.rating_combo.setCurrentIndex(0)
+    window.gallery_toolbar.label_buttons["Red"].click()
+    window.model.set_field([4], "label", "Red")
+    assert shown_names(window) == ["IMG_4.jpg"]
+    window.undo_stack.append([(window.model.photo(4).path, "label", None)])
+    window.undo()
+    assert window.proxy.rowCount() == 0
+
+
+def test_removing_a_star_under_the_filter_selects_the_next_photo(window):
+    window.model.set_field([1, 2, 3], "rating", 3)
+    window.gallery_toolbar.rating_combo.setCurrentIndex(3)
+    window.tabs.setCurrentIndex(GALLERY_TAB)
+    window.grid.setCurrentIndex(window.proxy.index(0, 0))
+    window.rate(0)
+    assert shown_names(window) == ["IMG_2.jpg", "IMG_3.jpg"]
+    assert window.model.photo(window.current_row).name == "IMG_2.jpg"
+
+
+# -- sorting ---------------------------------------------------------------------
+
+def known_times(win, times):
+    """Capture times by row, as the analysis would have found them."""
+    for row, seconds in times.items():
+        win.model.photo(row).capture_time = seconds
+
+
+def test_sorting_by_date_stays_on_the_same_photo_and_is_remembered(window):
+    known_times(window, {row: 100.0 - row for row in range(PHOTOS)})
+    window.go_to(1)
+    path = window.model.photo(1).path
+
+    window.gallery_toolbar.sort_combo.setCurrentIndex(1)
+    assert [p.name for p in window.model.photos] == [f"IMG_{i}.jpg" for i in reversed(range(PHOTOS))]
+    assert window.model.photo(window.current_row).path == path
+    assert window.current_row == 4
+    assert window.header.lbl_counter.text() == "5 / 6"
+    assert window.strip_proxy.index(4, 0).data(Qt.ItemDataRole.DisplayRole) == "IMG_1.jpg"
+    assert window.settings.value("sort_order") == "date"
+
+    press(window, Qt.Key.Key_Right)
+    assert window.model.photo(window.current_row).name == "IMG_0.jpg"
+    window.gallery_toolbar.sort_combo.setCurrentIndex(0)
+    assert window.model.photo(0).name == "IMG_0.jpg"
+
+
+def test_sorting_keeps_the_gallery_selection_on_its_photos(window):
+    known_times(window, {row: 100.0 - row for row in range(PHOTOS)})
+    window.tabs.setCurrentIndex(GALLERY_TAB)
+    selection = window.grid.selectionModel()
+    selection.clearSelection()
+    for row in (0, 1):
+        selection.select(window.proxy.index(row, 0), selection.SelectionFlag.Select)
+    window.set_sort_order("date")
+    selected = {index.data(Qt.ItemDataRole.DisplayRole) for index in selection.selectedIndexes()}
+    assert selected == {"IMG_0.jpg", "IMG_1.jpg"}
+
+
+def test_sorting_by_date_reads_the_dates_in_the_background(window, tmp_path):
+    for i, name in enumerate(["IMG_0", "IMG_1", "IMG_2", "IMG_3", "IMG_4", "IMG_5"]):
+        os.utime(tmp_path / f"{name}.jpg", (2_000_000_000 - i * 100, 2_000_000_000 - i * 100))
+    window.set_sort_order("date")
+    assert window.stats.lbl_analysis.text().startswith("Analysing")
+    assert wait_until(lambda: window.model.photo(0).name == "IMG_5.jpg")
+    assert window.stats.lbl_analysis.text() == ""
+    assert window.gallery_toolbar.sort_combo.currentData() == "date"
+
+
+def test_the_sort_order_applies_to_the_next_folder_opened(window, tmp_path):
+    window.set_sort_order("date")
+    assert wait_until(lambda: not window.analyzer._pending)
+    os.utime(tmp_path / "IMG_3.jpg", (1_000_000_000, 1_000_000_000))
+    window.refresh()
+    window.load_folder(str(tmp_path), keep_state=True)
+    assert wait_until(lambda: window.model.photo(0).name == "IMG_3.jpg")
+
+
+def test_exports_are_named_the_same_whatever_the_order_shown(window, tmp_path):
+    window.model.set_field([0], "edit", {"contrast": 10})
+    by_name_jobs = [job.path for job in window._plan_exports()]
+    known_times(window, {row: 100.0 - row for row in range(PHOTOS)})
+    window.set_sort_order("date")
+    assert [job.path for job in window._plan_exports()] == by_name_jobs
+
+
+# -- bursts ----------------------------------------------------------------------
+
+def test_bursts_group_photos_and_keep_one_rejects_the_others(window):
+    known_times(window, {0: 100.0, 1: 100.5, 2: 101.0, 3: 500.0, 4: 900.0, 5: 900.4})
+    press(window, Qt.Key.Key_B)
+    assert window.show_bursts and window.gallery_toolbar.bursts_button.isChecked()
+    assert [p.burst.size if p.burst else 0 for p in window.model.photos] == [3, 3, 3, 0, 2, 2]
+
+    window.go_to(1)
+    QTest.keyClick(window, Qt.Key.Key_P, Qt.KeyboardModifier.ShiftModifier)
+    assert [window.model.photo(row).status for row in range(4)] == [REJECT, KEEP, REJECT, None]
+    assert window.current_row == 3  # past the burst
+
+    window.undo()  # a single step
+    assert [window.model.photo(row).status for row in range(3)] == [None, None, None]
+
+
+def test_keep_one_needs_a_burst(window):
+    press(window, Qt.Key.Key_P, Qt.KeyboardModifier.ShiftModifier)
+    assert window.toast.text() == "Show bursts first (B)"
+    window.set_bursts(True)
+    wait_until(lambda: not window.analyzer._pending)
+    for photo in window.model.photos:
+        photo.burst = None
+    window.go_to(0)
+    press(window, Qt.Key.Key_P, Qt.KeyboardModifier.ShiftModifier)
+    assert window.model.photo(0).status is None
+
+
+def test_bursts_are_scored_to_find_their_sharpest_frame(window):
+    window.set_bursts(True)  # (files written just now: all one burst, going by their dates)
+    assert wait_until(lambda: not window.analyzer._pending and all(p.sharpness is not None for p in window.model.photos))
+    window._show_analysis()
+    assert all(photo.status is None for photo in window.model.photos)  # only ever a suggestion
+
+
+def test_bursts_off_clears_the_groups(window):
+    known_times(window, {0: 100.0, 1: 100.5})
+    window.set_bursts(True)
+    assert window.model.photo(0).burst is not None
+    window.set_bursts(False)
+    assert window.model.photo(0).burst is None
+
+
+# -- sharpness -------------------------------------------------------------------
+
+def test_focus_filter_and_sharpness_sort_follow_the_scores(window):
+    scores = {0: 100.0, 1: 5.0, 2: 90.0, 3: 110.0, 4: 80.0, 5: 95.0}
+    for row, score in scores.items():
+        window.model.photo(row).sharpness = score
+    window.model.analysis_changed()
+
+    window.gallery_toolbar.focus_combo.setCurrentIndex(2)  # looks soft
+    assert shown_names(window) == ["IMG_1.jpg"]
+    window.gallery_toolbar.focus_combo.setCurrentIndex(1)  # looks sharp
+    assert "IMG_1.jpg" not in shown_names(window)
+    window.gallery_toolbar.focus_combo.setCurrentIndex(0)
+
+    window.gallery_toolbar.sort_combo.setCurrentIndex(2)
+    assert window.model.photo(0).name == "IMG_3.jpg"
+    assert window.model.photo(5).name == "IMG_1.jpg"
+    assert all(photo.status is None for photo in window.model.photos)
+
+
+def test_sharpness_shows_in_the_info_lines(window):
+    window.model.photo(0).sharpness = 50.0
+    window.model.analysis_changed()
+    assert any("Sharpness 50" in line for line in window._info_lines(window.model.photo(0)))
+
+
+# -- focus peaking ---------------------------------------------------------------
+
+def test_focus_peaking_overlays_the_shown_photo(window):
+    assert window.image_view._overlay is None
+    press(window, Qt.Key.Key_F)
+    assert wait_until(lambda: window.image_view._overlay is not None)
+    assert window.image_view._overlay.size() == window.image_view._pixmap.size()
+    window.grab()  # paints it
+    press(window, Qt.Key.Key_F)
+    assert window.image_view._overlay is None
+
+
+def test_focus_peaking_leaves_the_crop_tool_alone(window):
+    press(window, Qt.Key.Key_F)
+    assert wait_until(lambda: window.image_view._overlay is not None)
+    press(window, Qt.Key.Key_R)
+    assert window.image_view._overlay is None
+    press(window, Qt.Key.Key_Escape)
+
+
+# -- thumbnails on disk ----------------------------------------------------------
+
+def test_thumbnails_come_back_from_disk_without_decoding(window, tmp_path, monkeypatch):
+    path = str(tmp_path / "IMG_0.jpg")
+    window.loader.thumbnail(path)
+    assert wait_until(lambda: window.loader._thumbnails.get(path) is not None)
+    assert wait_until(lambda: any(files for _, _, files in os.walk(window.loader._disk_thumbnails.directory)))
+
+    window.loader.reset()
+    monkeypatch.setattr(loader, "_decode", lambda *_: pytest.fail("decoded again"))
+    window.loader.thumbnail(path)
+    assert wait_until(lambda: window.loader._thumbnails.get(path) is not None)
+
+
+# -- the Trash -------------------------------------------------------------------
+
+def fake_trash(monkeypatch, tmp_path_factory):
+    """The real one would fill the real Trash."""
+    bin_dir = tmp_path_factory.mktemp("trash")
+
+    def to_trash(path):
+        location = str(bin_dir / os.path.basename(path))
+        os.replace(path, location)
+        return location
+
+    monkeypatch.setattr(fileops, "_to_trash", to_trash)
+    return bin_dir
+
+
+def confirm_dialogs(monkeypatch, answer=QDialog.DialogCode.Accepted):
+    seen = []
+
+    def confirm(dialog):
+        seen.append(dialog.body.text())
+        return answer
+
+    monkeypatch.setattr(MessageDialog, "exec", confirm)
+    return seen
+
+
+def test_trash_moves_rejects_and_everything_follows(window, tmp_path, monkeypatch, tmp_path_factory):
+    bin_dir = fake_trash(monkeypatch, tmp_path_factory)
+    seen = confirm_dialogs(monkeypatch)
+    statuses(window, keep=[0], reject=[1, 2])
+    process(window, monkeypatch, export=False)
+    (tmp_path / "_REJECTS" / "IMG_1.jpg.xmp").write_text("<x/>")
+    window.go_to(window.model.row_of(str(tmp_path / "_REJECTS" / "IMG_1.jpg")))
+    window.model.set_status([window.model.row_of(str(tmp_path / "IMG_3.jpg"))], REJECT)  # not in _REJECTS: stays
+    events = []
+    window.plugins.emit = lambda name, *args: events.append(name)
+
+    window.trash_rejects()
+
+    assert "<b>2</b>" in seen[0] and "1 rejected photo(s) aren't in _REJECTS" in seen[0]
+    assert sorted(os.listdir(bin_dir)) == ["IMG_1.jpg", "IMG_1.jpg.xmp", "IMG_2.jpg"]
+    assert not (tmp_path / "_REJECTS").exists()
+    assert [p.name for p in window.model.photos] == ["IMG_0.jpg", "IMG_3.jpg", "IMG_4.jpg", "IMG_5.jpg"]
+    assert window.model.counts() == (1, 1, 2)
+    assert window.current_row >= 0
+    assert "photos_trashed" in events
+    session = json.loads((tmp_path / SESSION_FILENAME).read_text())
+    assert not any("IMG_1" in key or "IMG_2" in key for key in session)
+    window.undo()  # nothing refers to the trashed photos any more
+
+
+def test_trash_can_be_refused_and_needs_something_to_do(window, tmp_path, monkeypatch, tmp_path_factory):
+    bin_dir = fake_trash(monkeypatch, tmp_path_factory)
+    window.trash_rejects()
+    assert window.toast.text() == "No rejected photos in _REJECTS"
+
+    statuses(window, reject=[1])
+    process(window, monkeypatch, export=False)
+    confirm_dialogs(monkeypatch, QDialog.DialogCode.Rejected)
+    window.trash_rejects()
+    assert os.listdir(bin_dir) == []
+    assert (tmp_path / "_REJECTS" / "IMG_1.jpg").exists()
+
+
+def test_a_photo_that_cannot_be_trashed_stays_with_its_mark(window, tmp_path, monkeypatch):
+    seen = confirm_dialogs(monkeypatch)
+    statuses(window, reject=[1])
+    process(window, monkeypatch, export=False)
+
+    def refuse(_path):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(fileops, "_to_trash", refuse)
+    window.trash_rejects()
+    assert (tmp_path / "_REJECTS" / "IMG_1.jpg").exists()
+    assert window.model.counts()[1] == 1
+    assert len(seen) == 2  # the confirmation, then what failed
+
+
+# -- importing -------------------------------------------------------------------
+
+def test_import_copies_a_card_and_opens_the_destination(window, tmp_path_factory, monkeypatch):
+    card = tmp_path_factory.mktemp("card")
+    (card / "DCIM" / "100CANON").mkdir(parents=True)
+    QImage(40, 30, QImage.Format.Format_RGB32).save(str(card / "DCIM" / "100CANON" / "A.jpg"))
+    destination = tmp_path_factory.mktemp("shoot") / "new"
+    backup = tmp_path_factory.mktemp("backup") / "copy"
+
+    def fill(dialog):
+        dialog.source_edit.setText(str(card))
+        dialog._scan()
+        dialog.destination_edit.setText(str(destination))
+        dialog.backup_edit.setText(str(backup))
+        dialog.backup_check.setChecked(True)
+        assert dialog.confirm_button.isEnabled()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ImportDialog, "exec", fill)
+    press(window, Qt.Key.Key_I, CTRL)
+    assert window.folder == str(destination)
+    assert [p.name for p in window.model.photos] == ["A.jpg"]
+    assert (backup / "A.jpg").exists()
+    assert (card / "DCIM" / "100CANON" / "A.jpg").exists()
+    assert window.settings.value("import_destination") == str(destination)
+
+
+def test_import_dialog_refuses_a_destination_on_the_card(qapp, tmp_path, window):
+    (tmp_path / "sub").mkdir()
+    dialog = ImportDialog(window, str(tmp_path), str(tmp_path / "sub"))
+    assert not dialog.confirm_button.isEnabled()
+    assert "inside" in dialog.body.text()
+    dialog.destination_edit.setText("")
+    assert not dialog.confirm_button.isEnabled()
+
+
+def test_a_card_opened_directly_points_to_import(window, tmp_path_factory):
+    card = tmp_path_factory.mktemp("card")
+    (card / "DCIM").mkdir()
+    window.load_folder(str(card))
+    assert "Import" in window.image_view._message
+
+
+# -- marks in other editors ------------------------------------------------------
+
+def raw_window_photo(tmp_path):
+    (tmp_path / "RAW_1.cr2").write_bytes(b"raw")
+
+
+def test_rejects_as_rating_minus_one_keep_the_stars_in_tamis(window, tmp_path):
+    raw_window_photo(tmp_path)
+    window.load_folder(str(tmp_path), keep_state=True)
+    row = window.model.row_of(str(tmp_path / "RAW_1.cr2"))
+    sidecar = tmp_path / "RAW_1.xmp"
+    window.xmp_mark_actions["rating"].trigger()
+    window.model.set_field([row], "rating", 3)
+    window.model.set_status([row], REJECT)
+    window.save_session()
+    assert 'xmp:Rating="-1"' in sidecar.read_text()
+
+    window.load_folder(str(tmp_path), keep_state=True)  # the -1 isn't taken for stars
+    row = window.model.row_of(str(tmp_path / "RAW_1.cr2"))
+    assert window.model.photo(row).rating == 3
+
+    window.model.set_status([row], KEEP)
+    window.save_session()
+    assert 'xmp:Rating="3"' in sidecar.read_text()
+
+
+def test_marks_touch_no_sidecar_by_default(window, tmp_path):
+    raw_window_photo(tmp_path)
+    window.load_folder(str(tmp_path), keep_state=True)
+    window.model.set_status([window.model.row_of(str(tmp_path / "RAW_1.cr2"))], REJECT)
+    window.save_session()
+    assert not (tmp_path / "RAW_1.xmp").exists()
+
+
+def test_marks_as_labels_leave_the_user_s_own_label_alone(window):
+    window.model.set_field([1], "label", "Blue")
+    statuses(window, keep=[2])  # marked before the option is on
+    window.xmp_mark_actions["labels"].trigger()
+    assert window.model.photo(2).label == "Green"
+
+    press(window, Qt.Key.Key_X)  # photo 0
+    assert window.model.photo(0).label == "Red"
+    window.go_to(1)
+    press(window, Qt.Key.Key_P)
+    assert window.model.photo(1).label == "Blue"
+
+    window.go_to(0)
+    press(window, Qt.Key.Key_U)
+    assert window.model.photo(0).label is None
+    window.undo()
+    assert (window.model.photo(0).status, window.model.photo(0).label) == (REJECT, "Red")
+
+
+def test_plugins_marks_follow_the_option(window):
+    window.xmp_mark_actions["labels"].trigger()
+    PluginApi(window.plugins, Plugin("test", "test", "test")).set_status(window.model.photo(3).path, KEEP)
+    assert window.model.photo(3).label == "Green"

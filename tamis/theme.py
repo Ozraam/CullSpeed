@@ -78,6 +78,7 @@ QSlider::handle:horizontal:hover {{ background: #ffffff; }}
 QComboBox {{
     background: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; border-radius: 5px; padding: 4px 8px;
 }}
+QComboBox#Compact {{ padding: 2px 8px; border-radius: 12px; }}
 QComboBox QAbstractItemView {{ background: {COLOR_CARD}; selection-background-color: {COLOR_ACCENT}; }}
 QMenu {{ background: {COLOR_CARD}; border: 1px solid {COLOR_BORDER}; padding: 4px 0; }}
 QMenu::item {{ padding: 4px 24px 4px 24px; }}

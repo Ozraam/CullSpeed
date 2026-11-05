@@ -17,13 +17,14 @@ from PyQt6.QtCore import (
     QTimer,
     pyqtSignal,
 )
-from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QFileDialog,
     QHBoxLayout,
     QMainWindow,
+    QMenu,
     QProgressDialog,
     QPushButton,
     QStackedWidget,
@@ -32,7 +33,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import cropping, develop, lut, xmp
+from . import bursts, cropping, develop, lut, xmp
+from .analysis import PhotoAnalyzer
 from .constants import (
     EXPORT_DIR,
     FALLBACK_SESSIONS_DIR,
@@ -52,24 +54,32 @@ from .editpanel import EditPanel
 from .exif import summary
 from .fileops import (
     copy_export,
+    execute_import,
     execute_moves,
+    execute_trash,
     export_record,
+    find_card,
     is_jpeg,
     jpeg_file,
     plan_exports,
     plan_moves,
+    plan_trash,
     rejected_exports,
     remove_rejected_exports,
+    trash_size,
     without_export,
 )
 from .loader import ImageLoader
-from .models import PhotoModel, StatusFilterProxy, photo_files, relative_key, save_session, scan_folder
+from .models import SORT_KEYS, PhotoModel, StatusFilterProxy, by_name, photo_files, relative_key, save_session, scan_folder
+from .peaking import FocusPeaker
 from .plugins import PhotoInfo, PluginManager
+from .thumbcache import ThumbnailCache
 from .widgets import (
     CompareView,
     GalleryToolbar,
     HeaderBar,
     ImageView,
+    ImportDialog,
     MessageDialog,
     ProcessDialog,
     StatsBar,
@@ -77,12 +87,21 @@ from .widgets import (
     Toast,
     inform,
     make_thumbnail_view,
+    size_text,
 )
 
 CULL_TAB, GALLERY_TAB = 0, 1
 FILMSTRIP_THUMB_SIZE = 64
 COMPARE_MAX = 4
 CROP_CACHE_SIZE = 8  # cropped previews and full-resolution images kept
+
+# How keep and reject reach other editors, as no flag is common to them (see xmp.py).
+XMP_MARKS = (
+    ("off", "Not at all"),
+    ("rating", "Rejected as rating −1 (darktable, Bridge)"),
+    ("labels", "Keep green, reject red (Lightroom, Capture One…)"),
+)
+MARK_LABELS = {KEEP: "Green", REJECT: "Red"}
 
 
 def _names(paths, limit=5):
@@ -150,8 +169,34 @@ class ExportThread(QThread):
         self.progressed.emit(len(self.jobs))
 
 
+class WorkThread(QThread):
+    """Runs `work(progress)` off the GUI thread; `progress(done)` returns False once asked to stop."""
+
+    progressed = pyqtSignal(int)
+
+    def __init__(self, work, parent=None):
+        super().__init__(parent)
+        self.work = work
+        self.result = None
+        self.failure = None
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        def progress(done):
+            self.progressed.emit(done)
+            return not self._stop.is_set()
+
+        try:
+            self.result = self.work(progress)
+        except Exception as exc:  # an exception escaping run() would abort the process
+            self.failure = str(exc) or type(exc).__name__
+
+
 class TamisApp(QMainWindow):
-    def __init__(self, plugins_dir=None):
+    def __init__(self, plugins_dir=None, cache_dir=None):
         super().__init__()
         self.setWindowTitle("Tamis")
         self.setMinimumSize(900, 600)
@@ -179,8 +224,17 @@ class TamisApp(QMainWindow):
         self.show_info = self.settings.value("show_info", True, type=bool)
         self.undo_stack = []
         self.moving = False
+        self.sort_order = self.settings.value("sort_order", "name")
+        if self.sort_order not in SORT_KEYS:
+            self.sort_order = "name"
+        self.show_bursts = self.settings.value("show_bursts", False, type=bool)
+        self.peaking = False
+        self.xmp_marks = self.settings.value("xmp_marks", "off")
+        if self.xmp_marks not in dict(XMP_MARKS):
+            self.xmp_marks = "off"
 
-        self.loader = ImageLoader(self)
+        cache_dir = cache_dir or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
+        self.loader = ImageLoader(self, ThumbnailCache(os.path.join(cache_dir, "thumbnails")))
         self.loader.preview_loaded.connect(self._on_image_ready)
         self.loader.preview_failed.connect(lambda path, _error: self._on_image_ready(path))
         self.loader.full_loaded.connect(self._on_image_ready)
@@ -190,9 +244,22 @@ class TamisApp(QMainWindow):
         self.editor.rendered.connect(self._on_image_ready)
         self.editor.failed.connect(self._on_edit_failed)
 
+        self.peaker = FocusPeaker(self)
+        self.peaker.ready.connect(self._on_peaking_ready)
+
+        self.analyzer = PhotoAnalyzer(os.path.join(cache_dir, "analysis"), self)
+        self.analyzer.analyzed.connect(self._on_analyzed)
+        self.analyzer.finished.connect(self._on_analysis_finished)
+        # What the analysis finds shows up a few times a second, not once per photo.
+        self.analysis_timer = QTimer(self)
+        self.analysis_timer.setSingleShot(True)
+        self.analysis_timer.setInterval(500)
+        self.analysis_timer.timeout.connect(self._show_analysis)
+
         self.model = PhotoModel(self.loader, self)
         self.model.statuses_changed.connect(self._on_statuses_changed)
         self.model.ratings_changed.connect(lambda paths: self.xmp_dirty.update(paths))
+        self.model.marks_changed.connect(self._on_marks_changed)
         self.proxy = StatusFilterProxy(self)
         self.proxy.setSourceModel(self.model)
         self.strip_proxy = StatusFilterProxy(self)  # the filmstrip's own: filtered by "Keeps only"
@@ -212,6 +279,7 @@ class TamisApp(QMainWindow):
         self.watcher.directoryChanged.connect(lambda _path: self.refresh_timer.start())
 
         self._build_ui()
+        self.analyzer.progressed.connect(self.stats.set_analysis_progress)
         self._build_shortcuts()
         self._load_luts(quiet=True)
         self._restore_window()
@@ -225,6 +293,8 @@ class TamisApp(QMainWindow):
     def _build_ui(self):
         self.header = HeaderBar()
         self.header.open_folder_requested.connect(self.choose_folder)
+        self.header.import_requested.connect(self.import_photos)
+        self.header.trash_requested.connect(self.trash_rejects)
         self.header.refresh_requested.connect(self.refresh)
         self.header.process_requested.connect(self.process_files)
 
@@ -274,8 +344,13 @@ class TamisApp(QMainWindow):
 
         # Gallery tab: filter chips + grid
         grid_size = int(self.settings.value("grid_thumb_size", 150))
-        self.gallery_toolbar = GalleryToolbar(grid_size)
+        self.gallery_toolbar = GalleryToolbar(grid_size, self.sort_order, self.show_bursts)
         self.gallery_toolbar.filter_changed.connect(self.proxy.set_filter)
+        self.gallery_toolbar.rating_changed.connect(self.proxy.set_min_rating)
+        self.gallery_toolbar.labels_changed.connect(self.proxy.set_labels)
+        self.gallery_toolbar.focus_changed.connect(self._on_focus_filter_changed)
+        self.gallery_toolbar.sort_changed.connect(self.set_sort_order)
+        self.gallery_toolbar.bursts_toggled.connect(self.set_bursts)
         self.gallery_toolbar.size_changed.connect(self._on_grid_size_changed)
         self.grid_delegate = ThumbnailDelegate(grid_size, show_names=True, parent=self)
         self.grid = make_thumbnail_view(self.proxy, self.grid_delegate, horizontal=False)
@@ -308,12 +383,18 @@ class TamisApp(QMainWindow):
         self.plugins_button.setObjectName("Chip")
         self.plugins_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.plugins_button.setFixedHeight(24)
+        self.options_button = QPushButton("Options ▾")
+        self.options_button.setObjectName("Chip")
+        self.options_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.options_button.setFixedHeight(24)
+        self.options_button.setMenu(self._build_options_menu())
         corner = QWidget()
         corner.setObjectName("TabCorner")
         corner_layout = QHBoxLayout(corner)
         corner_layout.setContentsMargins(0, 0, 10, 0)
         corner_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         corner_layout.addWidget(self.keeps_button)
+        corner_layout.addWidget(self.options_button)
         corner_layout.addWidget(self.plugins_button)
         self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
         self.tabs.tabBar().setDrawBase(False)
@@ -331,6 +412,20 @@ class TamisApp(QMainWindow):
 
         self.toast = Toast(central)
 
+    def _build_options_menu(self):
+        menu = QMenu(self)
+        marks = menu.addMenu("Show Keep and Reject in Other Editors")
+        marks.setToolTipsVisible(True)
+        group = QActionGroup(self)
+        self.xmp_mark_actions = {}
+        for value, title in XMP_MARKS:
+            action = QAction(title, self, checkable=True, checked=value == self.xmp_marks)
+            action.triggered.connect(lambda _checked, value=value: self.set_xmp_marks(value))
+            group.addAction(action)
+            marks.addAction(action)
+            self.xmp_mark_actions[value] = action
+        return menu
+
     def _build_shortcuts(self):
         self.cull_shortcuts = []
 
@@ -342,6 +437,8 @@ class TamisApp(QMainWindow):
                     self.cull_shortcuts.append(shortcut)
 
         bind(["P", "1"], lambda: self.mark(KEEP))
+        bind(["Shift+P"], self.keep_one_of_burst)
+        bind(["B"], lambda: self.set_bursts(not self.show_bursts))
         bind(["X", "3"], lambda: self.mark(REJECT))
         bind(["U", "2", "Backspace"], lambda: self.mark(None))
         # Stars and colour labels follow Lightroom's 0–5 and 6–9, with ⌘/Ctrl
@@ -352,6 +449,7 @@ class TamisApp(QMainWindow):
             bind([f"Ctrl+{key}"], lambda label=label: self.set_label(label))
         bind([QKeySequence.StandardKey.Undo], self.undo)
         bind([QKeySequence.StandardKey.Open], self.choose_folder)
+        bind(["Ctrl+I"], self.import_photos)
         bind(["Ctrl+R", "F5"], self.refresh)
         bind(["G"], self.toggle_tab)
         bind(["C"], self.toggle_compare)
@@ -372,6 +470,7 @@ class TamisApp(QMainWindow):
         bind(["N"], self.next_unmarked, cull_only=True)
         bind(["K"], self.toggle_keeps_only, cull_only=True)
         bind(["Z"], self.toggle_zoom, cull_only=True)
+        bind(["F"], self.toggle_peaking, cull_only=True)
         bind(["Escape"], self.escape, cull_only=True)
         bind(["Return", "Enter"], self._confirm_crop, cull_only=True)
 
@@ -411,20 +510,32 @@ class TamisApp(QMainWindow):
             self.undo_stack.clear()
             self.crop_cache.clear()
             self.moved_keys.clear()
+            self.peaker.reset()
+            self.analyzer.open_folder(folder)
+        self.analyzer.apply_known(photos)
+        if self.show_bursts:
+            bursts.assign(photos)
+        photos.sort(key=SORT_KEYS[self.sort_order])
         self.xmp_dirty = {photo.path for photo in photos if photo.xmp_pending}  # try those again
+        if self.xmp_marks == "rating":
+            self.xmp_dirty |= {photo.path for photo in photos if photo.status == REJECT}
         self._end_compare(show=False)
         self.folder = folder
         self.current_row = -1
         if not same_folder:
             self._set_keeps_only(False)
         self.model.set_photos(photos)
+        self.model.analysis_changed()
+        self._request_analysis()
         self.settings.setValue("last_folder", folder)
         self.header.set_folder(folder)
         self._watch(folder)
         event = "folder_refreshed" if same_folder else "folder_opened"
 
         if not photos:
-            self.image_view.set_image(None, "No photos in this folder")
+            card = os.path.isdir(os.path.join(folder, "DCIM"))
+            hint = "\n\nA memory card? Copy its photos with Import…" if card else ""
+            self.image_view.set_image(None, f"No photos in this folder{hint}")
             self.header.set_counter("")
             self.plugins.emit(event, folder)
             return
@@ -534,7 +645,8 @@ class TamisApp(QMainWindow):
             try:
                 if directory not in listings:
                     listings[directory] = {name.lower(): name for name in os.listdir(directory)}
-                xmp.write(photo.files, photo.rating, photo.label, listings[directory])
+                rejected = self.xmp_marks == "rating" and photo.status == REJECT
+                xmp.write(photo.files, xmp.REJECTED_RATING if rejected else photo.rating, photo.label, listings[directory])
                 photo.xmp_pending = False
             except OSError as exc:
                 photo.xmp_pending = True
@@ -694,6 +806,7 @@ class TamisApp(QMainWindow):
         else:
             shown = [(self.image_view, self.current_row)]
         zoomed = self._zoomed()
+        self.peaker.begin()
         # Previews are downscaled, so while zoomed the photos load at full resolution.
         self.loader.ensure_full([self.model.photo(row).path for _, row in shown], load=zoomed)
         for view, row in shown:
@@ -714,14 +827,26 @@ class TamisApp(QMainWindow):
             view.set_image(None, f"Could not load {photo.name}\n\n{error}" if error else "Loading…", keep_zoom=True)
         view.set_status(photo.status)
         view.set_rating(photo.rating, photo.label)
-        view.set_info(summary(self.loader.info(photo.path)) if self.show_info else [])
+        view.set_info(self._info_lines(photo) if self.show_info else [])
         view.set_active(bool(self.compare_rows) and row == self.current_row)
+        shown = pixmap
         if zoomed and pixmap is not None:
             full = self.loader.full_pixmap(photo.path)
             if full is not None:
-                view.set_full_image(self._cropped(full, crop))
+                shown = self._cropped(full, crop)
+                view.set_full_image(shown)
             else:
                 view.set_full_loading(self.loader.full_error(photo.path) is None)
+        peaks = self.peaking and shown is not None and not self.cropping
+        view.set_overlay(self.peaker.overlay(shown) if peaks else None)
+
+    def _info_lines(self, photo):
+        lines = summary(self.loader.info(photo.path))
+        median = self.model.median_sharpness()
+        if photo.sharpness is not None and median is not None:
+            soft = " · looks soft" if self.model.is_soft(self.model.row_of(photo.path)) else ""
+            lines.append(f"Sharpness {photo.sharpness:.0f} · folder median {median:.0f}{soft}")
+        return lines
 
     def _shown_edit(self, photo):
         """The photo's edit, or the one being dragged."""
@@ -798,6 +923,15 @@ class TamisApp(QMainWindow):
             self._end_compare()
         else:
             self.image_view.reset_zoom()
+
+    def toggle_peaking(self):
+        self.peaking = not self.peaking
+        self.toast.show_message("Focus peaking on" if self.peaking else "Focus peaking off")
+        self._refresh_view()
+
+    def _on_peaking_ready(self):
+        if self.peaking:
+            self._refresh_view()
 
     def toggle_info(self):
         self.show_info = not self.show_info
@@ -1068,7 +1202,7 @@ class TamisApp(QMainWindow):
         in_gallery = self.tabs.currentIndex() == GALLERY_TAB
         first_visible = min(self.proxy.mapFromSource(self.model.index(row)).row() for row in rows)
         marked_row = self.current_row
-        self._push_undo(self.model.set_status(rows, status))
+        self._push_undo(self.set_marks(dict.fromkeys(rows, status)))
         if in_gallery:
             self._select_after_filtering(first_visible)
         elif status is not None and not self.compare_rows and self.current_row == marked_row:
@@ -1079,10 +1213,49 @@ class TamisApp(QMainWindow):
             else:
                 self._report_end()
 
+    def set_marks(self, statuses):
+        """Mark photos, `statuses` being {row: status}; returns the undo changes.
+
+        With colour labels passing on the marks, the photos get theirs too, unless the user gave them another.
+        """
+        changes = self.model.set_values("status", statuses)
+        if self.xmp_marks == "labels":
+            labels = {
+                row: MARK_LABELS.get(status) for row, status in statuses.items()
+                if self.model.photo(row).label in (None, *MARK_LABELS.values())
+            }
+            changes += self.model.set_values("label", labels)
+        return changes
+
+    def set_xmp_marks(self, value):
+        """How keep and reject reach other editors, for all photos from now on, starting with this folder's."""
+        was_rating = self.xmp_marks == "rating"
+        self.xmp_marks = value
+        self.settings.setValue("xmp_marks", value)
+        if value == "labels":
+            marked = {row: photo.status for row, photo in enumerate(self.model.photos) if photo.status}
+            self._push_undo(self.set_marks(marked))
+        if value == "rating" or was_rating:
+            self.xmp_dirty |= {photo.path for photo in self.model.photos if photo.status == REJECT}
+        self.session_timer.start()
+
+    def _on_marks_changed(self, paths):
+        if self.xmp_marks == "rating":
+            self.xmp_dirty.update(paths)
+
+    def _first_visible(self, rows):
+        return min(self.proxy.mapFromSource(self.model.index(row)).row() for row in rows)
+
+    def _reselect_in_gallery(self, proxy_row):
+        if self.tabs.currentIndex() == GALLERY_TAB:
+            self._select_after_filtering(max(0, proxy_row))
+
     def rate(self, stars):
         rows = self._target_rows()
         if rows:
+            first_visible = self._first_visible(rows)
             self._push_undo(self.model.set_field(rows, "rating", stars))
+            self._reselect_in_gallery(first_visible)  # a star filter may have hidden them
 
     def set_label(self, label):
         """Give `label` to the target photos, or remove it if they all have it already."""
@@ -1091,7 +1264,9 @@ class TamisApp(QMainWindow):
             return
         if all(self.model.photo(row).label == label for row in rows):
             label = None
+        first_visible = self._first_visible(rows)
         self._push_undo(self.model.set_field(rows, "label", label))
+        self._reselect_in_gallery(first_visible)  # a label filter may have hidden them
 
     def _report_end(self):
         unmarked = self.model.counts()[2]
@@ -1181,6 +1356,219 @@ class TamisApp(QMainWindow):
         self.grid.doItemsLayout()
         self.settings.setValue("grid_thumb_size", size)
 
+    # -- sorting, analysis and bursts ---------------------------------------
+
+    def set_sort_order(self, order):
+        self.sort_order = order
+        self.settings.setValue("sort_order", order)
+        self.gallery_toolbar.set_sort_order(order)
+        self._apply_order()
+        self._request_analysis()
+
+    def _apply_order(self):
+        """Sort the photos again, staying on the same ones."""
+        current = self.model.photo(self.current_row).path if self.current_row >= 0 else None
+        compared = [self.model.photo(row).path for row in self.compare_rows]
+        if not self.model.reorder(SORT_KEYS[self.sort_order]):
+            return
+        self.compare_rows = [self.model.row_of(path) for path in compared]
+        if current is None:
+            return
+        self.current_row = self.model.row_of(current)
+        if self.live_edit is None:
+            self.go_to(self.current_row)  # for the filmstrip, and what to prefetch
+        else:
+            self._update_counter()  # a slider is being dragged: go_to() would end that
+        if self.tabs.currentIndex() == GALLERY_TAB:
+            self.grid.scrollTo(self.grid.currentIndex())
+
+    def set_bursts(self, on):
+        self.show_bursts = on
+        self.settings.setValue("show_bursts", on)
+        self.gallery_toolbar.bursts_button.setChecked(on)
+        self.toast.show_message("Showing bursts" if on else "Not showing bursts")
+        self._show_analysis()
+        self._request_analysis()
+
+    def _on_focus_filter_changed(self, value):
+        self.proxy.set_focus(value)
+        self._request_analysis()
+
+    def _request_analysis(self):
+        """Ask for what the current options need, and nothing more: reading every file of a card takes a while."""
+        photos = self.model.photos
+        capture = photos if self.sort_order == "date" or self.show_bursts else []
+        if self.sort_order == "sharpness" or self.gallery_toolbar.focus_combo.currentData() != StatusFilterProxy.ALL:
+            images = photos
+        else:
+            images = [photo for photo in photos if photo.burst]  # to find their sharpest frame
+        self.analyzer.request(capture, images)
+
+    def _on_analyzed(self, path, results):
+        row = self.model.row_of(path)
+        if row == -1:
+            return
+        photo = self.model.photo(row)
+        for name, value in results.items():
+            setattr(photo, name, value)
+        if not self.analysis_timer.isActive():
+            self.analysis_timer.start()
+
+    def _show_analysis(self):
+        self.analysis_timer.stop()
+        if self.show_bursts:
+            bursts.assign(self.model.photos)
+        else:
+            for photo in self.model.photos:
+                photo.burst = None
+        self.model.analysis_changed()
+        self._refresh_view()
+
+    def _on_analysis_finished(self):
+        self._show_analysis()
+        self._apply_order()  # only now: the photos shouldn't keep moving while they are looked at
+        self._request_analysis()  # bursts are known now, whose frames get scored
+
+    def keep_one_of_burst(self):
+        """Keep the current photo and reject the rest of its burst, as one undo step."""
+        if self.current_row < 0:
+            return
+        current = self.model.photo(self.current_row)
+        if current.burst is None:
+            self.toast.show_message("This photo isn't part of a burst" if self.show_bursts else "Show bursts first (B)")
+            return
+        rows = [row for row, photo in enumerate(self.model.photos) if photo.burst and photo.burst.id == current.burst.id]
+        first_visible = self.proxy.mapFromSource(self.model.index(self.current_row)).row()
+        statuses = {row: KEEP if row == self.current_row else REJECT for row in rows}
+        self._push_undo(self.set_marks(statuses))
+        self.toast.show_message(f"Kept {current.name}, rejected {len(rows) - 1}")
+        if self.tabs.currentIndex() == GALLERY_TAB:
+            self._reselect_in_gallery(first_visible)
+        elif not self.compare_rows and (following := self._cull_neighbor(max(rows), 1)) is not None:
+            self.go_to(following)
+
+    # -- long jobs behind a dialog ------------------------------------------
+
+    def _run_work(self, title, text, count, work):
+        """Run `work(progress)` behind a modal progress dialog; returns its result, None if it broke down."""
+        progress = QProgressDialog(text, "Stop", 0, count, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        thread = WorkThread(work, self)
+        thread.progressed.connect(progress.setValue)
+        progress.canceled.connect(thread.stop)
+        loop = QEventLoop()
+        thread.finished.connect(loop.quit)
+        self.moving = True  # same guard as moving files: no folder change meanwhile
+        thread.start()
+        loop.exec()
+        self.moving = False
+        progress.close()
+        thread.deleteLater()
+        if thread.failure:
+            inform(self, title, escape(thread.failure))
+        return thread.result
+
+    # -- importing ----------------------------------------------------------
+
+    def import_photos(self):
+        """Copy photos from a memory card to a folder, and to a backup if asked, then open that folder."""
+        if self.moving:
+            return
+        dialog = ImportDialog(
+            self, find_card(), self.settings.value("import_destination", ""), self.settings.value("import_backup", "")
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.settings.setValue("import_destination", dialog.destination)
+        self.settings.setValue("import_backup", dialog.backup)
+        groups, destinations = dialog.groups, dialog.destinations
+        self._finish_crop(apply=True)
+        self.save_session()
+        result = self._run_work(
+            "Import photos", "Copying and verifying…", len(groups), lambda progress: execute_import(groups, destinations, progress)
+        )
+        if result is None:
+            return
+        if result.errors:
+            inform(
+                self,
+                "Some files were not imported",
+                f"Copied {result.copied} file(s). These failed, and their originals are untouched:",
+                details=result.errors,
+            )
+        if os.path.isdir(dialog.destination):
+            self.load_folder(dialog.destination, keep_state=True)
+        skipped = f", {result.skipped} already there" if result.skipped else ""
+        stopped = "Stopped: " if result.cancelled else ""
+        self.toast.show_message(f"{stopped}{result.copied} file(s) copied and verified{skipped}", 4000)
+
+    # -- the Trash ----------------------------------------------------------
+
+    def trash_rejects(self):
+        """Move the photos in _REJECTS to the system Trash, with their pairs and sidecars. Nothing is ever deleted."""
+        if not self.folder or self.moving:
+            return
+        self._finish_crop(apply=True)
+        self._end_compare()
+        self.save_session()
+        photos = plan_trash(self.model.photos)
+        waiting = sum(1 for photo in self.model.photos if photo.status == REJECT and photo.location != REJECT)
+        note = f"{waiting} rejected photo(s) aren't in {REJECT_DIR} yet: Process Files moves them there."
+        if not photos:
+            self.toast.show_message(note if waiting else f"No rejected photos in {REJECT_DIR}", 4000)
+            return
+        text = (
+            f"<b>{len(photos)}</b> rejected photo(s) in {REJECT_DIR}, <b>{size_text(trash_size(photos))}</b> with their "
+            "RAW+JPEG pairs and XMP sidecars, will go to the Trash. They can be put back from there until it is emptied."
+        )
+        if waiting:
+            text += f"<br><br>{note}"
+        if MessageDialog(self, "Move to the Trash", text, confirm_text="Move to Trash").exec() != QDialog.DialogCode.Accepted:
+            return
+        result = self._run_work(
+            "Move to the Trash", "Moving to the Trash…", len(photos), lambda progress: execute_trash(photos, progress)
+        )
+        if result is None:
+            return
+        if result.trashed:
+            self._forget_trashed(set(result.trashed))
+        if result.errors:
+            inform(
+                self,
+                "Some photos stayed where they are",
+                f"Moved {len(result.trashed)} of {len(photos)} photo(s) to the Trash. These could not be moved:",
+                details=result.errors,
+            )
+        else:
+            self.toast.show_message(f"Moved {len(result.trashed)} photo(s) to the Trash")
+
+    def _forget_trashed(self, gone):
+        """Photos are identified by path: nothing may keep referring to these."""
+        rows = range(self.model.rowCount())
+        current = self.model.photo(self.current_row) if self.current_row >= 0 else None
+        select = current.path if current else None
+        if current and current.path in gone:  # the next photo left, or else the one before
+            after = [r for r in rows if r > self.current_row and self.model.photo(r).path not in gone]
+            before = [r for r in rows if r < self.current_row and self.model.photo(r).path not in gone]
+            select = self.model.photo(after[0]).path if after else self.model.photo(before[-1]).path if before else None
+        files = [path for photo in self.model.photos if photo.path in gone for path in photo.files]
+        self.moved_keys.update(relative_key(self.folder, path) for path in files)
+        self.loader.forget(files)
+        for path in gone:
+            self.editor.forget(path)
+        self.xmp_dirty -= gone
+        self.undo_stack = [kept for changes in self.undo_stack if (kept := [c for c in changes if c[0] not in gone])]
+        self.current_row = -1
+        self.model.remove_paths(gone)
+        self.save_session()
+        with suppress(OSError):  # only goes if nothing is left in it
+            os.rmdir(os.path.join(self.folder, REJECT_DIR))
+        self.plugins.emit("photos_trashed", sorted(gone))
+        self.load_folder(self.folder, select=select and relative_key(self.folder, select), keep_state=True)
+
     # -- processing --------------------------------------------------------
 
     def process_files(self):
@@ -1196,7 +1584,7 @@ class TamisApp(QMainWindow):
         self._end_compare()
         self.save_session()
         moves = plan_moves(self.folder, self.model.photos)
-        exports = plan_exports(self.model.photos)
+        exports = self._plan_exports()
         no_jpeg = [photo.path for photo in without_export(self.model.photos)]
         export_dir = os.path.join(self.folder, EXPORT_DIR)
         removable, changed = rejected_exports(self.model.photos, export_dir)
@@ -1285,7 +1673,7 @@ class TamisApp(QMainWindow):
             )
 
         # Planned again: the photos may have just moved.
-        exports = plan_exports(self.model.photos)
+        exports = self._plan_exports()
         jobs = [(job.path, job.edit, self._lut_path(job.edit), job.name) for job in exports]
         thread = self._run_export(jobs, "Process files") if jobs else None
         if thread is not None and thread.errors:
@@ -1302,6 +1690,10 @@ class TamisApp(QMainWindow):
             if removed:
                 done.append(f"removed {len(removed)} export(s) of rejected photos")
             self.toast.show_message(", ".join(done))
+
+    def _plan_exports(self):
+        # By name, whatever the order shown: which photo gets `IMG_1 (1).jpg` must not depend on it.
+        return plan_exports(sorted(self.model.photos, key=by_name))
 
     def _move_files(self, moves):
         """Run the moves behind a modal progress dialog and update the model; returns the MoveResult."""
@@ -1336,6 +1728,8 @@ class TamisApp(QMainWindow):
         self.undo_stack.clear()  # undo entries refer to the old paths
         self.save_session()
         self._on_statuses_changed([])
+        self.analyzer.restart()  # what was running has the old paths; results are kept by file, so little is lost
+        self._request_analysis()
         self._watch(self.folder)  # _KEEPS / _REJECTS may have just been created
         if self.current_row >= 0:
             self.header.set_folder(self.folder, self.model.photo(self.current_row).display_name)
@@ -1362,6 +1756,8 @@ class TamisApp(QMainWindow):
             self.settings.setValue("last_file", relative_key(self.folder, self.model.photo(self.current_row).path))
         self.loader.shutdown()
         self.editor.shutdown()
+        self.peaker.shutdown()
+        self.analyzer.shutdown()
         super().closeEvent(event)
 
     def resizeEvent(self, event):

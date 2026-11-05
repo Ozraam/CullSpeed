@@ -154,6 +154,15 @@ def image_to_array(image):
     return rows[:, :width * 4].reshape(height, width, 4)[..., :3].copy()
 
 
+def gray_array(image):
+    """QImage -> uint8 array h×w of its luminance (a copy)."""
+    image = image.convertToFormat(QImage.Format.Format_Grayscale8)
+    pointer = image.constBits()
+    pointer.setsize(image.sizeInBytes())
+    rows = np.frombuffer(pointer, dtype=np.uint8).reshape(image.height(), image.bytesPerLine())
+    return rows[:, :image.width()].copy()
+
+
 def array_to_image(array):
     """uint8 h×w×3 (or h×w) array -> QImage that owns its pixels."""
     return _from_array(array)

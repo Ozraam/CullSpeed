@@ -1,3 +1,5 @@
+import os
+import shutil
 from functools import partial
 
 from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, pyqtSignal
@@ -6,12 +8,15 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListView,
     QPlainTextEdit,
     QPushButton,
@@ -37,9 +42,30 @@ from .constants import (
     LABEL_COLORS,
     REJECT,
 )
-from .models import EDITED_ROLE, LABEL_ROLE, RATING_ROLE, STATUS_ROLE, THUMBNAIL_FAILED_ROLE
+from .fileops import import_size, plan_import
+from .models import (
+    BURST_ROLE,
+    EDITED_ROLE,
+    LABEL_ROLE,
+    RATING_ROLE,
+    SOFT_ROLE,
+    STATUS_ROLE,
+    THUMBNAIL_FAILED_ROLE,
+    StatusFilterProxy,
+)
 
 STATUS_COLORS = {KEEP: QColor(COLOR_KEEP), REJECT: QColor(COLOR_REJECT)}
+BURST_COLORS = ("#f59e0b", "#22d3ee")  # alternating, so that bursts side by side stay apart
+
+
+def size_text(size):
+    """`1.2 GB`."""
+    amount = float(size)
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if amount < 1000:
+            return f"{amount:.0f} {unit}" if unit == "bytes" else f"{amount:.1f} {unit}"
+        amount /= 1000
+    return f"{amount:.1f} TB"
 
 
 def draw_status_badge(painter, center, radius, status):
@@ -183,7 +209,33 @@ class ThumbnailDelegate(QStyledItemDelegate):
             _fill_pill(painter, strip, QColor(0, 0, 0, 150))
             painter.setPen(QColor(COLOR_STAR))
             painter.drawText(strip, Qt.AlignmentFlag.AlignCenter, text)
+        self._draw_analysis(painter, option, index, target)
         painter.restore()
+
+    def _draw_analysis(self, painter, option, index, target):
+        """A bar across the frames of a burst, and a pill with the frame's place in it and what focus suggests."""
+        burst = index.data(BURST_ROLE)
+        soft = index.data(SOFT_ROLE)
+        if burst:
+            bar = QRectF(option.rect.left(), option.rect.top(), option.rect.width(), 3)
+            painter.fillRect(bar, QColor(BURST_COLORS[burst.id % len(BURST_COLORS)]))
+        parts = []
+        if burst:
+            parts.append(f"{'◎ ' if burst.sharpest else ''}{burst.position + 1}/{burst.size}")
+        if soft:
+            parts.append("soft")
+        if not parts:
+            return
+        font = option.font
+        font.setPointSizeF(max(7.0, font.pointSizeF() * 0.8))
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        text = " · ".join(parts)
+        pill = QRectF(0, 0, metrics.horizontalAdvance(text) + 10, metrics.height() + 2)
+        pill.moveCenter(QPointF(target.center().x(), target.top() + pill.height() / 2 + 3))
+        _fill_pill(painter, pill, QColor(0, 0, 0, 170))
+        painter.setPen(QColor(COLOR_KEEP if burst and burst.sharpest else COLOR_TEXT))
+        painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
 
 
 def make_thumbnail_view(model, delegate, horizontal):
@@ -248,6 +300,7 @@ class ImageView(QWidget):
         self._source_key = None  # cacheKey() of the pixmap last given to set_image()
         self._native = None  # size of the photo itself, which a preview is smaller than
         self._scaled = None
+        self._overlay = None  # focus peaking, drawn over the photo at whatever size it is shown
         self._message = ""
         self._status = None
         self._rating = 0
@@ -286,6 +339,11 @@ class ImageView(QWidget):
             self._native = pixmap.size()
             self._scaled = None
         self.update()
+
+    def set_overlay(self, pixmap):
+        if pixmap is not self._overlay:
+            self._overlay = pixmap
+            self.update()
 
     def set_full_loading(self, loading):
         if loading != self._full_loading:
@@ -558,6 +616,8 @@ class ImageView(QWidget):
             target = self._zoom_rect()
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
+            if self._overlay is not None:
+                painter.drawPixmap(target, self._overlay, QRectF(self._overlay.rect()))
         else:
             fit = self._fit_rect()
             dpr = self.devicePixelRatioF()
@@ -570,6 +630,9 @@ class ImageView(QWidget):
                 self._scaled.setDevicePixelRatio(dpr)
             painter.drawPixmap(fit.topLeft(), self._scaled)
             target = QRectF(fit)
+            if self._overlay is not None:
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                painter.drawPixmap(target, self._overlay, QRectF(self._overlay.rect()))
             if self._crop is not None:
                 self._draw_crop(painter, fit)
                 return
@@ -734,7 +797,9 @@ class CompareView(QWidget):
 
 class HeaderBar(QFrame):
     open_folder_requested = pyqtSignal()
+    import_requested = pyqtSignal()
     refresh_requested = pyqtSignal()
+    trash_requested = pyqtSignal()
     process_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -755,17 +820,27 @@ class HeaderBar(QFrame):
         btn_open = QPushButton("Open Folder…")
         btn_open.clicked.connect(self.open_folder_requested)
 
+        btn_import = QPushButton("Import…")
+        import_key = QKeySequence("Ctrl+I").toString(QKeySequence.SequenceFormat.NativeText)
+        btn_import.setToolTip(f"Copy photos from a memory card ({import_key})")
+        btn_import.clicked.connect(self.import_requested)
+
         btn_refresh = QPushButton("Refresh")
         refresh_key = QKeySequence("Ctrl+R").toString(QKeySequence.SequenceFormat.NativeText)
         btn_refresh.setToolTip(f"Look for new photos in the folder ({refresh_key})")
         btn_refresh.clicked.connect(self.refresh_requested)
+
+        self.btn_trash = QPushButton("Trash Rejects…")
+        self.btn_trash.setToolTip("Move the photos in _REJECTS to the system Trash")
+        self.btn_trash.setEnabled(False)
+        self.btn_trash.clicked.connect(self.trash_requested)
 
         self.btn_process = QPushButton("Process Files…")
         self.btn_process.setObjectName("Primary")
         self.btn_process.setEnabled(False)
         self.btn_process.clicked.connect(self.process_requested)
 
-        for button in (btn_open, btn_refresh, self.btn_process):
+        for button in (btn_open, btn_import, btn_refresh, self.btn_trash, self.btn_process):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         layout = QHBoxLayout(self)
@@ -775,7 +850,9 @@ class HeaderBar(QFrame):
         layout.addWidget(self.lbl_folder, 1)
         layout.addWidget(self.lbl_counter)
         layout.addWidget(btn_open)
+        layout.addWidget(btn_import)
         layout.addWidget(btn_refresh)
+        layout.addWidget(self.btn_trash)
         layout.addWidget(self.btn_process)
         self._folder_text = ""
 
@@ -790,6 +867,7 @@ class HeaderBar(QFrame):
 
     def set_can_process(self, enabled):
         self.btn_process.setEnabled(enabled)
+        self.btn_trash.setEnabled(enabled)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -813,13 +891,16 @@ class StatsBar(QFrame):
         self.lbl_reject.setObjectName("RejectCount")
         self.lbl_unmarked = QLabel()
         self.lbl_unmarked.setObjectName("Muted")
+        self.lbl_analysis = QLabel()
+        self.lbl_analysis.setObjectName("Muted")
 
         native = QKeySequence.SequenceFormat.NativeText
         undo = QKeySequence(QKeySequence.StandardKey.Undo).toString(native)
         mod = QKeySequence("Ctrl+1").toString(native)[:-1]  # "⌘" on macOS, "Ctrl+" elsewhere
         hint = QLabel(
             f"P keep · X reject · U unmark · {mod}1–5 stars · {mod}6–9 label · N next unmarked · K keeps only · "
-            f"C compare · E edit · R crop · {mod}C / {mod}V copy / paste edit · Z zoom · I info · G gallery · {undo} undo"
+            f"B bursts · ⇧P keep one of a burst · C compare · E edit · R crop · {mod}C / {mod}V copy / paste edit · "
+            f"Z zoom · F focus peaking · I info · G gallery · {undo} undo"
         )
         hint.setToolTip(hint.text())
         # May be cut off in a narrow window rather than force the window wider.
@@ -833,6 +914,7 @@ class StatsBar(QFrame):
         layout.addWidget(self.lbl_keep)
         layout.addWidget(self.lbl_reject)
         layout.addWidget(self.lbl_unmarked)
+        layout.addWidget(self.lbl_analysis)
         layout.addWidget(hint, 1)
         self.update_counts(0, 0, 0)
 
@@ -841,19 +923,35 @@ class StatsBar(QFrame):
         self.lbl_reject.setText(f"Rejects  {rejects}")
         self.lbl_unmarked.setText(f"Unmarked  {unmarked}")
 
+    def set_analysis_progress(self, done, total):
+        self.lbl_analysis.setText(f"Analysing {done} / {total}" if total else "")
+
 
 class GalleryToolbar(QFrame):
     filter_changed = pyqtSignal(str)
+    rating_changed = pyqtSignal(int)  # minimum stars
+    labels_changed = pyqtSignal(list)  # colour labels to show; empty: all
+    focus_changed = pyqtSignal(str)
+    sort_changed = pyqtSignal(str)
+    bursts_toggled = pyqtSignal(bool)
     size_changed = pyqtSignal(int)
 
     FILTERS = (("all", "All"), ("unmarked", "Unmarked"), (KEEP, "Keeps"), (REJECT, "Rejects"))
+    FOCUS = ((StatusFilterProxy.ALL, "Any focus"), (StatusFilterProxy.SHARP, "Looks sharp"), (StatusFilterProxy.SOFT, "Looks soft"))
+    SORTS = (("name", "Sort by name"), ("date", "Sort by date"), ("sharpness", "Sort by sharpness"))
 
-    def __init__(self, initial_size, parent=None):
+    def __init__(self, initial_size, sort_order="name", bursts=False, parent=None):
         super().__init__(parent)
         self.setObjectName("GalleryToolbar")
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 6, 12, 6)
+        rows = QVBoxLayout(self)
+        rows.setContentsMargins(12, 6, 12, 6)
+        rows.setSpacing(6)
+        layout = QHBoxLayout()
         layout.setSpacing(6)
+        settings = QHBoxLayout()
+        settings.setSpacing(6)
+        rows.addLayout(layout)
+        rows.addLayout(settings)
 
         self._buttons = {}
         group = QButtonGroup(self)
@@ -868,18 +966,78 @@ class GalleryToolbar(QFrame):
             layout.addWidget(button)
             self._buttons[key] = (button, label)
         self._buttons["all"][0].setChecked(True)
+        layout.addSpacing(10)
 
+        self.rating_combo = self._combo([(stars, f"{'★' * stars} or more" if stars else "Any stars") for stars in range(6)])
+        self.rating_combo.setToolTip("Only show photos with at least this many stars")
+        self.rating_combo.currentIndexChanged.connect(lambda _index: self.rating_changed.emit(self.rating_combo.currentData()))
+        layout.addWidget(self.rating_combo)
+
+        self.label_buttons = {}
+        for label, color in LABEL_COLORS.items():
+            button = QPushButton()
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setFixedSize(18, 18)
+            button.setToolTip(f"Only show photos labelled {label.lower()} (several can be on)")
+            button.setStyleSheet(
+                f"QPushButton {{ background: {color}; border: 2px solid transparent; border-radius: 9px; padding: 0; }}"
+                f"QPushButton:hover {{ background: {color}; border-color: {COLOR_MUTED}; }}"
+                f"QPushButton:checked {{ background: {color}; border-color: white; }}"
+            )
+            button.clicked.connect(lambda _checked: self.labels_changed.emit(self.checked_labels()))
+            layout.addWidget(button)
+            self.label_buttons[label] = button
+        layout.addSpacing(10)
+
+        self.focus_combo = self._combo(self.FOCUS)
+        self.focus_combo.setToolTip("A suggestion, from comparing each photo's sharpness with the folder's median")
+        self.focus_combo.currentIndexChanged.connect(lambda _index: self.focus_changed.emit(self.focus_combo.currentData()))
+        layout.addWidget(self.focus_combo)
         layout.addStretch()
+
+        self.sort_combo = self._combo(self.SORTS)
+        self.sort_combo.setCurrentIndex(max(0, self.sort_combo.findData(sort_order)))
+        self.sort_combo.currentIndexChanged.connect(lambda _index: self.sort_changed.emit(self.sort_combo.currentData()))
+        settings.addWidget(self.sort_combo)
+
+        self.bursts_button = QPushButton("Bursts")
+        self.bursts_button.setObjectName("Chip")
+        self.bursts_button.setCheckable(True)
+        self.bursts_button.setChecked(bursts)
+        self.bursts_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.bursts_button.setToolTip("Group the shots taken in quick succession (B)")
+        self.bursts_button.clicked.connect(self.bursts_toggled)
+        settings.addWidget(self.bursts_button)
+
+        settings.addStretch()
         size_label = QLabel("Size")
         size_label.setObjectName("Muted")
-        layout.addWidget(size_label)
+        settings.addWidget(size_label)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(90, 240)
         self.slider.setValue(initial_size)
         self.slider.setFixedWidth(140)
         self.slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.slider.valueChanged.connect(self.size_changed)
-        layout.addWidget(self.slider)
+        settings.addWidget(self.slider)
+
+    @staticmethod
+    def _combo(items):
+        combo = QComboBox()
+        combo.setObjectName("Compact")
+        combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        for value, text in items:
+            combo.addItem(text, value)
+        return combo
+
+    def set_sort_order(self, order):
+        self.sort_combo.blockSignals(True)  # the app is what is telling
+        self.sort_combo.setCurrentIndex(max(0, self.sort_combo.findData(order)))
+        self.sort_combo.blockSignals(False)
+
+    def checked_labels(self):
+        return [label for label, button in self.label_buttons.items() if button.isChecked()]
 
     def update_counts(self, total, keeps, rejects, unmarked):
         counts = {"all": total, "unmarked": unmarked, KEEP: keeps, REJECT: rejects}
@@ -983,6 +1141,103 @@ class ProcessDialog(MessageDialog):
     @property
     def export_requested(self):
         return self.export_check is not None and self.export_check.isChecked()
+
+
+class ImportDialog(MessageDialog):
+    """Asks what to copy where. Accepted, `groups`, `destinations` and `destination` say what was chosen."""
+
+    def __init__(self, parent, source="", destination="", backup=""):
+        super().__init__(parent, "Import photos", "", confirm_text="Import")
+        self.groups = []
+        self.size = 0
+        self.setMinimumWidth(560)
+        self.source_edit = QLineEdit(source)
+        self.destination_edit = QLineEdit(destination)
+        self.backup_check = QCheckBox("Also copy to a backup folder")
+        self.backup_check.setChecked(bool(backup))
+        self.backup_edit = QLineEdit(backup)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        rows = (
+            (QLabel("From"), self.source_edit, "From the card or folder"),
+            (QLabel("To"), self.destination_edit, "Destination folder"),
+            (self.backup_check, self.backup_edit, "Backup folder"),
+        )
+        for row, (label, edit, title) in enumerate(rows):
+            browse = QPushButton("Choose…")
+            browse.clicked.connect(partial(self._browse, edit, title))
+            grid.addWidget(label, row, 0)
+            grid.addWidget(edit, row, 1)
+            grid.addWidget(browse, row, 2)
+        layout = self.layout()
+        layout.insertLayout(1, grid)  # under the heading, above the summary
+
+        self.source_edit.editingFinished.connect(self._scan)
+        self.destination_edit.textChanged.connect(self._update)
+        self.backup_edit.textChanged.connect(self._update)
+        self.backup_check.toggled.connect(self._update)
+        self._scan()
+
+    @property
+    def destination(self):
+        return self.destination_edit.text().strip()
+
+    @property
+    def backup(self):
+        return self.backup_edit.text().strip() if self.backup_check.isChecked() else ""
+
+    @property
+    def destinations(self):
+        return [self.destination, *([self.backup] if self.backup else [])]
+
+    def _browse(self, edit, title):
+        folder = QFileDialog.getExistingDirectory(self, title, edit.text() or os.path.expanduser("~"))
+        if folder:
+            edit.setText(folder)
+            if edit is self.source_edit:
+                self._scan()
+            elif edit is self.backup_edit:
+                self.backup_check.setChecked(True)
+
+    def _scan(self):
+        source = self.source_edit.text().strip()
+        self.groups = plan_import(source) if source and os.path.isdir(source) else []
+        self.size = import_size(self.groups)  # once: the summary is worked out at every key pressed
+        self._update()
+
+    def _problem(self):
+        """Why importing can't go ahead, None if it can."""
+        source = self.source_edit.text().strip()
+        if not self.groups:
+            return "No photos found there." if source else "Choose where to import from."
+        if not self.destination:
+            return "Choose a destination folder."
+        if self.backup_check.isChecked() and not self.backup:
+            return "Choose a backup folder."
+        if self.backup and os.path.abspath(self.backup) == os.path.abspath(self.destination):
+            return "The backup folder must not be the destination."
+        for target in self.destinations:
+            inside = os.path.commonpath([os.path.abspath(source), os.path.abspath(target)]) == os.path.abspath(source)
+            if inside:
+                return f"{target} is inside the folder being imported."
+            existing = target
+            while existing and not os.path.isdir(existing) and existing != os.path.dirname(existing):
+                existing = os.path.dirname(existing)
+            if os.path.isdir(existing) and shutil.disk_usage(existing).free < self.size:
+                return f"Not enough free space in {target}."
+        return None
+
+    def _update(self):
+        problem = self._problem()
+        self.confirm_button.setEnabled(problem is None)
+        if problem:
+            self.body.setText(problem)
+        else:
+            self.body.setText(
+                f"<b>{len(self.groups)}</b> photo(s), {size_text(self.size)}. Every copy is read back and "
+                "compared with the original, files already there are skipped, and nothing on the card changes."
+            )
 
 
 def inform(parent, title, text, details=None):

@@ -72,3 +72,14 @@ def test_write_updates_existing_sidecars_whatever_their_case(tmp_path):
 
     assert xmp.parse((tmp_path / "IMG.JPG.XMP").read_text()) == (4, None)
     assert sorted(os.listdir(tmp_path)) == ["IMG.JPG.XMP", "IMG.jpg"]
+
+
+def test_read_says_a_rejected_rating_is_no_number_of_stars(tmp_path):
+    raw = str(tmp_path / "IMG.CR2")
+    open(raw, "w").close()
+    xmp.write([raw], xmp.REJECTED_RATING, "Red", names(tmp_path))
+    assert xmp.read([raw], names(tmp_path)) == (None, "Red")
+    assert xmp.parse((tmp_path / "IMG.xmp").read_text()) == (0, "Red")
+
+    xmp.write([raw], 2, "Red", names(tmp_path))
+    assert xmp.read([raw], names(tmp_path)) == (2, "Red")

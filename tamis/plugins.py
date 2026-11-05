@@ -30,6 +30,7 @@ EVENTS = frozenset({
     "photos_edited",     # ([photos]) marks, ratings, labels or edits changed, undo included
     "files_moved",       # ({old path: new path}) Process Files moved photos and their companions
     "photos_exported",   # ([paths]) JPEGs were written to _EXPORTS
+    "photos_trashed",    # ([paths]) photos of _REJECTS were moved to the Trash
     "closing",           # () the window is closing; changes made now are still saved
 })
 
@@ -165,7 +166,8 @@ class PluginApi:
         """Mark as tamis.KEEP, tamis.REJECT, or None to unmark."""
         if status not in (KEEP, REJECT, None):
             raise ValueError(f"Invalid status: {status!r}")
-        self._set(photos, "status", status)
+        rows = self._rows(photos)
+        self.window._push_undo(self.window.set_marks(dict.fromkeys(rows, status)))
 
     def set_rating(self, photos, rating):
         """Give 0 to 5 stars."""

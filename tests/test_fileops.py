@@ -3,6 +3,7 @@ import shutil
 
 import pytest
 
+from tamis import fileops
 from tamis.constants import KEEP, KEEP_DIR, REJECT, REJECT_DIR
 from tamis.fileops import (
     copy_export,
@@ -355,3 +356,146 @@ def test_export_already_gone_is_ignored(tmp_path):
     photo, path = exported_photo(tmp_path)
     os.remove(path)
     assert rejected_exports([photo], str(tmp_path / "_EXPORTS")) == ([], [])
+
+
+# -- the Trash ---------------------------------------------------------------
+
+def _trash_into(monkeypatch, tmp_path, fail_on=None):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    def to_trash(path):
+        if os.path.basename(path) == fail_on:
+            raise OSError(5, "refused")
+        location = str(bin_dir / os.path.basename(path))
+        os.replace(path, location)
+        return location
+
+    monkeypatch.setattr(fileops, "_to_trash", to_trash)
+    return bin_dir
+
+
+def _rejected_pair(tmp_path):
+    folder = tmp_path / "_REJECTS"
+    folder.mkdir()
+    for name in ("IMG.CR2", "IMG.JPG", "IMG.xmp"):
+        (folder / name).write_bytes(b"12345")
+    return Photo(str(folder / "IMG.CR2"), REJECT, REJECT, companions=[str(folder / "IMG.JPG")])
+
+
+def test_the_real_trash_reports_what_it_cannot_do(tmp_path):
+    with pytest.raises(OSError):
+        fileops._to_trash(str(tmp_path / "missing.jpg"))
+
+
+def test_plan_trash_only_takes_rejects_in_rejects():
+    photos = [Photo("a", REJECT, REJECT), Photo("b", KEEP, REJECT), Photo("c", REJECT, None), Photo("d", None, None)]
+    assert [p.path for p in fileops.plan_trash(photos)] == ["a"]
+
+
+def test_trash_takes_companions_and_sidecars(tmp_path, monkeypatch):
+    bin_dir = _trash_into(monkeypatch, tmp_path)
+    photo = _rejected_pair(tmp_path)
+    assert fileops.trash_size([photo]) == 15
+    result = fileops.execute_trash([photo])
+    assert result.trashed == [photo.path] and not result.errors
+    assert sorted(os.listdir(bin_dir)) == ["IMG.CR2", "IMG.JPG", "IMG.xmp"]
+
+
+def test_trash_is_all_or_nothing_for_a_photo(tmp_path, monkeypatch):
+    bin_dir = _trash_into(monkeypatch, tmp_path, fail_on="IMG.JPG")
+    photo = _rejected_pair(tmp_path)
+    result = fileops.execute_trash([photo])
+    assert result.trashed == [] and "IMG.CR2" in result.errors[0]
+    assert sorted(os.listdir(tmp_path / "_REJECTS")) == ["IMG.CR2", "IMG.JPG", "IMG.xmp"]
+    assert os.listdir(bin_dir) == []
+
+
+def test_trash_can_be_stopped(tmp_path, monkeypatch):
+    _trash_into(monkeypatch, tmp_path)
+    photo = _rejected_pair(tmp_path)
+    result = fileops.execute_trash([photo], lambda done: False)
+    assert result.cancelled and not result.trashed
+    assert os.path.exists(photo.path)
+
+
+def test_a_missing_folder_is_reported_not_raised(tmp_path, monkeypatch):
+    _trash_into(monkeypatch, tmp_path)
+    result = fileops.execute_trash([Photo(str(tmp_path / "gone" / "IMG.jpg"), REJECT, REJECT)])
+    assert len(result.errors) == 1
+
+
+# -- importing ---------------------------------------------------------------
+
+def _card(tmp_path):
+    first = tmp_path / "card" / "DCIM" / "100CANON"
+    second = tmp_path / "card" / "DCIM" / "101CANON"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "IMG_1.CR2").write_bytes(b"raw one")
+    (first / "IMG_1.JPG").write_bytes(b"jpeg one")
+    (first / "IMG_1.xmp").write_bytes(b"sidecar")
+    (first / "._IMG_1.JPG").write_bytes(b"apple double")
+    (first / "notes.txt").write_bytes(b"not a photo")
+    (second / "IMG_1.CR2").write_bytes(b"raw two")  # the camera's counter rolled over
+    hidden = tmp_path / "card" / ".Trashes"
+    hidden.mkdir()
+    (hidden / "old.jpg").write_bytes(b"deleted")
+    return tmp_path / "card"
+
+
+def test_plan_import_finds_photos_in_sub_folders_and_keeps_pairs_together(tmp_path):
+    card = _card(tmp_path)
+    groups = fileops.plan_import(str(card))
+    assert [[os.path.basename(path) for path in group] for group in groups] == [["IMG_1.CR2", "IMG_1.JPG"], ["IMG_1.CR2"]]
+    assert fileops.import_size(groups) == 22
+
+
+def test_import_renames_whole_groups_never_overwrites_and_leaves_the_card_alone(tmp_path):
+    card = _card(tmp_path)
+    before = {path: os.path.getsize(path) for group in fileops.plan_import(str(card)) for path in group}
+    dest = tmp_path / "shoot"
+    result = fileops.execute_import(fileops.plan_import(str(card)), [str(dest)])
+    assert not result.errors
+    assert sorted(os.listdir(dest)) == ["IMG_1 (1).CR2", "IMG_1.CR2", "IMG_1.JPG", "IMG_1.xmp"]
+    assert (dest / "IMG_1.CR2").read_bytes() == b"raw one"
+    assert (dest / "IMG_1 (1).CR2").read_bytes() == b"raw two"
+    assert {path: os.path.getsize(path) for path in before} == before
+
+
+def test_importing_again_only_brings_what_is_new(tmp_path):
+    card = _card(tmp_path)
+    dest = tmp_path / "shoot"
+    fileops.execute_import(fileops.plan_import(str(card)), [str(dest)])
+    (dest / "IMG_1.xmp").write_bytes(b"edited since")
+    (dest / "_KEEPS").mkdir()
+    os.replace(dest / "IMG_1.JPG", dest / "_KEEPS" / "IMG_1.JPG")  # sorted since
+
+    result = fileops.execute_import(fileops.plan_import(str(card)), [str(dest)])
+    assert result.copied == 0 and result.skipped == 4
+    assert (dest / "IMG_1.xmp").read_bytes() == b"edited since"
+    assert not (dest / "IMG_1.JPG").exists()
+
+
+def test_import_writes_every_destination(tmp_path):
+    card = _card(tmp_path)
+    result = fileops.execute_import(fileops.plan_import(str(card)), [str(tmp_path / "a"), str(tmp_path / "b")])
+    assert result.copied == 8
+    assert sorted(os.listdir(tmp_path / "a")) == sorted(os.listdir(tmp_path / "b"))
+
+
+def test_a_copy_that_differs_is_reported_and_removed(tmp_path, monkeypatch):
+    card = _card(tmp_path)
+    real_digest = fileops._digest
+    monkeypatch.setattr(fileops, "_digest", lambda path: "wrong" if ".tmp" in path else real_digest(path))
+    dest = tmp_path / "shoot"
+    result = fileops.execute_import(fileops.plan_import(str(card)), [str(dest)])
+    assert result.errors and result.copied == 0
+    assert os.listdir(dest) == []
+
+
+def test_find_card_looks_for_a_dcim_folder(tmp_path):
+    (tmp_path / "Macintosh HD").mkdir()
+    (tmp_path / "EOS_DIGITAL" / "DCIM").mkdir(parents=True)
+    assert fileops.find_card([str(tmp_path)]) == str(tmp_path / "EOS_DIGITAL")
+    assert fileops.find_card([str(tmp_path / "Macintosh HD")]) == ""

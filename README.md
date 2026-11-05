@@ -7,8 +7,16 @@ Tamis is a PyQt6 desktop application for rapidly reviewing and triaging large ph
 - **Cull** view: the current photo fitted to the window with a filmstrip; next/previous photos are prefetched so stepping through is instant. Double-click or `Z` zooms to 1:1 (the photo is loaded at full resolution for focus checking), drag to pan. The zoom and its position stay as you move to the next photo, so a burst can be checked at the same spot.
 - **Keeps only**: `K` (or the chip in the Cull tab's corner) limits the filmstrip and all navigation to the photos marked keep, for a second pass. Rejecting or unmarking a photo moves on to the next keep; picking another photo in the Gallery, or `N`, ends the filter.
 - **Compare**: `C` shows photos side by side (the current and next one, or the 2–4 selected in the Gallery) with shared zoom and pan. `←`/`→` pick the photo that marks apply to.
-- **Gallery** view: thumbnail grid with multi-select marking, filters (All / Unmarked / Keeps / Rejects) and adjustable thumbnail size.
+- **Gallery** view: thumbnail grid with multi-select marking and adjustable thumbnail size. Filters combine: status (All / Unmarked / Keeps / Rejects), minimum stars, colour labels (several can be on) and focus, and follow changes live.
+- **Sorting**: by name, with numbers compared as numbers (`IMG_9` before `IMG_10`), by capture date (with sub-seconds; a file without a date uses its modification time) or by sharpness. The choice is remembered, and dates are read in the background, so the order changes once they are all known.
+- **Bursts** (`B`, or the chip in the Gallery): shots less than 2 seconds apart are grouped in the filmstrip and Gallery with a coloured bar and their place in the burst (`2/5`), unless the picture changes completely. `⇧P` keeps the current photo and rejects the rest of its burst, as one undo step.
+- **Sharpness**, computed in the background when something needs it (the sort, the focus filter, bursts): the variance of the Laplacian in the sharpest regions of a photo. It is only a suggestion: `◎` marks the sharpest frame of a burst and `soft` a photo far below the folder's median, and marks stay yours. Scores are compared within a folder, and the thresholds haven't been tuned on many real shoots yet.
+- **Focus peaking** (`F` in the Cull view): highlights the sharp edges of what is shown, edits, crop and 1:1 zoom included.
+- **Import** (`⌘I`): finds the photos in the sub-folders of a memory card, copies them with their sidecars to a folder and optionally to a backup, reads every copy back to compare it with the original, then opens the folder. Nothing on the card changes, files never overwrite others (`IMG_1 (1).CR2`), and those already imported are skipped, even if sorted into `_KEEPS` or `_REJECTS` since.
+- **Trash Rejects**: moves the photos in `_REJECTS` that are still marked reject to the system Trash, with their pairs and sidecars, after a confirmation with their count and size. Nothing is ever deleted: a photo that can't go to the Trash stays where it is, whole.
+- Thumbnails are kept on disk (up to 512 MB, in the app's cache folder), so reopening a folder is fast. They are found by a file's path, size and modification time, so a changed or moved file just gets a new one.
 - **Star ratings and colour labels**, written to XMP sidecars (`xmp:Rating`, `xmp:Label`) so Lightroom, Bridge, Capture One and darktable see them. Existing sidecars are edited in place, touching only those two properties; new ones are only created for RAWs (`IMG.xmp`).
+- **Keep and reject in other editors**, off by default (**Options ▾ > Show Keep and Reject in Other Editors**), as no flag is common to them. *Rejected as rating −1* writes the `xmp:Rating="-1"` that darktable and Bridge read as rejected; the photo keeps its stars in Tamis, but other editors no longer see them. *Keep green, reject red* gives photos those colour labels, for editors that read `xmp:Label` such as Lightroom, whose own flags are not in XMP at all. A label you gave a photo yourself stays, except that unmarking clears a green or red one. As with ratings, new sidecars are only created for RAWs.
 - **RAW+JPEG pairs** (same name, same folder) are culled as one photo and always move together.
 - **Shooting info** (exposure, aperture, ISO, focal length, camera, lens, date) read from EXIF; `I` shows or hides it.
 - **Quick edits** (`E`): exposure, contrast, highlights, shadows, white balance (temperature / tint), saturation, film simulation LUTs with strength, grain and vignette. Edits are non-destructive (stored in the session, originals untouched), previewed live, can be copied and pasted across photos, and exported as full-size JPEGs to `_EXPORTS`. RAWs are edited from LibRaw's 16-bit linear development, not from their embedded JPEG.
@@ -53,6 +61,10 @@ tamis                  # or: python Tamis.py, python -m tamis
 | Copy / paste edit (paste applies to the selection) | `⌘C` / `⌘V` or `⌘⇧C` / `⌘⇧V` (`Ctrl+C` / `V`, `Ctrl+Shift+C` / `V`) |
 | Export JPEG (current or selected photos: edited ones and those without a JPEG are rendered, others copied) | `⌘⇧E` / `Ctrl+Shift+E` |
 | Refresh the folder | `⌘R` / `Ctrl+R`, `F5` |
+| Show bursts, on / off | `B` |
+| Keep this photo, reject the rest of its burst | `⇧P` / `Shift+P` |
+| Focus peaking, on / off (Cull view) | `F` |
+| Import from a memory card | `⌘I` / `Ctrl+I` |
 | Switch Cull ↔ Gallery | `G` (Enter or double-click in the gallery opens a photo) |
 | Open folder | `⌘O` / `Ctrl+O` |
 
@@ -103,6 +115,7 @@ def register(tamis):
 | `photos_edited` | `[photos]` | Marks, ratings, labels or edits changed, undo included |
 | `files_moved` | `{old path: new path}` | Process Files moved photos. Photos are identified by path, so a plugin keeping data per photo must follow this |
 | `photos_exported` | `[paths]` | JPEGs were written to `_EXPORTS` |
+| `photos_trashed` | `[paths]` | Photos of `_REJECTS` were moved to the Trash |
 | `closing` | | The window is closing; changes made now are still saved |
 
 Good to know:
@@ -126,6 +139,10 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `tamis/app.py` | Main window: navigation, marking, processing |
 | `tamis/models.py` | Photo list model, gallery filter, folder scan and session file |
 | `tamis/loader.py` | Background preview/thumbnail loading, caching and prefetching |
+| `tamis/thumbcache.py` | Thumbnails on disk |
+| `tamis/analysis.py` | Background capture dates, sharpness scores and perceptual hashes, remembered on disk |
+| `tamis/bursts.py` | Grouping shots taken in quick succession |
+| `tamis/peaking.py` | Focus peaking overlay and its background worker |
 | `tamis/imaging.py` | Thread-safe decoding of RAW and standard images (QImage only) |
 | `tamis/exif.py` | Minimal EXIF reader for shooting info |
 | `tamis/xmp.py` | Reading and editing ratings and labels in XMP sidecars |
@@ -134,7 +151,7 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `tamis/lut.py` | HaldCLUT / `.cube` loading and fast 256³ lookup tables |
 | `tamis/editing.py` | Developing photos for editing, background previews, JPEG export |
 | `tamis/editpanel.py` | The edit panel |
-| `tamis/fileops.py` | Planning and executing file moves |
+| `tamis/fileops.py` | Planning and executing file moves, the Trash and imports |
 | `tamis/plugins.py` | Loading plugins, the API they receive and the Plugins menu |
 | `tamis/widgets.py` | Image and compare views, thumbnail delegate, bars, toast and dialogs |
 | `tamis/theme.py` | Dark palette and stylesheet |

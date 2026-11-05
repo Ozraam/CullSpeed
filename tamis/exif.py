@@ -5,7 +5,9 @@ A small reader for the TIFF structure EXIF is stored in, found in JPEG
 (through its embedded JPEG) and Canon CR3 (CMT1/CMT2 boxes). Anything
 else, or anything malformed, simply gives no info.
 """
+import os
 import struct
+from datetime import datetime
 
 # EXIF sits near the start of every format handled here.
 _READ_LIMIT = 1 << 20
@@ -17,12 +19,17 @@ _EXPOSURE_TIME = 0x829A
 _F_NUMBER = 0x829D
 _ISO = 0x8827
 _DATE_TIME_ORIGINAL = 0x9003
+_SUB_SEC_ORIGINAL = 0x9291
 _FOCAL_LENGTH = 0x920A
 _LENS_MODEL = 0xA434
-_WANTED = {_MAKE, _MODEL, _EXIF_IFD, _EXPOSURE_TIME, _F_NUMBER, _ISO, _DATE_TIME_ORIGINAL, _FOCAL_LENGTH, _LENS_MODEL}
+_WANTED = {
+    _MAKE, _MODEL, _EXIF_IFD, _EXPOSURE_TIME, _F_NUMBER, _ISO, _DATE_TIME_ORIGINAL, _SUB_SEC_ORIGINAL, _FOCAL_LENGTH, _LENS_MODEL,
+}
 
 # TIFF field type -> bytes per value
 _TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8}
+
+_EPOCH = datetime(1970, 1, 1)
 
 
 def read_info(path):
@@ -33,6 +40,36 @@ def read_info(path):
         return _describe(_find_tags(data))
     except (OSError, struct.error, ValueError, IndexError, ZeroDivisionError):
         return {}
+
+
+def _exif_time(path):
+    """Seconds of EXIF's DateTimeOriginal, with its fraction, None if the file has no valid one."""
+    try:
+        with open(path, 'rb') as file:
+            tags = _find_tags(file.read(_READ_LIMIT))
+        moment = datetime.strptime(tags[_DATE_TIME_ORIGINAL][:19], "%Y:%m:%d %H:%M:%S")
+    except (OSError, struct.error, ValueError, IndexError, ZeroDivisionError, KeyError, TypeError):
+        return None
+    fraction = tags.get(_SUB_SEC_ORIGINAL)
+    digits = fraction if isinstance(fraction, str) and fraction.isdecimal() else "0"
+    return (moment - _EPOCH).total_seconds() + float(f"0.{digits}")
+
+
+def capture_time(paths):
+    """When the photo made of `paths` (a RAW and its JPEG, say) was taken, in seconds; None if none can be read.
+
+    EXIF has no time zone, so this is the camera's local time, which is what
+    comparing photos needs. A file without a date falls back on its
+    modification time, in local time likewise.
+    """
+    for path in paths:
+        moment = _exif_time(path)
+        if moment is not None:
+            return moment
+    try:
+        return (datetime.fromtimestamp(os.path.getmtime(paths[0])) - _EPOCH).total_seconds()
+    except (OSError, ValueError, OverflowError):
+        return None
 
 
 def summary(info):
