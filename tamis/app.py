@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+from contextlib import suppress
 from html import escape
 
 from PyQt6.QtCore import (
@@ -49,7 +50,18 @@ from .constants import (
 from .editing import EditRenderer, export_photo
 from .editpanel import EditPanel
 from .exif import summary
-from .fileops import copy_export, execute_moves, is_jpeg, jpeg_file, plan_exports, plan_moves
+from .fileops import (
+    copy_export,
+    execute_moves,
+    export_record,
+    is_jpeg,
+    jpeg_file,
+    plan_exports,
+    plan_moves,
+    rejected_exports,
+    remove_rejected_exports,
+    without_export,
+)
 from .loader import ImageLoader
 from .models import PhotoModel, StatusFilterProxy, photo_files, relative_key, save_session, scan_folder
 from .plugins import PhotoInfo, PluginManager
@@ -58,6 +70,7 @@ from .widgets import (
     GalleryToolbar,
     HeaderBar,
     ImageView,
+    MessageDialog,
     ProcessDialog,
     StatsBar,
     ThumbnailDelegate,
@@ -70,6 +83,13 @@ CULL_TAB, GALLERY_TAB = 0, 1
 FILMSTRIP_THUMB_SIZE = 64
 COMPARE_MAX = 4
 CROP_CACHE_SIZE = 8  # cropped previews and full-resolution images kept
+
+
+def _names(paths, limit=5):
+    """`a.jpg, b.jpg and 3 more`, as rich text."""
+    names = [escape(os.path.basename(path)) for path in paths]
+    extra = f" and {len(names) - limit} more" if len(names) > limit else ""
+    return ", ".join(names[:limit]) + extra
 
 
 class MoveThread(QThread):
@@ -105,6 +125,7 @@ class ExportThread(QThread):
         self.jobs = jobs
         self.dest_dir = dest_dir
         self.exported = []
+        self.sources = {}  # exported path -> the job's path
         self.errors = []
         self._stop = threading.Event()
 
@@ -119,9 +140,11 @@ class ExportThread(QThread):
             self.progressed.emit(done)
             try:
                 if edit or not is_jpeg(path):
-                    self.exported.append(export_photo(path, edit, lut_path, self.dest_dir, tables, name=name))
+                    dest = export_photo(path, edit, lut_path, self.dest_dir, tables, name=name)
                 else:
-                    self.exported.append(copy_export(path, self.dest_dir, name))
+                    dest = copy_export(path, self.dest_dir, name)
+                self.exported.append(dest)
+                self.sources[dest] = path
             except Exception as exc:  # one bad photo must not stop the others
                 self.errors.append(f"{os.path.basename(path)}: {exc}")
         self.progressed.emit(len(self.jobs))
@@ -419,6 +442,7 @@ class TamisApp(QMainWindow):
         """Pick up photos added to or removed from the folder, keeping marks and the current photo."""
         if not self.folder or self.moving:
             return
+        self.loader.retry_failed_thumbnails()
         try:
             files = photo_files(self.folder)
         except OSError:
@@ -734,6 +758,10 @@ class TamisApp(QMainWindow):
     def _lut_path(self, edit):
         return self.luts.get(edit.get("lut")) if edit.get("lut") else None
 
+    def _lut_missing(self, edit):
+        """Whether the edit uses a film simulation that isn't in the LUT folder: rendering it would skip the look."""
+        return bool(edit.get("lut")) and edit["lut"] not in self.luts
+
     def _is_shown(self, path):
         return any(self.model.photo(row).path == path for row in self._shown_rows())
 
@@ -914,10 +942,20 @@ class TamisApp(QMainWindow):
         if not rows or self.moving:
             return
         self.save_session()
-        jobs = [
-            (p.path if p.edit else jpeg_file(p) or p.path, p.edit, self._lut_path(p.edit), None)
-            for p in (self.model.photo(row) for row in rows)
-        ]
+        photos = [self.model.photo(row) for row in rows]
+        missing = [photo.name for photo in photos if self._lut_missing(photo.edit)]
+        if missing:
+            dialog = MessageDialog(
+                self,
+                "Film simulation not found",
+                f"{len(missing)} photo(s) use a film simulation that isn't in the LUT folder, "
+                "and would be exported without it:",
+                confirm_text="Export anyway",
+                details=missing,
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+        jobs = [(p.path if p.edit else jpeg_file(p) or p.path, p.edit, self._lut_path(p.edit), None) for p in photos]
         thread = self._run_export(jobs, "Export JPEG")
         if thread.errors:
             inform(
@@ -947,9 +985,27 @@ class TamisApp(QMainWindow):
         self.moving = False
         progress.close()
         thread.deleteLater()
+        self._record_exports(thread)
         if thread.exported:
             self.plugins.emit("photos_exported", list(thread.exported))
         return thread
+
+    def _record_exports(self, thread):
+        """Remember which photo each export came from, so that rejecting it later can remove the export."""
+        if not thread.exported:
+            return
+        written = {os.path.basename(dest).lower() for dest in thread.exported}
+        owners = {path: photo for photo in self.model.photos for path in photo.files}
+        for photo in self.model.photos:  # a file that was replaced is no longer the export of its former photo
+            if photo.exports:
+                photo.exports = [record for record in photo.exports if record["name"].lower() not in written]
+        for dest in thread.exported:
+            photo = owners.get(thread.sources[dest])
+            # A rejected photo exported on request stays: the user just asked for that file.
+            if photo is not None and photo.status != REJECT:
+                with suppress(OSError):  # gone already: nothing to remember
+                    photo.exports = [*photo.exports, export_record(dest)]
+        self.save_session()
 
     # -- compare -----------------------------------------------------------
 
@@ -1131,7 +1187,8 @@ class TamisApp(QMainWindow):
         """Move photos to the folder of their mark, then fill _EXPORTS if asked to.
 
         Edited photos are exported as JPEGs; unedited ones get their JPEG
-        (if they have one) copied. Rejected photos are not exported.
+        (if they have one) copied. Rejected photos are not exported, and
+        what was exported of them earlier is removed.
         """
         if not self.folder:
             return
@@ -1140,8 +1197,12 @@ class TamisApp(QMainWindow):
         self.save_session()
         moves = plan_moves(self.folder, self.model.photos)
         exports = plan_exports(self.model.photos)
-        if not moves and not exports:
-            self.toast.show_message("Everything is already sorted")
+        no_jpeg = [photo.path for photo in without_export(self.model.photos)]
+        export_dir = os.path.join(self.folder, EXPORT_DIR)
+        removable, changed = rejected_exports(self.model.photos, export_dir)
+        if not moves and not exports and not removable:
+            note = f" · {len(no_jpeg)} photo(s) have no JPEG to export" if no_jpeg else ""
+            self.toast.show_message(f"Everything is already sorted{note}")
             return
 
         keeps = sum(1 for m in moves if m.status == KEEP)
@@ -1159,17 +1220,33 @@ class TamisApp(QMainWindow):
         if moves:
             lines.append("<br>RAW+JPEG pairs and XMP sidecars move together. Existing files are never overwritten.")
 
+        no_jpeg_line = f"{len(no_jpeg)} photo(s) have no JPEG and won't be exported: {_names(no_jpeg)}"
         export_label = export_text = None
-        if exports:
+        if exports or removable:
             edited = sum(1 for job in exports if job.edit)
-            export_label = f"Export {len(exports)} photo(s) to {EXPORT_DIR}"
+            export_label = f"Export {len(exports)} photo(s) to {EXPORT_DIR}" if exports else f"Update {EXPORT_DIR}"
             details = []
             if edited:
                 details.append(f"&nbsp;&nbsp;• {edited} edited → rendered as JPEG")
             if len(exports) - edited:
                 details.append(f"&nbsp;&nbsp;• {len(exports) - edited} without edits → JPEG copied")
-            details.append("Earlier exports of the same photos are replaced.")
+            if removable:
+                details.append(f"&nbsp;&nbsp;• {len(removable)} earlier export(s) of rejected photos → removed")
+            if exports:
+                details.append("Earlier exports of the same photos are replaced.")
+            if changed:
+                details.append(f"{len(changed)} export(s) of rejected photos changed since and stay: {_names(changed)}")
+            if no_jpeg:
+                details.append(no_jpeg_line)
+            missing = [job.path for job in exports if self._lut_missing(job.edit)]
+            if missing:
+                details.append(
+                    f"<b>{len(missing)} photo(s) use a film simulation that isn't in the LUT folder "
+                    f"and would be exported without it:</b> {_names(missing)}"
+                )
             export_text = "<br>".join(details)
+        elif no_jpeg:
+            lines.append(no_jpeg_line)
 
         dialog = ProcessDialog(self, "<br>".join(lines), export_label, export_text)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1185,7 +1262,7 @@ class TamisApp(QMainWindow):
                     f"Moved {moved} of {len(moves)} photo(s). These failed:",
                     details=result.errors,
                 )
-            elif result.cancelled:
+            if result.cancelled:
                 self.toast.show_message(f"Stopped after moving {moved} photo(s)")
                 return
             summary_text = f"Moved {moved} photo(s)"
@@ -1196,11 +1273,22 @@ class TamisApp(QMainWindow):
             self.toast.show_message(summary_text)
             return
 
+        # First, since a photo about to be exported may take over the name of a removed export.
+        removed, remove_errors = remove_rejected_exports(self.model.photos, export_dir)
+        self.save_session()
+        if remove_errors:
+            inform(
+                self,
+                "Some exports were not removed",
+                f"These exports of rejected photos are still in {EXPORT_DIR}:",
+                details=remove_errors,
+            )
+
         # Planned again: the photos may have just moved.
         exports = plan_exports(self.model.photos)
         jobs = [(job.path, job.edit, self._lut_path(job.edit), job.name) for job in exports]
-        thread = self._run_export(jobs, "Process files")
-        if thread.errors:
+        thread = self._run_export(jobs, "Process files") if jobs else None
+        if thread is not None and thread.errors:
             inform(
                 self,
                 "Some photos were not exported",
@@ -1208,7 +1296,12 @@ class TamisApp(QMainWindow):
                 details=thread.errors,
             )
         else:
-            self.toast.show_message(f"{summary_text}, exported {len(thread.exported)} to {EXPORT_DIR}")
+            done = [summary_text]
+            if thread is not None:
+                done.append(f"exported {len(thread.exported)} to {EXPORT_DIR}")
+            if removed:
+                done.append(f"removed {len(removed)} export(s) of rejected photos")
+            self.toast.show_message(", ".join(done))
 
     def _move_files(self, moves):
         """Run the moves behind a modal progress dialog and update the model; returns the MoveResult."""

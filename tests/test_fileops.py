@@ -1,7 +1,18 @@
 import os
+import shutil
+
+import pytest
 
 from tamis.constants import KEEP, KEEP_DIR, REJECT, REJECT_DIR
-from tamis.fileops import execute_moves, plan_moves
+from tamis.fileops import (
+    copy_export,
+    execute_moves,
+    export_record,
+    plan_moves,
+    rejected_exports,
+    remove_rejected_exports,
+    without_export,
+)
 from tamis.models import Photo
 
 
@@ -202,3 +213,145 @@ def test_copy_export_without_a_name_picks_a_free_one(tmp_path):
     assert os.path.basename(dest) == "a (1).jpg"
     assert read(dest) == "new"
     assert read(tmp_path / "_EXPORTS" / "a.jpg") == "earlier"
+
+
+def failing_move(monkeypatch, *failing):
+    """shutil.move that fails for the sources in `failing`, as with a file locked by another app."""
+    real_move = shutil.move
+
+    def move(source, dest):
+        if os.path.basename(source) in failing:
+            raise PermissionError(13, "Permission denied", source)
+        return real_move(source, dest)
+
+    monkeypatch.setattr("tamis.fileops.shutil.move", move)
+
+
+def test_failed_move_keeps_the_pair_together(tmp_path, monkeypatch):
+    folder = str(tmp_path)
+    raw = touch(tmp_path / "IMG.CR2")
+    jpg = touch(tmp_path / "IMG.JPG")
+    touch(tmp_path / "IMG.xmp")
+    other = touch(tmp_path / "other.jpg")
+    failing_move(monkeypatch, "IMG.JPG")
+
+    result = process(folder, [Photo(raw, KEEP, companions=[jpg]), Photo(other, KEEP)])
+
+    assert len(result.errors) == 1 and result.errors[0].startswith("IMG.CR2: Permission denied")
+    assert list(result.moved) == [other]
+    assert sorted(listing(folder)) == sorted(["IMG.CR2", "IMG.JPG", "IMG.xmp", KEEP_DIR])
+    assert listing(folder, KEEP_DIR) == ["other.jpg"]
+
+
+def test_failed_move_frees_the_names_it_had_taken(tmp_path, monkeypatch):
+    folder = str(tmp_path)
+    raw = touch(tmp_path / "IMG.CR2")
+    jpg = touch(tmp_path / "IMG.JPG")
+    same_name = touch(tmp_path / REJECT_DIR / "IMG.CR2")
+    failing_move(monkeypatch, "IMG.JPG")
+
+    result = process(folder, [Photo(raw, KEEP, companions=[jpg]), Photo(same_name, KEEP, REJECT)])
+
+    assert result.moved[same_name] == os.path.join(folder, KEEP_DIR, "IMG.CR2")
+
+
+def test_file_that_cannot_go_back_is_reported_and_followed(tmp_path, monkeypatch):
+    folder = str(tmp_path)
+    raw = touch(tmp_path / "IMG.CR2")
+    jpg = touch(tmp_path / "IMG.JPG")
+    real_move = shutil.move
+    moved_out = os.path.join(folder, KEEP_DIR, "IMG.CR2")
+
+    def move(source, dest):
+        if os.path.basename(source) == "IMG.JPG" or source == moved_out:
+            raise PermissionError(13, "Permission denied", source)
+        return real_move(source, dest)
+
+    monkeypatch.setattr("tamis.fileops.shutil.move", move)
+
+    result = process(folder, [Photo(raw, KEEP, companions=[jpg])])
+
+    assert "could not be moved back: IMG.CR2" in result.errors[0]
+    assert result.moved == {raw: moved_out}
+    assert os.path.exists(moved_out)
+
+
+def test_without_export_lists_what_plan_exports_leaves_out(tmp_path):
+    folder = str(tmp_path)
+    left_out = Photo(f"{folder}/a.CR2", KEEP)
+    png = Photo(f"{folder}/b.png")
+    photos = [
+        left_out,
+        png,
+        Photo(f"{folder}/c.CR2", KEEP, companions=[f"{folder}/c.JPG"]),
+        Photo(f"{folder}/d.CR2", KEEP, edit={"exposure": 1.0}),
+        Photo(f"{folder}/e.CR2", REJECT),
+    ]
+    assert without_export(photos) == [left_out, png]
+
+
+def test_failed_copy_leaves_the_earlier_export_alone(tmp_path, monkeypatch):
+    source = touch(tmp_path / "a.jpg", "new")
+    earlier = touch(tmp_path / "_EXPORTS" / "a.jpg", "earlier")
+
+    def truncated_copy(_source, dest):
+        with open(dest, "w") as file:
+            file.write("ne")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("tamis.fileops.shutil.copy2", truncated_copy)
+
+    with pytest.raises(OSError):
+        copy_export(source, str(tmp_path / "_EXPORTS"), "a.jpg")
+
+    assert read(earlier) == "earlier"
+    assert os.listdir(tmp_path / "_EXPORTS") == ["a.jpg"]
+
+
+def exported_photo(tmp_path, name="a.jpg", content="export", status=REJECT):
+    path = touch(tmp_path / "_EXPORTS" / name, content)
+    return Photo(str(tmp_path / name), status, exports=[export_record(path)]), path
+
+
+def test_exports_of_rejected_photos_are_removed(tmp_path):
+    rejected, path = exported_photo(tmp_path)
+    kept, kept_path = exported_photo(tmp_path, "b.jpg", status=KEEP)
+    users_own = touch(tmp_path / "_EXPORTS" / "c.jpg")
+    photos = [rejected, kept, Photo(str(tmp_path / "c.jpg"), REJECT)]  # c.jpg never was an export of that photo
+
+    removed, errors = remove_rejected_exports(photos, str(tmp_path / "_EXPORTS"))
+
+    assert (removed, errors) == ([path], [])
+    assert not os.path.exists(path)
+    assert os.path.exists(kept_path) and os.path.exists(users_own)
+    assert rejected.exports == [] and kept.exports
+
+
+def test_export_changed_since_is_not_removed(tmp_path):
+    photo, path = exported_photo(tmp_path)
+    touch(path, "retouched by hand")
+
+    dest_dir = str(tmp_path / "_EXPORTS")
+    assert rejected_exports([photo], dest_dir) == ([], [path])
+    assert remove_rejected_exports([photo], dest_dir) == ([], [])
+    assert read(path) == "retouched by hand"
+    assert photo.exports == []  # no longer ours: not reported again
+
+
+def test_export_that_cannot_be_removed_is_remembered(tmp_path, monkeypatch):
+    photo, path = exported_photo(tmp_path)
+
+    def locked(_path):
+        raise PermissionError(13, "Permission denied", _path)
+
+    monkeypatch.setattr("tamis.fileops.os.remove", locked)
+    removed, errors = remove_rejected_exports([photo], str(tmp_path / "_EXPORTS"))
+
+    assert removed == [] and errors == ["a.jpg: Permission denied"]
+    assert photo.exports
+
+
+def test_export_already_gone_is_ignored(tmp_path):
+    photo, path = exported_photo(tmp_path)
+    os.remove(path)
+    assert rejected_exports([photo], str(tmp_path / "_EXPORTS")) == ([], [])

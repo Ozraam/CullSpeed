@@ -469,3 +469,25 @@ def test_removing_a_rating_is_remembered_until_the_sidecar_has_it(tmp_path):
     photo.rating, photo.xmp_pending = 0, True
     save_session(folder, [photo])
     assert scan_folder(folder)[0].rating == 0
+
+
+def test_exports_are_saved_and_survive_a_reload(tmp_path):
+    path = tmp_path / "a.jpg"
+    path.write_text("x")
+    record = {"name": "a.jpg", "size": 1, "mtime": 2}
+    save_session(str(tmp_path), [Photo(str(path), exports=[record])])
+    assert load_session(str(tmp_path))["a.jpg"]["exports"] == [record]
+    assert scan_folder(str(tmp_path))[0].exports == [record]
+
+
+def test_session_exports_only_name_files_directly_in_exports(tmp_path):
+    (tmp_path / SESSION_FILENAME).write_text(json.dumps({
+        "a.jpg": {"status": "reject", "exports": [
+            {"name": "../IMG.CR2", "size": 1, "mtime": 2},
+            {"name": "..", "size": 1, "mtime": 2},
+            {"name": "b.jpg", "size": "1", "mtime": 2},
+            "c.jpg",
+            {"name": "ok.jpg", "size": 1, "mtime": 2},
+        ]},
+    }))
+    assert [record["name"] for record in load_session(str(tmp_path))["a.jpg"]["exports"]] == ["ok.jpg"]

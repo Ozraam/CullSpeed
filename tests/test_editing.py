@@ -1,6 +1,7 @@
 import os
 
 import numpy as np
+import pytest
 from PyQt6.QtGui import QColor, QImage
 
 from tamis import editing
@@ -38,3 +39,24 @@ def test_export_writes_an_edited_full_size_jpeg(tmp_path):
     assert exported.shape == (600, 800, 3)
     assert exported.mean() / 257 > 130  # +1 EV over the 100 grey original
     assert abs(image_to_array(QImage(again)).mean() / 257 - 100) < 2  # no edit: unchanged
+
+
+def test_failed_export_leaves_the_earlier_one_alone(tmp_path, monkeypatch):
+    source = jpeg(tmp_path / "a.jpg")
+    exports = tmp_path / "_EXPORTS"
+    exports.mkdir()
+    (exports / "a.jpg").write_text("earlier")
+
+    class FullDisk:
+        def save(self, path, _format, _quality):
+            with open(path, "w") as file:
+                file.write("trunc")
+            return False
+
+    monkeypatch.setattr(editing, "array_to_image", lambda _pixels: FullDisk())
+
+    with pytest.raises(editing.EditError):
+        editing.export_photo(source, {"exposure": 1.0}, None, str(exports), name="a.jpg")
+
+    assert (exports / "a.jpg").read_text() == "earlier"
+    assert os.listdir(exports) == ["a.jpg"]
