@@ -37,7 +37,7 @@ _FIELD_ROLES = {
     "status": [STATUS_ROLE, FILTER_ROLE],
     "rating": [RATING_ROLE, FILTER_ROLE],
     "label": [LABEL_ROLE, FILTER_ROLE],
-    "edit": [EDITED_ROLE],
+    "edit": [EDITED_ROLE, Qt.ItemDataRole.DecorationRole],
 }
 
 # Below this share of the folder's median sharpness, a photo is suggested as soft.
@@ -399,8 +399,20 @@ class PhotoModel(QAbstractListModel):
         # Kept up to date on every change so per-keystroke updates stay O(1).
         self._keeps = self._rejects = self._unsorted = 0
         self._median_sharpness = None
+        self._edit_thumbnails = None  # see set_edit_thumbnails()
+        self._lut_path = None
         loader.thumbnail_loaded.connect(self._on_thumbnail_loaded)
         loader.thumbnail_failed.connect(self._on_thumbnail_loaded)
+
+    def set_edit_thumbnails(self, thumbnails, lut_path):
+        """Show edited photos through `thumbnails` (an EditThumbnails); `lut_path(edit)` finds an edit's LUT file."""
+        self._edit_thumbnails, self._lut_path = thumbnails, lut_path
+        thumbnails.ready.connect(self._on_thumbnail_loaded)
+
+    def thumbnails_changed(self):
+        """What thumbnails show changed for every photo (another LUT folder): paint them again."""
+        if self._photos:
+            self.dataChanged.emit(self.index(0), self.index(len(self._photos) - 1), [Qt.ItemDataRole.DecorationRole])
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self._photos)
@@ -412,6 +424,10 @@ class PhotoModel(QAbstractListModel):
         if role == Qt.ItemDataRole.DisplayRole:
             return photo.display_name
         if role == Qt.ItemDataRole.DecorationRole:
+            if photo.edit and self._edit_thumbnails is not None:
+                edited = self._edit_thumbnails.pixmap(photo.path, photo.edit, self._lut_path(photo.edit))
+                if edited is not None:
+                    return edited
             return self._loader.thumbnail(photo.path)
         if role == Qt.ItemDataRole.ToolTipRole:
             return "\n".join(photo.files)

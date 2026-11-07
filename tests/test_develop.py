@@ -98,3 +98,80 @@ def test_decode_table_inverts_encode():
     values = np.arange(256)
     round_trip = (encode(develop.DECODE_8BIT[values]) * 255 + 0.5).astype(int)
     assert np.array_equal(round_trip, values)
+
+
+# -- framing -------------------------------------------------------------------
+
+def test_clean_keeps_quarter_turns_and_bounds_straightening():
+    assert develop.clean({"rotate": 90, "straighten": 2.34}) == {"rotate": 90, "straighten": 2.3}
+    assert develop.clean({"rotate": 450}) == {"rotate": 90}
+    assert develop.clean({"rotate": -90}) == {"rotate": 270}
+    assert develop.clean({"rotate": 360, "straighten": 0}) == {}
+    assert develop.clean({"rotate": 45}) == {}
+    assert develop.clean({"rotate": True, "straighten": "a"}) == {}
+    assert develop.clean({"straighten": 99}) == {"straighten": 15.0}
+
+
+def test_look_and_framing_split_an_edit():
+    edit = {"contrast": 10, "lut": "a.cube", "crop": [0, 0, 0.5, 0.5], "rotate": 90, "straighten": 1.5}
+    assert develop.look(edit) == {"contrast": 10, "lut": "a.cube"}
+    assert develop.framing(edit) == {"crop": [0, 0, 0.5, 0.5], "rotate": 90, "straighten": 1.5}
+
+
+def test_turn_array_goes_clockwise():
+    pixels = np.array([[1, 2], [3, 4]])
+    assert develop.turn_array(pixels, 90).tolist() == [[3, 1], [4, 2]]
+    assert develop.turn_array(pixels, 180).tolist() == [[4, 3], [2, 1]]
+    assert develop.turn_array(pixels, 270).tolist() == [[2, 4], [1, 3]]
+    assert develop.turn_array(pixels, 0) is pixels
+
+
+@pytest.mark.parametrize("degrees", [90, -90])
+def test_a_crop_stays_on_the_same_part_of_the_picture_when_turned(degrees):
+    pixels = np.arange(40 * 60).reshape(40, 60)
+    edit = {"crop": [0.25, 0.5, 0.5, 0.75], "contrast": 5}
+    turned = develop.turned(edit, degrees)
+    assert turned["rotate"] == degrees % 360 and turned["contrast"] == 5
+    before = develop.crop_array(pixels, edit["crop"])
+    after = develop.crop_array(develop.turn_array(pixels, turned["rotate"]), turned["crop"])
+    assert sorted(before.ravel()) == sorted(after.ravel())
+
+
+def test_four_turns_are_no_edit_at_all():
+    edit = {}
+    for _ in range(4):
+        edit = develop.turned(edit, 90)
+    assert edit == {}
+
+
+def test_framed_size_follows_turns_and_crop():
+    assert develop.framed_size(200, 300, {}) == (200, 300)
+    assert develop.framed_size(200, 300, {"rotate": 90}) == (300, 200)
+    assert develop.framed_size(200, 300, {"rotate": 180}) == (200, 300)
+    assert develop.framed_size(200, 300, {"rotate": 90, "crop": [0, 0, 0.5, 0.5]}) == (150, 100)
+
+
+def test_straightening_turns_clockwise_and_leaves_no_empty_corner():
+    pixels = np.zeros((101, 201, 3), dtype=np.float32)
+    pixels[50, :] = 1.0  # a horizontal line through the centre
+    out = develop.straighten_rows(pixels, 5.0, 0, 101)
+    assert out.shape == pixels.shape
+    rows = out[..., 0].argmax(axis=0)
+    assert rows[150] > 50 > rows[50]  # clockwise: the right goes down, the left up
+    assert out[50, 100, 0] == pytest.approx(1.0)  # the centre stays
+
+    # The corners of the frame still fall inside the picture: nothing is read past its edges.
+    height, width = pixels.shape[:2]
+    zoom = develop.straighten_zoom(height, width, 15.0)
+    angle = np.radians(15.0)
+    for dx, dy in ((width / 2, height / 2), (width / 2, -height / 2)):
+        assert abs(np.cos(angle) * dx + np.sin(angle) * dy) / zoom <= width / 2 + 1e-6
+        assert abs(np.cos(angle) * dy - np.sin(angle) * dx) / zoom <= height / 2 + 1e-6
+
+
+def test_straightening_in_strips_gives_the_same_result_and_keeps_the_type():
+    pixels = (np.random.default_rng(1).random((60, 90, 3)) * 65535).astype(np.uint16)
+    whole = develop.straighten_rows(pixels, -3.2, 0, 60)
+    strips = np.concatenate([develop.straighten_rows(pixels, -3.2, top, top + 20) for top in range(0, 60, 20)])
+    assert whole.dtype == np.uint16
+    assert np.array_equal(whole, strips)

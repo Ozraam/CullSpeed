@@ -301,6 +301,9 @@ class ImageView(QWidget):
         self._native = None  # size of the photo itself, which a preview is smaller than
         self._scaled = None
         self._overlay = None  # focus peaking, drawn over the photo at whatever size it is shown
+        self._clipping = None  # clipped pixels, drawn the same way, under focus peaking
+        self._clipping_tag = None  # the photo it is of
+        self._note = ""  # a word over the photo, like "Before"
         self._message = ""
         self._status = None
         self._rating = 0
@@ -343,6 +346,20 @@ class ImageView(QWidget):
     def set_overlay(self, pixmap):
         if pixmap is not self._overlay:
             self._overlay = pixmap
+            self.update()
+
+    def set_clipping(self, pixmap, tag=None):
+        """`tag`: what the overlay is of. While a new one is made (None), that of the same `tag` stays up."""
+        if pixmap is None and tag is not None and tag == self._clipping_tag:
+            return
+        self._clipping_tag = tag
+        if pixmap is not self._clipping:
+            self._clipping = pixmap
+            self.update()
+
+    def set_note(self, text):
+        if text != self._note:
+            self._note = text
             self.update()
 
     def set_full_loading(self, loading):
@@ -616,8 +633,7 @@ class ImageView(QWidget):
             target = self._zoom_rect()
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
-            if self._overlay is not None:
-                painter.drawPixmap(target, self._overlay, QRectF(self._overlay.rect()))
+            self._draw_overlays(painter, target)
         else:
             fit = self._fit_rect()
             dpr = self.devicePixelRatioF()
@@ -630,9 +646,7 @@ class ImageView(QWidget):
                 self._scaled.setDevicePixelRatio(dpr)
             painter.drawPixmap(fit.topLeft(), self._scaled)
             target = QRectF(fit)
-            if self._overlay is not None:
-                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-                painter.drawPixmap(target, self._overlay, QRectF(self._overlay.rect()))
+            self._draw_overlays(painter, target)
             if self._crop is not None:
                 self._draw_crop(painter, fit)
                 return
@@ -648,9 +662,17 @@ class ImageView(QWidget):
             self._draw_rating_pill(painter, visible)
         if self._info:
             self._draw_info(painter, visible)
-        if self._zoomed and self._full_loading:
-            self._draw_loading_note(painter)
+        if self._note:
+            self._draw_note(painter, self._note)
+        elif self._zoomed and self._full_loading:
+            self._draw_note(painter, "Loading full resolution…")
         self._draw_active(painter)
+
+    def _draw_overlays(self, painter, target):
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        for overlay in (self._clipping, self._overlay):
+            if overlay is not None:
+                painter.drawPixmap(target, overlay, QRectF(overlay.rect()))
 
     def _draw_status_pill(self, painter, rect, color):
         painter.save()
@@ -714,8 +736,7 @@ class ImageView(QWidget):
             )
         painter.restore()
 
-    def _draw_loading_note(self, painter):
-        text = "Loading full resolution…"
+    def _draw_note(self, painter, text):
         metrics = QFontMetrics(painter.font())
         note = QRectF(14, self.height() - metrics.height() - 24, metrics.horizontalAdvance(text) + 20, metrics.height() + 10)
         _fill_pill(painter, note)
@@ -899,7 +920,8 @@ class StatsBar(QFrame):
         mod = QKeySequence("Ctrl+1").toString(native)[:-1]  # "⌘" on macOS, "Ctrl+" elsewhere
         hint = QLabel(
             f"P keep · X reject · U unmark · {mod}1–5 stars · {mod}6–9 label · N next unmarked · K keeps only · "
-            f"B bursts · ⇧P keep one of a burst · C compare · E edit · R crop · {mod}C / {mod}V copy / paste edit · "
+            f"B bursts · ⇧P keep one of a burst · C compare · E edit · Y hold for before · R crop · [ ] rotate · "
+            f"J clipping · {mod}C / {mod}V copy / paste edit · "
             f"Z zoom · F focus peaking · I info · G gallery · {undo} undo"
         )
         hint.setToolTip(hint.text())
@@ -1109,6 +1131,22 @@ class MessageDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+
+class NameDialog(MessageDialog):
+    """Asks for a name. Accepted, `name` is what was typed, never blank."""
+
+    def __init__(self, parent, title, text, confirm_text):
+        super().__init__(parent, title, text, confirm_text=confirm_text)
+        self.field = QLineEdit()
+        self.field.textChanged.connect(lambda text: self.confirm_button.setEnabled(bool(text.strip())))
+        self.confirm_button.setEnabled(False)
+        layout = self.layout()
+        layout.insertWidget(layout.count() - 1, self.field)  # between the text and the buttons
+
+    @property
+    def name(self):
+        return self.field.text().strip()
 
 
 class ProcessDialog(MessageDialog):

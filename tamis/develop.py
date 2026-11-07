@@ -11,8 +11,9 @@ a large image can be processed in strips (export) with the same result.
 An edit is a plain dict holding only the settings that differ from
 DEFAULTS, which is also how it is stored in the session.
 
-The crop is applied before all of this (see crop_array()), so the vignette
-and the grain follow the final frame: render() is given the cropped pixels.
+The framing (quarter turns, straightening, then the crop, which is in
+fractions of the turned picture) is applied before all of this, so the vignette
+and the grain follow the final frame: render() is given the framed pixels.
 """
 import math
 
@@ -23,7 +24,9 @@ from .lut import apply as apply_lut
 MIN_CROP_SIZE = 0.005  # smallest stored crop side, as a fraction of the photo's
 
 DEFAULTS = {
-    "crop": None,  # [left, top, right, bottom], fractions of the photo's width and height
+    "crop": None,  # [left, top, right, bottom], fractions of the turned photo's width and height
+    "rotate": 0,  # quarter turns clockwise, in degrees: 0, 90, 180 or 270
+    "straighten": 0.0,  # degrees clockwise; the picture is enlarged to fill the frame
     "exposure": 0.0,  # EV
     "temperature": 0,  # -100 cooler … +100 warmer
     "tint": 0,  # -100 greener … +100 more magenta
@@ -38,6 +41,7 @@ DEFAULTS = {
     "vignette": 0,  # negative darkens the corners
 }
 RANGES = {
+    "straighten": (-15.0, 15.0),
     "exposure": (-5.0, 5.0),
     "temperature": (-100, 100),
     "tint": (-100, 100),
@@ -50,6 +54,9 @@ RANGES = {
     "grain_size": (1, 3),
     "vignette": (-100, 100),
 }
+
+# What belongs to one photo's framing: not part of its look, so neither copied nor kept in a preset.
+FRAMING = ("crop", "rotate", "straighten")
 
 LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
@@ -91,6 +98,67 @@ def crop_array(pixels, crop):
     return pixels[top:bottom, left:right]
 
 
+def look(edit):
+    """`edit` without its framing: what can be carried over to another photo."""
+    return {key: value for key, value in edit.items() if key not in FRAMING}
+
+
+def framing(edit):
+    """Only the framing of `edit`."""
+    return {key: edit[key] for key in FRAMING if edit.get(key)}
+
+
+def turned(edit, degrees):
+    """`edit` after a further quarter turn (90 or -90): a crop stays on the same part of the picture."""
+    crop = edit.get("crop")
+    if crop:
+        left, top, right, bottom = crop
+        crop = [1 - bottom, left, 1 - top, right] if degrees > 0 else [top, 1 - right, bottom, 1 - left]
+    return clean({**edit, "rotate": (edit.get("rotate", 0) + degrees) % 360, "crop": crop})
+
+
+def framed_size(height, width, edit):
+    """(height, width) of a picture of that size once `edit` has framed it."""
+    if edit.get("rotate", 0) % 180:
+        height, width = width, height
+    if edit.get("crop"):
+        top, bottom, left, right = crop_box(height, width, edit["crop"])
+        return bottom - top, right - left
+    return height, width
+
+
+def turn_array(pixels, rotate):
+    """`pixels` turned clockwise by `rotate` degrees, without copying."""
+    return np.rot90(pixels, -(rotate // 90)) if rotate else pixels
+
+
+def straighten_zoom(height, width, degrees):
+    """How much a picture is enlarged so that, turned by `degrees`, it still fills its frame."""
+    angle = math.radians(abs(degrees))
+    return math.cos(angle) + math.sin(angle) * max(height / width, width / height)
+
+
+def straighten_rows(pixels, degrees, top, bottom):
+    """Rows `top` to `bottom` of `pixels` straightened by `degrees` clockwise, about the centre (bilinear)."""
+    height, width = pixels.shape[:2]
+    angle = math.radians(degrees)
+    cos, sin = math.cos(angle), math.sin(angle)
+    zoom = straighten_zoom(height, width, degrees)
+    centre_x, centre_y = (width - 1) / 2, (height - 1) / 2
+    dx = np.arange(width, dtype=np.float32) - centre_x
+    dy = (np.arange(top, bottom, dtype=np.float32) - centre_y)[:, None]
+    # Where each pixel of the result comes from: the turn and the enlargement, inverted.
+    x = np.clip((cos * dx + sin * dy) / zoom + centre_x, 0, width - 1)
+    y = np.clip((cos * dy - sin * dx) / zoom + centre_y, 0, height - 1)
+    x0, y0 = x.astype(np.intp), y.astype(np.intp)
+    x1, y1 = np.minimum(x0 + 1, width - 1), np.minimum(y0 + 1, height - 1)
+    fx, fy = (x - x0)[..., None], (y - y0)[..., None]
+    upper = pixels[y0, x0] * (1 - fx) + pixels[y0, x1] * fx
+    lower = pixels[y1, x0] * (1 - fx) + pixels[y1, x1] * fx
+    out = upper * (1 - fy) + lower * fy
+    return (out + 0.5).astype(pixels.dtype) if np.issubdtype(pixels.dtype, np.integer) else out
+
+
 def clean(edit):
     """`edit` without default or invalid values: what is stored. {} means no edit."""
     result = {}
@@ -103,15 +171,23 @@ def clean(edit):
             if crop:
                 result[key] = crop
             continue
+        if key == "rotate":
+            valid = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+            if valid and value % 90 == 0 and value % 360:
+                result[key] = int(value % 360)
+            continue
         if key == "lut":
             if isinstance(value, str) and value:
                 result[key] = value
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             continue
         low, high = RANGES[key]
         value = min(high, max(low, value))
-        value = round(float(value), 2) if key == "exposure" else int(round(value))
+        if key == "straighten":
+            value = round(float(value), 1)
+        else:
+            value = round(float(value), 2) if key == "exposure" else int(round(value))
         if value != default:
             result[key] = value
     return result
