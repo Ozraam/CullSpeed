@@ -28,10 +28,21 @@ def test_tone_counts_each_channel(qapp):
 def test_tone_reports_what_is_clipped(qapp):
     pixels = np.full((100, 100, 3), 128, dtype=np.uint8)
     pixels[:10] = 0  # 10 % black
-    pixels[10:30, :, 0] = 255  # 20 % with one channel blown
+    pixels[10:30] = 255  # 20 % blown out
+    pixels[30:60, :, 0] = 255  # 30 % with only one channel at the top: not counted
     tone = tones.tone_of(array_to_image(pixels))
     assert tone.shadows == pytest.approx(0.1)
     assert tone.highlights == pytest.approx(0.2)
+
+
+def test_a_vivid_yellow_is_only_partly_clipped(qapp):
+    pixels = np.zeros((10, 10, 3), dtype=np.uint8)
+    pixels[...] = (255, 200, 0)
+    assert tones.tone_of(array_to_image(pixels)).highlights == 0
+    overlay = tones.clipping_image(array_to_image(pixels))
+    color = overlay.pixelColor(5, 5)
+    assert color.getRgb()[:3] == tones.PARTIAL_COLOR
+    assert color.alpha() == tones.PARTIAL_ALPHA
 
 
 def test_a_saturated_colour_is_not_black(qapp):

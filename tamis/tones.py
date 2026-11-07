@@ -15,12 +15,14 @@ from PyQt6.QtGui import QImage, QPixmap
 # A little inside the limits: JPEG compression leaves blown areas speckled with 254.
 HIGHLIGHT = 254  # a channel at or above this has lost its detail
 SHADOW = 1  # every channel at or below this is black
-HIGHLIGHT_COLOR = (255, 40, 40)
+HIGHLIGHT_COLOR = (255, 40, 40)  # every channel clipped: nothing is left there
+PARTIAL_COLOR = (255, 150, 0)  # one or two: a saturated colour, flatter but not blown out
+PARTIAL_ALPHA = 130  # discreet, so that the photo still shows through
 SHADOW_COLOR = (50, 120, 255)
 _HISTOGRAM_SIZE = 1024  # longest edge a histogram is counted at
 _CACHE_SIZE = 8
 
-# `counts`: 3×256 array, for red, green and blue; `shadows`, `highlights`: fractions of the pixels clipped.
+# `counts`: 3×256 array, for red, green and blue; `shadows`, `highlights`: fractions of the pixels fully clipped.
 Tone = namedtuple("Tone", "counts shadows highlights")
 
 
@@ -34,9 +36,14 @@ def _rgb(image):
 
 
 def clipped(rgb):
-    """(shadows, highlights): boolean h×w arrays of the pixels without detail left."""
+    """(shadows, highlights, partial): boolean h×w arrays.
+
+    `shadows` and `highlights` have no detail left in any channel; `partial` has
+    one or two channels at the top, like a vivid yellow with its red at 255.
+    """
     brightest = rgb.max(axis=2)
-    return brightest <= SHADOW, brightest >= HIGHLIGHT
+    highlights = rgb.min(axis=2) >= HIGHLIGHT
+    return brightest <= SHADOW, highlights, (brightest >= HIGHLIGHT) & ~highlights
 
 
 def tone_of(image):
@@ -48,18 +55,19 @@ def tone_of(image):
         )
     rgb, _keep = _rgb(image)
     counts = np.stack([np.bincount(rgb[..., channel].ravel(), minlength=256) for channel in range(3)])
-    shadows, highlights = clipped(rgb)
+    shadows, highlights, _partial = clipped(rgb)
     return Tone(counts, float(shadows.mean()), float(highlights.mean()))
 
 
 def clipping_image(image):
     """QImage, transparent but for the clipped pixels of `image`."""
     rgb, _keep = _rgb(image)
-    shadows, highlights = clipped(rgb)
+    shadows, highlights, partial = clipped(rgb)
     height, width = rgb.shape[:2]
     pixels = np.zeros((height, width, 4), dtype=np.uint8)
     pixels[shadows] = (*SHADOW_COLOR, 255)
     pixels[highlights] = (*HIGHLIGHT_COLOR, 255)
+    pixels[partial] = (*PARTIAL_COLOR, PARTIAL_ALPHA)
     data = pixels.tobytes()
     return QImage(data, width, height, width * 4, QImage.Format.Format_RGBA8888).copy()  # copy(): owns its pixels
 

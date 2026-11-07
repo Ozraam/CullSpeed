@@ -11,7 +11,7 @@ from PyQt6.QtGui import QColor, QImage, QPixmap  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 
-from tamis import develop, fileops, loader, xmp  # noqa: E402
+from tamis import develop, fileops, loader, tones, xmp  # noqa: E402
 from tamis.app import CULL_TAB, GALLERY_TAB, TamisApp  # noqa: E402
 from tamis.constants import KEEP, REJECT, SESSION_FILENAME  # noqa: E402
 from tamis.fileops import MoveResult, plan_moves  # noqa: E402
@@ -1556,9 +1556,10 @@ def test_before_keeps_the_crop_tool_alone(window):
 def test_histogram_follows_the_photo_and_its_edit(window):
     panel = window.edit_panel
     window.toggle_edit_panel()
+    window.go_to(5)  # no channel at 0, so that all three can blow out
     assert wait_until(lambda: panel.histogram.tone is not None)
     first = panel.histogram.tone
-    window.model.set_field([0], "edit", {"exposure": 5.0})
+    window.model.set_field([5], "edit", {"exposure": 5.0})
     assert wait_until(lambda: panel.histogram.tone is not first and panel.histogram.tone.highlights > 0.5)
     panel.histogram.grab()  # paints without trouble, clipped or not
 
@@ -1583,11 +1584,21 @@ def test_clipping_overlay_with_its_shortcut_and_button(window):
 
 
 def test_clipping_shows_in_red_what_an_edit_blows_out(window):
-    window.model.set_field([0], "edit", {"exposure": 5.0})
+    window.go_to(5)
+    window.model.set_field([5], "edit", {"exposure": 5.0})
     press(window, Qt.Key.Key_J)
     assert wait_until(lambda: (
         window.image_view._clipping is not None
         and window.image_view._clipping.toImage().pixelColor(10, 10).alpha() == 255
+    ))
+
+
+def test_clipping_shows_in_orange_a_colour_with_a_channel_left(window):
+    window.model.set_field([0], "edit", {"exposure": 5.0})  # its red is at 0, and stays there
+    press(window, Qt.Key.Key_J)
+    assert wait_until(lambda: (
+        window.image_view._clipping is not None
+        and window.image_view._clipping.toImage().pixelColor(10, 10).alpha() == tones.PARTIAL_ALPHA
     ))
 
 

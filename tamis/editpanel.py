@@ -330,7 +330,7 @@ class EditPanel(QFrame):
         self.clipping_button = QPushButton("Clipping")
         self.clipping_button.setCheckable(True)
         self.clipping_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.clipping_button.setToolTip("Show clipped highlights in red and shadows in blue (J)")
+        self.clipping_button.setToolTip("Show blown highlights in red, clipped colours in orange and blocked shadows in blue (J)")
         self.clipping_button.clicked.connect(self.clipping_toggled)
         self.before_button = QPushButton("Before")
         self.before_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
