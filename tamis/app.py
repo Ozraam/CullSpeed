@@ -1,13 +1,15 @@
-import errno
 import json
+import math
 import os
-import threading
-from contextlib import suppress
+import platform
+import time
 from html import escape
 
+import rawpy
 from PyQt6.QtCore import (
+    PYQT_VERSION_STR,
+    QT_VERSION_STR,
     QEvent,
-    QEventLoop,
     QFileSystemWatcher,
     QItemSelectionModel,
     QRect,
@@ -15,9 +17,7 @@ from PyQt6.QtCore import (
     QSize,
     QStandardPaths,
     Qt,
-    QThread,
     QTimer,
-    pyqtSignal,
 )
 from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QPainter, QPixmap, QShortcut, QTransform
 from PyQt6.QtWidgets import (
@@ -28,7 +28,6 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QMainWindow,
     QMenu,
-    QProgressDialog,
     QPushButton,
     QStackedWidget,
     QTabWidget,
@@ -36,9 +35,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import bursts, cropping, develop, exportsettings, lut, shortcuts, xmp
+from . import __version__, bursts, cropping, develop, exportsettings, lut, shortcuts, xmp
 from .analysis import PhotoAnalyzer
 from .constants import (
+    APP_NAME,
     FALLBACK_SESSIONS_DIR,
     KEEP,
     KEEP_DIR,
@@ -51,60 +51,44 @@ from .constants import (
     REJECT_DIR,
     SESSION_FILENAME,
     UNDO_LIMIT,
+    is_raw,
 )
-from .editing import EditRenderer, EditThumbnails, export_photo, exposure_shift
+from .editing import EditRenderer, EditThumbnails, exposure_shift
 from .editpanel import EditPanel
 from .exif import summary
-from .exportsettings import ExportSettings
-from .fileops import (
-    copy_export,
-    execute_import,
-    execute_moves,
-    execute_trash,
-    export_record,
-    find_card,
-    is_jpeg,
-    jpeg_file,
-    plan_exports,
-    plan_moves,
-    plan_trash,
-    record_path,
-    rejected_exports,
-    remove_rejected_exports,
-    trash_size,
-    without_export,
-)
-from .imaging import is_raw
 from .loader import ImageLoader
-from .models import SORT_KEYS, PhotoModel, StatusFilterProxy, by_name, photo_files, relative_key, save_session, scan_folder
+from .models import SORT_KEYS, PhotoModel, StatusFilterProxy, relative_key, save_session
 from .peaking import FocusPeaker
 from .plugins import PhotoInfo, PluginManager
 from .presets import PresetStore
+from .processing import ProcessingMixin
+from .scanning import FolderScanner
 from .shortcutsdialog import ShortcutsDialog, ShortcutsEditor
 from .thumbcache import ThumbnailCache
 from .tones import ToneReader
+from .views import CompareView, ImageView
 from .widgets import (
-    CompareView,
-    ExportSettingsDialog,
     GalleryToolbar,
     HeaderBar,
-    ImageView,
-    ImportDialog,
     MessageDialog,
     NameDialog,
-    ProcessDialog,
     StatsBar,
     ThumbnailDelegate,
     Toast,
     inform,
     make_thumbnail_view,
-    size_text,
 )
 
 CULL_TAB, GALLERY_TAB = 0, 1
 FILMSTRIP_THUMB_SIZE = 64
 COMPARE_MAX = 4
 CROP_CACHE_SIZE = 8  # cropped previews and full-resolution images kept
+# Changes in the folder are looked for this long after they happen, so that a burst of files is read once;
+# after the app's own session writes, a while longer.
+REFRESH_DELAY_MS = 800
+SCAN_PROGRESS_AFTER = 0.3  # seconds of reading a folder before saying how far it got
+OWN_WRITE_SECONDS = 1.0
+OWN_WRITE_REFRESH_MS = 4000
 
 # How keep and reject reach other editors, as no flag is common to them (see xmp.py).
 XMP_MARKS = (
@@ -115,107 +99,7 @@ XMP_MARKS = (
 MARK_LABELS = {KEEP: "Green", REJECT: "Red"}
 
 
-def _names(paths, limit=5):
-    """`a.jpg, b.jpg and 3 more`, as rich text."""
-    names = [escape(os.path.basename(path)) for path in paths]
-    extra = f" and {len(names) - limit} more" if len(names) > limit else ""
-    return ", ".join(names[:limit]) + extra
-
-
-class MoveThread(QThread):
-    """Runs execute_moves() off the GUI thread, so slow disks don't freeze the window."""
-
-    progressed = pyqtSignal(int)
-
-    def __init__(self, moves, parent=None):
-        super().__init__(parent)
-        self.moves = moves
-        self.result = None
-        self._stop = threading.Event()
-
-    def stop(self):
-        self._stop.set()
-
-    def run(self):
-        def progress(done):
-            self.progressed.emit(done)
-            return not self._stop.is_set()
-
-        self.result = execute_moves(self.moves, progress)
-
-
-class ExportThread(QThread):
-    """Renders edited photos to JPEG (or copies unedited ones) off the GUI thread."""
-
-    progressed = pyqtSignal(int)
-
-    def __init__(self, jobs, dest_dir, settings=None, protected=(), parent=None):
-        super().__init__(parent)
-        # [(path, edit, LUT path, name)]: an unedited JPEG is copied (unless it must be
-        # resized), anything else rendered; name None picks a free one
-        self.jobs = jobs
-        self.dest_dir = dest_dir
-        self.settings = settings or ExportSettings()
-        # Files never to write over, the photos': only a mistaken destination would get there.
-        self.protected = {os.path.normcase(os.path.abspath(path)) for path in protected}
-        self.exported = []
-        self.sources = {}  # exported path -> the job's path
-        self.errors = []
-        self._stop = threading.Event()
-
-    def stop(self):
-        self._stop.set()
-
-    def run(self):
-        tables = {}
-        for done, (path, edit, lut_path, name) in enumerate(self.jobs):
-            if self._stop.is_set():
-                break
-            self.progressed.emit(done)
-            try:
-                if name is not None and os.path.normcase(os.path.abspath(os.path.join(self.dest_dir, name))) in self.protected:
-                    raise OSError(errno.EEXIST, "a photo has that name in the export folder")
-                if edit or not is_jpeg(path) or self.settings.resizes:
-                    dest = export_photo(
-                        path, edit, lut_path, self.dest_dir, tables,
-                        quality=self.settings.quality, name=name, long_edge=self.settings.long_edge,
-                    )
-                else:
-                    dest = copy_export(path, self.dest_dir, name)
-                self.exported.append(dest)
-                self.sources[dest] = path
-            except Exception as exc:  # one bad photo must not stop the others
-                self.errors.append(f"{os.path.basename(path)}: {exc}")
-        self.progressed.emit(len(self.jobs))
-
-
-class WorkThread(QThread):
-    """Runs `work(progress)` off the GUI thread; `progress(done)` returns False once asked to stop."""
-
-    progressed = pyqtSignal(int)
-
-    def __init__(self, work, parent=None):
-        super().__init__(parent)
-        self.work = work
-        self.result = None
-        self.failure = None
-        self._stop = threading.Event()
-
-    def stop(self):
-        self._stop.set()
-
-    def run(self):
-        def progress(done):
-            self.progressed.emit(done)
-            return not self._stop.is_set()
-
-        try:
-            self.result = self.work(progress)
-        except Exception as exc:  # an exception escaping run() would abort the process
-            self.failure = str(exc) or type(exc).__name__
-
-
-class TamisApp(QMainWindow):
+class TamisApp(ProcessingMixin, QMainWindow):
     def __init__(self, plugins_dir=None, cache_dir=None, presets_file=None):
         super().__init__()
         self.setWindowTitle("Tamis")
@@ -305,13 +189,18 @@ class TamisApp(QMainWindow):
         self.session_timer.setInterval(400)
         self.session_timer.timeout.connect(self.save_session)
 
+        self.scanner = FolderScanner(self)
+        self.scanner.scanned.connect(self._on_scanned)
+        self.scanner.progressed.connect(self._on_scan_progress)
+
         # New files (an import or a tethered shot landing in the folder) show up by themselves.
         self.watcher = QFileSystemWatcher(self)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setSingleShot(True)
-        self.refresh_timer.setInterval(800)
         self.refresh_timer.timeout.connect(lambda: self.refresh(auto=True))
-        self.watcher.directoryChanged.connect(lambda _path: self.refresh_timer.start())
+        self.watcher.directoryChanged.connect(self._on_directory_changed)
+        self.saved_at = -math.inf  # time.monotonic() of the last session written in the folder
+        self.scan_started = -math.inf
 
         self._build_ui()
         self.analyzer.progressed.connect(self.stats.set_analysis_progress)
@@ -472,7 +361,19 @@ class TamisApp(QMainWindow):
             self.xmp_mark_actions[value] = action
         menu.addAction("Export Settings…", self.edit_export_settings)
         menu.addAction("Keyboard Shortcuts…", self.edit_shortcuts)
+        menu.addSeparator()
+        menu.addAction(f"About {APP_NAME}…", self.show_about)
         return menu
+
+    def show_about(self):
+        """The app's version, and those of what it is built on, for bug reports."""
+        libraw = ".".join(str(part) for part in rawpy.libraw_version)
+        text = (
+            f"Version <b>{escape(__version__)}</b><br><br>"
+            f"Python {platform.python_version()} · Qt {QT_VERSION_STR} · PyQt {PYQT_VERSION_STR} · LibRaw {libraw}<br>"
+            f"{escape(platform.platform(terse=True))}"
+        )
+        inform(self, APP_NAME, text)
 
     def _shortcut_slots(self):
         """What each command of `shortcuts.COMMANDS` does."""
@@ -579,22 +480,48 @@ class TamisApp(QMainWindow):
     def load_folder(self, folder, select=None, keep_state=False):
         """Open `folder`; `select` is a photo's path relative to it (or, from older versions, its name).
 
-        `keep_state` (refreshing the open folder) keeps cached images and undo.
+        The folder is read in the background (see FolderScanner): the photos of
+        the folder open until then stay usable, and opening another folder
+        meanwhile supersedes this one. `keep_state`, for the open folder, keeps
+        cached images and undo.
         """
         if self.moving:
             return
         self._finish_crop(apply=True)
         self.save_session()
-        problems = []
-        try:
-            photos = scan_folder(folder, self.session_fallback_dir, problems)
-        except OSError as exc:
-            inform(self, "Cannot open folder", escape(f"{folder}: {exc}"))
+        self.refresh_timer.stop()
+        self.scan_started = time.monotonic()
+        self.scanner.scan(folder, self.session_fallback_dir, ("open", folder, select, keep_state, self.model.revision))
+
+    def _on_scan_progress(self, folder, count):
+        if count and time.monotonic() - self.scan_started > SCAN_PROGRESS_AFTER:  # only when it takes a while
+            self.toast.show_message(f"Reading {os.path.basename(folder) or folder}… {count} photo(s)", 3000)
+
+    def _on_scanned(self, result):
+        kind, folder, *details = result.request
+        self._report_damaged_sessions(result.problems)
+        if kind == "open":
+            self._open_scanned(result, *details)
+        elif folder == self.folder and not self.moving:
+            self._apply_folder_changes(result, *details)
+
+    def _open_scanned(self, result, select, keep_state, revision):
+        folder, photos = result.folder, result.photos
+        if result.error:
+            inform(self, "Cannot open folder", escape(f"{folder}: {result.error}"))
             return
-        self._report_damaged_sessions(problems)
+        same_folder = keep_state and folder == self.folder
+        if same_folder and self.model.revision != revision:
+            # Marked while being read: what was read is out of date, save it and read again.
+            self.load_folder(folder, select, keep_state)
+            return
+        if self.moving:  # (cannot happen: no long job starts while a folder is being read)
+            return
+        self.save_session()  # what was marked meanwhile in the folder open until now
+        if self.toast.text().startswith("Reading "):
+            self.toast.hide()
 
         self.live_edit = None
-        same_folder = keep_state and folder == self.folder
         if not same_folder:
             self.loader.reset()
             self.editor.reset()
@@ -607,7 +534,7 @@ class TamisApp(QMainWindow):
             self.tones.reset()
             self.edit_thumbnails.reset()
             self.analyzer.open_folder(folder)
-        self.analyzer.apply_known(photos)
+        self.analyzer.apply_known(photos, result.file_keys)
         if self.show_bursts:
             bursts.assign(photos)
         photos.sort(key=SORT_KEYS[self.sort_order])
@@ -645,24 +572,108 @@ class TamisApp(QMainWindow):
         self.plugins.emit(event, folder)
 
     def refresh(self, auto=False):
-        """Pick up photos added to or removed from the folder, keeping marks and the current photo."""
-        if not self.folder or self.moving:
+        """Pick up photos added to or removed from the folder, keeping marks, the selection and the current photo.
+
+        Only new photos are read (in the background), and the others stay as they are.
+        """
+        if not self.folder or self.moving or self.scanner.busy:
             return
         self.loader.retry_failed_thumbnails()
-        try:
-            files = photo_files(self.folder)
-        except OSError:
-            return
-        known = {path for photo in self.model.photos for path in photo.files}
-        if files == known:
+        known = {photo.path: photo.companions for photo in self.model.photos}
+        self.scanner.refresh(self.folder, known, self.session_fallback_dir, ("refresh", self.folder, auto))
+
+    def _apply_folder_changes(self, result, auto):
+        changes = result.changes
+        if result.error or not changes:
             if not auto:
                 self.toast.show_message("No new photos")
             return
-        added, removed = len(files - known), len(known - files)
+        # Read from what was shown when the refresh started: since then, a photo may have gone another way.
+        changes.removed &= {photo.path for photo in self.model.photos}
+        changes.added = [photo for photo in changes.added if self.model.row_of(photo.path) == -1]
+        # A RAW landing after its JPEG makes one photo of them: it keeps the JPEG's marks.
+        replaced = {photo.path: photo for photo in self.model.photos if photo.path in changes.removed}
+        for photo in changes.added:
+            earlier = next((replaced[path] for path in photo.companions if path in replaced), None)
+            if earlier is not None and (photo.status, photo.rating, photo.label) == (None, 0, None):
+                photo.status, photo.rating, photo.label = earlier.status, earlier.rating, earlier.label
+        before = {path for photo in self.model.photos for path in photo.files}
+        self.analyzer.apply_known(changes.added, result.file_keys)
+        self._update_photos(changes)
+        after = {path for photo in self.model.photos for path in photo.files}
+        added, removed = len(after - before), len(before - after)
+        if not (added or removed):
+            if not auto:
+                self.toast.show_message("No new photos")
+            return
+        self._watch(self.folder)  # _KEEPS / _REJECTS may have just appeared
+        parts = [f"{added} new file(s)" if added else "", f"{removed} gone" if removed else ""]
+        self.toast.show_message("Folder updated · " + ", ".join(part for part in parts if part))
+        self.plugins.emit("folder_refreshed", self.folder)
+
+    def _update_photos(self, changes, select=None):
+        """Add and remove photos of the open folder in place (FolderChanges), staying on the current photo.
+
+        Photos are identified by path: nothing may keep referring to removed ones.
+        `select`, a path, is the photo to show when the current one goes.
+        """
         current = self.model.photo(self.current_row).path if self.current_row >= 0 else None
-        self.load_folder(self.folder, select=current and relative_key(self.folder, current), keep_state=True)
-        changes = [f"{added} new file(s)" if added else "", f"{removed} gone" if removed else ""]
-        self.toast.show_message("Folder updated · " + ", ".join(c for c in changes if c))
+        if current in changes.removed and select is None:
+            # The next photo that stays, or else the one before.
+            rows = range(self.model.rowCount())
+            after = [r for r in rows if r > self.current_row and self.model.photo(r).path not in changes.removed]
+            before = [r for r in rows if r < self.current_row and self.model.photo(r).path not in changes.removed]
+            select = self.model.photo(after[0] if after else before[-1]).path if after or before else None
+        compared = [self.model.photo(row).path for row in self.compare_rows]
+        gone = changes.removed
+        if gone:
+            files = [path for photo in self.model.photos if photo.path in gone for path in photo.files]
+            self.loader.forget(files)
+            for path in gone:
+                self.editor.forget(path)
+                self.edit_thumbnails.forget(path)
+            self.xmp_dirty -= gone
+            self.undo_stack = [kept for undo in self.undo_stack if (kept := [c for c in undo if c[0] not in gone])]
+            if set(compared) & gone:
+                self._end_compare(show=False)
+                compared = []
+        for photo in changes.added:
+            if photo.xmp_pending or (self.xmp_marks == "rating" and photo.status == REJECT):
+                self.xmp_dirty.add(photo.path)
+
+        self.model.update_photos(changes, SORT_KEYS[self.sort_order])
+        self.compare_rows = [self.model.row_of(path) for path in compared]
+        if changes.added or gone:
+            self._show_analysis()  # bursts may have changed
+            self._request_analysis()
+        follow = current if current not in gone else select
+        if follow is None or self.model.row_of(follow) == -1:
+            self.current_row = -1
+            if not self.model.rowCount():
+                self.image_view.set_image(None, "No photos in this folder")
+                self.header.set_counter("")
+            elif current in gone:
+                self.go_to(0)
+            return
+        row = self.model.row_of(follow)
+        if follow == current:
+            self.current_row = row  # the same photo: only its row moved
+            if self.live_edit is None:
+                self.go_to(row)  # for the filmstrip, and what to prefetch
+            else:
+                self._update_counter()  # a slider is being dragged: go_to() would end that
+        else:
+            self.go_to(row)
+            self._keep_current_in_filter()
+
+    def _on_directory_changed(self, path):
+        if path == self.folder and time.monotonic() - self.saved_at < OWN_WRITE_SECONDS:
+            # Most likely the session that was just saved: saving follows every mark, so look
+            # later, once for all of them, rather than reading the folder after each one.
+            if not self.refresh_timer.isActive():
+                self.refresh_timer.start(OWN_WRITE_REFRESH_MS)
+        else:
+            self.refresh_timer.start(REFRESH_DELAY_MS)
 
     def _watch(self, folder):
         if self.watcher.directories():
@@ -706,6 +717,7 @@ class TamisApp(QMainWindow):
         if path != os.path.join(self.folder, SESSION_FILENAME):
             self._session_problem("fallback", "This folder is read-only: marks are saved in the app's data folder")
         else:
+            self.saved_at = time.monotonic()
             self.session_warning = None
 
     def _session_problem(self, kind, message):
@@ -1327,105 +1339,6 @@ class TamisApp(QMainWindow):
             self.toast.show_message(f"{len(self.luts)} film simulation(s) found")
         self._refresh_view()
 
-    def export_photos(self):
-        """Export the target photos, with their edits, as full-size JPEGs in _EXPORTS."""
-        self._finish_crop(apply=True)
-        rows = self._target_rows()
-        if not rows or self.moving:
-            return
-        self.save_session()
-        photos = [self.model.photo(row) for row in rows]
-        missing = [photo.name for photo in photos if self._lut_missing(photo.edit)]
-        if missing:
-            dialog = MessageDialog(
-                self,
-                "Film simulation not found",
-                f"{len(missing)} photo(s) use a film simulation that isn't in the LUT folder, "
-                "and would be exported without it:",
-                confirm_text="Export anyway",
-                details=missing,
-            )
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-        if not self._export_folder_ok():
-            return
-        jobs = [(p.path if p.edit else jpeg_file(p) or p.path, p.edit, self._lut_path(p.edit), None) for p in photos]
-        thread = self._run_export(jobs, "Export JPEG")
-        where = self.export_settings.folder
-        if thread.errors:
-            inform(
-                self,
-                "Some photos were not exported",
-                f"Exported {len(thread.exported)} of {len(jobs)} photo(s) to {where}. These failed:",
-                details=thread.errors,
-            )
-        else:
-            self.toast.show_message(f"Exported {len(thread.exported)} photo(s) to {where}")
-
-    def _export_folder_ok(self):
-        """Whether the export folder of the settings can be used here; tells the user if not."""
-        problem = self.export_settings.problem(self.folder)
-        if problem:
-            inform(self, "Choose another export folder", f"{problem} Change it in Options → Export Settings.")
-        return problem is None
-
-    def edit_export_settings(self):
-        """Open the export settings; returns whether they were changed."""
-        def save_profiles(profiles):
-            self.export_profiles = profiles
-            self.settings.setValue("export_profiles", exportsettings.dump_profiles(profiles))
-
-        dialog = ExportSettingsDialog(self, self.export_settings, self.export_profiles, self.folder, save_profiles)
-        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.settings == self.export_settings:
-            return False
-        self.export_settings = dialog.settings
-        self.settings.setValue("export_settings", json.dumps(self.export_settings.to_dict()))
-        return True
-
-    def _run_export(self, jobs, title):
-        """Run an ExportThread behind a modal progress dialog; returns the finished thread."""
-        progress = QProgressDialog("Exporting…", "Stop", 0, len(jobs), self)
-        progress.setWindowTitle(title)
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        protected = [path for photo in self.model.photos for path in photo.files]
-        thread = ExportThread(jobs, self.export_settings.dest_dir(self.folder), self.export_settings, protected, self)
-        thread.progressed.connect(progress.setValue)
-        progress.canceled.connect(thread.stop)
-        loop = QEventLoop()
-        thread.finished.connect(loop.quit)
-        self.moving = True  # same guard as moving files: no folder change meanwhile
-        thread.start()
-        loop.exec()
-        self.moving = False
-        progress.close()
-        thread.deleteLater()
-        self._record_exports(thread)
-        if thread.exported:
-            self.plugins.emit("photos_exported", list(thread.exported))
-        return thread
-
-    def _record_exports(self, thread):
-        """Remember which photo each export came from, so that rejecting it later can remove the export."""
-        if not thread.exported:
-            return
-        def key(path):
-            return os.path.normcase(os.path.abspath(path))
-
-        written = {key(dest) for dest in thread.exported}
-        owners = {path: photo for photo in self.model.photos for path in photo.files}
-        for photo in self.model.photos:  # a file that was replaced is no longer the export of its former photo
-            if photo.exports:
-                photo.exports = [record for record in photo.exports if key(record_path(self.folder, record)) not in written]
-        for dest in thread.exported:
-            photo = owners.get(thread.sources[dest])
-            # A rejected photo exported on request stays: the user just asked for that file.
-            if photo is not None and photo.status != REJECT:
-                with suppress(OSError):  # gone already: nothing to remember
-                    photo.exports = [*photo.exports, export_record(dest, self.export_settings.folder)]
-        self.save_session()
-
     # -- compare -----------------------------------------------------------
 
     def toggle_compare(self):
@@ -1733,330 +1646,6 @@ class TamisApp(QMainWindow):
         elif not self.compare_rows and (following := self._cull_neighbor(max(rows), 1)) is not None:
             self.go_to(following)
 
-    # -- long jobs behind a dialog ------------------------------------------
-
-    def _run_work(self, title, text, count, work):
-        """Run `work(progress)` behind a modal progress dialog; returns its result, None if it broke down."""
-        progress = QProgressDialog(text, "Stop", 0, count, self)
-        progress.setWindowTitle(title)
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        thread = WorkThread(work, self)
-        thread.progressed.connect(progress.setValue)
-        progress.canceled.connect(thread.stop)
-        loop = QEventLoop()
-        thread.finished.connect(loop.quit)
-        self.moving = True  # same guard as moving files: no folder change meanwhile
-        thread.start()
-        loop.exec()
-        self.moving = False
-        progress.close()
-        thread.deleteLater()
-        if thread.failure:
-            inform(self, title, escape(thread.failure))
-        return thread.result
-
-    # -- importing ----------------------------------------------------------
-
-    def import_photos(self):
-        """Copy photos from a memory card to a folder, and to a backup if asked, then open that folder."""
-        if self.moving:
-            return
-        dialog = ImportDialog(
-            self, find_card(), self.settings.value("import_destination", ""), self.settings.value("import_backup", "")
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        self.settings.setValue("import_destination", dialog.destination)
-        self.settings.setValue("import_backup", dialog.backup)
-        groups, destinations = dialog.groups, dialog.destinations
-        self._finish_crop(apply=True)
-        self.save_session()
-        result = self._run_work(
-            "Import photos", "Copying and verifying…", len(groups), lambda progress: execute_import(groups, destinations, progress)
-        )
-        if result is None:
-            return
-        if result.errors:
-            inform(
-                self,
-                "Some files were not imported",
-                f"Copied {result.copied} file(s). These failed, and their originals are untouched:",
-                details=result.errors,
-            )
-        if os.path.isdir(dialog.destination):
-            self.load_folder(dialog.destination, keep_state=True)
-        skipped = f", {result.skipped} already there" if result.skipped else ""
-        stopped = "Stopped: " if result.cancelled else ""
-        self.toast.show_message(f"{stopped}{result.copied} file(s) copied and verified{skipped}", 4000)
-
-    # -- the Trash ----------------------------------------------------------
-
-    def trash_rejects(self):
-        """Move the photos in _REJECTS to the system Trash, with their pairs and sidecars. Nothing is ever deleted."""
-        if not self.folder or self.moving:
-            return
-        self._finish_crop(apply=True)
-        self._end_compare()
-        self.save_session()
-        photos = plan_trash(self.model.photos)
-        waiting = sum(1 for photo in self.model.photos if photo.status == REJECT and photo.location != REJECT)
-        note = f"{waiting} rejected photo(s) aren't in {REJECT_DIR} yet: Process Files moves them there."
-        if not photos:
-            self.toast.show_message(note if waiting else f"No rejected photos in {REJECT_DIR}", 4000)
-            return
-        text = (
-            f"<b>{len(photos)}</b> rejected photo(s) in {REJECT_DIR}, <b>{size_text(trash_size(photos))}</b> with their "
-            "RAW+JPEG pairs and XMP sidecars, will go to the Trash. They can be put back from there until it is emptied."
-        )
-        if waiting:
-            text += f"<br><br>{note}"
-        if MessageDialog(self, "Move to the Trash", text, confirm_text="Move to Trash").exec() != QDialog.DialogCode.Accepted:
-            return
-        result = self._run_work(
-            "Move to the Trash", "Moving to the Trash…", len(photos), lambda progress: execute_trash(photos, progress)
-        )
-        if result is None:
-            return
-        if result.trashed:
-            self._forget_trashed(set(result.trashed))
-        if result.errors:
-            inform(
-                self,
-                "Some photos stayed where they are",
-                f"Moved {len(result.trashed)} of {len(photos)} photo(s) to the Trash. These could not be moved:",
-                details=result.errors,
-            )
-        else:
-            self.toast.show_message(f"Moved {len(result.trashed)} photo(s) to the Trash")
-
-    def _forget_trashed(self, gone):
-        """Photos are identified by path: nothing may keep referring to these."""
-        rows = range(self.model.rowCount())
-        current = self.model.photo(self.current_row) if self.current_row >= 0 else None
-        select = current.path if current else None
-        if current and current.path in gone:  # the next photo left, or else the one before
-            after = [r for r in rows if r > self.current_row and self.model.photo(r).path not in gone]
-            before = [r for r in rows if r < self.current_row and self.model.photo(r).path not in gone]
-            select = self.model.photo(after[0]).path if after else self.model.photo(before[-1]).path if before else None
-        files = [path for photo in self.model.photos if photo.path in gone for path in photo.files]
-        self.moved_keys.update(relative_key(self.folder, path) for path in files)
-        self.loader.forget(files)
-        for path in gone:
-            self.editor.forget(path)
-            self.edit_thumbnails.forget(path)
-        self.xmp_dirty -= gone
-        self.undo_stack = [kept for changes in self.undo_stack if (kept := [c for c in changes if c[0] not in gone])]
-        self.current_row = -1
-        self.model.remove_paths(gone)
-        self.save_session()
-        with suppress(OSError):  # only goes if nothing is left in it
-            os.rmdir(os.path.join(self.folder, REJECT_DIR))
-        self.plugins.emit("photos_trashed", sorted(gone))
-        self.load_folder(self.folder, select=select and relative_key(self.folder, select), keep_state=True)
-
-    # -- processing --------------------------------------------------------
-
-    def process_files(self):
-        """Move photos to the folder of their mark, then fill the export folder if asked to.
-
-        Edited photos are exported as JPEGs; unedited ones get their JPEG
-        (if they have one) copied. Rejected photos are not exported, nor
-        unmarked ones when only keeps are, and what was exported of
-        rejected photos earlier is removed.
-        """
-        if not self.folder:
-            return
-        self._finish_crop(apply=True)
-        self._end_compare()
-        self.save_session()
-        moves = plan_moves(self.folder, self.model.photos)
-        # Whatever the scope: the dialog is where it can be changed.
-        anything = self._plan_exports(keeps_only=False)
-        no_jpeg = [photo.path for photo in without_export(self.model.photos, self.export_scope == "keeps")]
-        removable, _changed = rejected_exports(self.model.photos, self.folder)
-        if not moves and not anything and not removable:
-            note = f" · {len(no_jpeg)} photo(s) have no JPEG to export" if no_jpeg else ""
-            self.toast.show_message(f"Everything is already sorted{note}")
-            return
-
-        keeps = sum(1 for m in moves if m.status == KEEP)
-        rejects = sum(1 for m in moves if m.status == REJECT)
-        unmarked = len(moves) - keeps - rejects
-        lines = []
-        if moves:
-            lines.append(f"<b>{len(moves)}</b> photo(s) will be moved:")
-        if keeps:
-            lines.append(f"&nbsp;&nbsp;• {keeps} → <b>_KEEPS</b>")
-        if rejects:
-            lines.append(f"&nbsp;&nbsp;• {rejects} → <b>_REJECTS</b>")
-        if unmarked:
-            lines.append(f"&nbsp;&nbsp;• {unmarked} → folder root (unmarked)")
-        if moves:
-            lines.append("<br>RAW+JPEG pairs and XMP sidecars move together. Existing files are never overwritten.")
-
-        if anything or removable:
-            export_label, export_text, _can = self._describe_exports(self.export_scope)
-        else:
-            export_label = export_text = None
-            if no_jpeg:
-                lines.append(f"{len(no_jpeg)} photo(s) have no JPEG and won't be exported: {_names(no_jpeg)}")
-
-        dialog = ProcessDialog(
-            self, "<br>".join(lines), export_label, export_text,
-            scope=self.export_scope, describe=self._describe_exports, edit_settings=self.edit_export_settings,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        if dialog.export_check is not None and dialog.scope != self.export_scope:
-            self.export_scope = dialog.scope
-            self.settings.setValue("export_scope", self.export_scope)
-
-        if moves:
-            result = self._move_files(moves)
-            moved = sum(1 for move in moves if move.src in result.moved)
-            if result.errors:
-                inform(
-                    self,
-                    "Some files were not moved",
-                    f"Moved {moved} of {len(moves)} photo(s). These failed:",
-                    details=result.errors,
-                )
-            if result.cancelled:
-                self.toast.show_message(f"Stopped after moving {moved} photo(s)")
-                return
-            summary_text = f"Moved {moved} photo(s)"
-        else:
-            summary_text = "Nothing to move"
-
-        if not dialog.export_requested or not self._export_folder_ok():
-            self.toast.show_message(summary_text)
-            return
-
-        where = self.export_settings.folder
-        # First, since a photo about to be exported may take over the name of a removed export.
-        removed, remove_errors = remove_rejected_exports(self.model.photos, self.folder)
-        self.save_session()
-        if remove_errors:
-            inform(
-                self,
-                "Some exports were not removed",
-                "These exports of rejected photos are still there:",
-                details=remove_errors,
-            )
-
-        # Planned again: the photos may have just moved.
-        exports = self._plan_exports()
-        jobs = [(job.path, job.edit, self._lut_path(job.edit), job.name) for job in exports]
-        thread = self._run_export(jobs, "Process files") if jobs else None
-        if thread is not None and thread.errors:
-            inform(
-                self,
-                "Some photos were not exported",
-                f"Exported {len(thread.exported)} of {len(jobs)} photo(s) to {where}. These failed:",
-                details=thread.errors,
-            )
-        else:
-            done = [summary_text]
-            if thread is not None:
-                done.append(f"exported {len(thread.exported)} to {where}")
-            if removed:
-                done.append(f"removed {len(removed)} export(s) of rejected photos")
-            self.toast.show_message(", ".join(done))
-
-    def _describe_exports(self, scope):
-        """(label, details, anything to do) of the export part of the Process Files dialog, for a scope."""
-        keeps_only = scope == "keeps"
-        settings = self.export_settings
-        where = escape(settings.folder)
-        exports = self._plan_exports(keeps_only)
-        no_jpeg = [photo.path for photo in without_export(self.model.photos, keeps_only)]
-        removable, changed = rejected_exports(self.model.photos, self.folder)
-        edited = sum(1 for job in exports if job.edit)
-        if exports:
-            label = f"Export {len(exports)} photo(s) to {settings.folder}"
-        elif removable:
-            label = f"Update {settings.folder}"
-        else:
-            label = "Nothing to export" + (" (no keeps)" if keeps_only else "")
-        details = []
-        if edited:
-            details.append(f"&nbsp;&nbsp;• {edited} edited → rendered as JPEG")
-        if len(exports) - edited:
-            how = "rendered as JPEG" if settings.resizes else "JPEG copied"
-            details.append(f"&nbsp;&nbsp;• {len(exports) - edited} without edits → {how}")
-        if removable:
-            details.append(f"&nbsp;&nbsp;• {len(removable)} earlier export(s) of rejected photos → removed")
-        if exports:
-            details.append(f"Into <b>{where}</b>: {escape(settings.describe())}. Earlier exports of the same photos are replaced.")
-        if changed:
-            details.append(f"{len(changed)} export(s) of rejected photos changed since and stay: {_names(changed)}")
-        if no_jpeg:
-            details.append(f"{len(no_jpeg)} photo(s) have no JPEG and won't be exported: {_names(no_jpeg)}")
-        missing = [job.path for job in exports if self._lut_missing(job.edit)]
-        if missing:
-            details.append(
-                f"<b>{len(missing)} photo(s) use a film simulation that isn't in the LUT folder "
-                f"and would be exported without it:</b> {_names(missing)}"
-            )
-        problem = settings.problem(self.folder)
-        if problem:
-            details.append(f"<b>{escape(problem)}</b>")
-        return label, "<br>".join(details), bool(exports or removable) and problem is None
-
-    def _plan_exports(self, keeps_only=None):
-        """What Process Files exports, for the scope chosen (or `keeps_only`)."""
-        if keeps_only is None:
-            keeps_only = self.export_scope == "keeps"
-        # By name, whatever the order shown: which photo gets `IMG_1 (1).jpg` must not depend on it.
-        return plan_exports(
-            sorted(self.model.photos, key=by_name), keeps_only, self.export_settings.pattern, os.path.basename(self.folder)
-        )
-
-    def _move_files(self, moves):
-        """Run the moves behind a modal progress dialog and update the model; returns the MoveResult."""
-        progress = QProgressDialog("Moving files…", "Stop", 0, len(moves), self)
-        progress.setWindowTitle("Process files")
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        # Shown at once: being modal is what keeps marks from changing mid-move.
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-
-        thread = MoveThread(moves, self)
-        thread.progressed.connect(progress.setValue)
-        progress.canceled.connect(thread.stop)
-        loop = QEventLoop()
-        thread.finished.connect(loop.quit)
-        self.moving = True
-        thread.start()
-        loop.exec()
-        self.moving = False
-        progress.close()
-        result = thread.result
-        thread.deleteLater()
-
-        # Locations come from the plan: once Stop is pressed the window is
-        # usable again while the last file finishes, so marks may have changed.
-        locations = {path: move.status for move in moves for path in (move.src, *move.companions)}
-        self.model.apply_moves({old: (new, locations[old]) for old, new in result.moved.items()})
-        self.loader.rename_paths(result.moved)
-        self.editor.rename_paths(result.moved)
-        self.edit_thumbnails.rename_paths(result.moved)
-        self.xmp_dirty = {result.moved.get(path, path) for path in self.xmp_dirty}
-        self.moved_keys.update(relative_key(self.folder, old) for old in result.moved)
-        self.undo_stack.clear()  # undo entries refer to the old paths
-        self.save_session()
-        self._on_statuses_changed([])
-        self.analyzer.restart()  # what was running has the old paths; results are kept by file, so little is lost
-        self._request_analysis()
-        self._watch(self.folder)  # _KEEPS / _REJECTS may have just been created
-        if self.current_row >= 0:
-            self.header.set_folder(self.folder, self.model.photo(self.current_row).display_name)
-        if result.moved:
-            self.plugins.emit("files_moved", dict(result.moved))
-        return result
-
     # -- window ------------------------------------------------------------
 
     def _restore_window(self):
@@ -2080,6 +1669,7 @@ class TamisApp(QMainWindow):
         self.tones.shutdown()
         self.edit_thumbnails.shutdown()
         self.analyzer.shutdown()
+        self.scanner.shutdown()
         super().closeEvent(event)
 
     def resizeEvent(self, event):

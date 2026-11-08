@@ -17,6 +17,7 @@ from .constants import ANALYSIS_MAX_SIZE
 from .exif import capture_time
 from .imaging import gray_array, load_image
 from .models import write_json
+from .workers import emit_safely
 
 _TILES = 8  # per side: the score comes from the sharpest tiles, as a subject is often small
 _SHARPEST_TILES = 0.95  # percentile
@@ -60,7 +61,7 @@ def _score(path):
         return {}
 
 
-def _file_key(path):
+def file_key(path):
     """What a result is valid for, None if the file can't be read."""
     try:
         stat = os.stat(path)
@@ -108,10 +109,14 @@ class PhotoAnalyzer(QObject):
                 if isinstance(data, dict):
                     self._results = {key: value for key, value in data.items() if isinstance(value, dict)}
 
-    def apply_known(self, photos):
-        """Give the photos what is known of their files already."""
+    def apply_known(self, photos, keys=None):
+        """Give the photos what is known of their files already.
+
+        `keys`, {path: file_key(path)}, saves reading the files again when they were just read.
+        """
         for photo in photos:
-            known = self._results.get(_file_key(photo.path), {})
+            key = keys[photo.path] if keys is not None and photo.path in keys else file_key(photo.path)
+            known = self._results.get(key, {})
             photo.capture_time = known.get("capture_time")
             photo.sharpness = known.get("sharpness")
             photo.image_hash = known.get("image_hash")
@@ -155,7 +160,7 @@ class PhotoAnalyzer(QObject):
 
     def _queue(self, photo, kind, field, priority):
         path = photo.path
-        key = _file_key(path)
+        key = file_key(path)
         if key is None or field in self._results.get(key, {}) or (path, kind) in self._pending:
             return
         self._pending.add((path, kind))
@@ -170,8 +175,7 @@ class PhotoAnalyzer(QObject):
                 results = {"capture_time": capture_time(files)} if kind == "capture" else {"sharpness": None, **_score(path)}
             except Exception:  # a bad photo must not kill a worker
                 results = {field: None}
-            with suppress(RuntimeError):  # analyzer already destroyed during shutdown
-                self._done.emit(generation, (path, kind), key, results)
+            emit_safely(self._done, generation, (path, kind), key, results)
 
         self._pool.start(job, priority)
 

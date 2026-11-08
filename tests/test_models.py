@@ -6,6 +6,11 @@ import pytest
 from tamis.constants import KEEP, KEEP_DIR, LEGACY_SESSION_FILENAME, REJECT, REJECT_DIR, SESSION_FILENAME
 from tamis.models import FORMAT_KEY, SESSION_FORMAT, Photo, PhotoModel, load_session, save_session, scan_folder
 
+# A folder is made read-only with chmod, which Windows ignores for folders (and root, for everyone).
+needs_read_only_folders = pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), reason="chmod can't make a folder read-only here"
+)
+
 
 def stored(folder):
     """The session saved in `folder`, without its format key (which must be the current one)."""
@@ -115,6 +120,7 @@ def locked_folder(tmp_path):
     os.chmod(folder, 0o755)
 
 
+@needs_read_only_folders
 def test_read_only_folder_saves_to_fallback(locked_folder, tmp_path):
     fallback = str(tmp_path / "fallback")
     photos = [Photo(f"{locked_folder}/a.jpg", KEEP)]
@@ -127,6 +133,7 @@ def test_read_only_folder_saves_to_fallback(locked_folder, tmp_path):
     assert [p.status for p in scan_folder(locked_folder, fallback)] == [KEEP]
 
 
+@needs_read_only_folders
 def test_without_fallback_a_read_only_folder_raises(locked_folder):
     with pytest.raises(OSError):
         save_session(locked_folder, [Photo(f"{locked_folder}/a.jpg", KEEP)])
@@ -159,6 +166,7 @@ def test_saving_replaces_the_session_from_before_the_rename(tmp_path):
     assert statuses(load_session(folder)) == {"a.jpg": KEEP}
 
 
+@needs_read_only_folders
 def test_read_only_folder_with_a_session_from_before_the_rename(tmp_path):
     folder = tmp_path / "card"
     legacy = folder / LEGACY_SESSION_FILENAME
@@ -178,6 +186,7 @@ def test_read_only_folder_with_a_session_from_before_the_rename(tmp_path):
         os.chmod(folder, 0o755)
 
 
+@needs_read_only_folders
 def test_saving_in_the_folder_removes_the_stale_fallback(tmp_path):
     folder, fallback = str(tmp_path / "f"), str(tmp_path / "fallback")
     touch(tmp_path / "f" / "a.jpg")
@@ -192,6 +201,7 @@ def test_saving_in_the_folder_removes_the_stale_fallback(tmp_path):
     assert statuses(load_session(folder, fallback)) == {"a.jpg": KEEP}
 
 
+@needs_read_only_folders
 def test_newest_session_wins(tmp_path):
     folder, fallback = str(tmp_path / "f"), str(tmp_path / "fallback")
     touch(tmp_path / "f" / "a.jpg")
@@ -232,21 +242,17 @@ def model():
 
 def test_counts_follow_marks_and_undo(model):
     assert model.counts() == (1, 0, 4)
-    assert not model.has_unsorted()
 
     changes = model.set_status([0, 1], REJECT)
     assert model.counts() == (1, 2, 2)
-    assert model.has_unsorted()
 
     model.restore(changes)
     assert model.counts() == (1, 0, 4)
-    assert not model.has_unsorted()
 
 
-def test_unmarking_a_kept_photo_makes_it_unsorted(model):
+def test_unmarking_a_kept_photo_counts_it_as_unmarked(model):
     model.set_status([4], None)
     assert model.counts() == (0, 0, 5)
-    assert model.has_unsorted()
 
 
 def test_apply_moves_updates_paths_and_locations(model):
@@ -256,7 +262,7 @@ def test_apply_moves_updates_paths_and_locations(model):
     assert model.photo(0).path == f"/f/{KEEP_DIR}/0.jpg"
     assert model.row_of(f"/f/{KEEP_DIR}/0.jpg") == 0
     assert model.row_of("/f/0.jpg") == -1
-    assert not model.has_unsorted()
+    assert model.photo(0).location == KEEP
 
 
 def test_model_ratings_and_labels_undo(model):
@@ -437,6 +443,7 @@ def test_damaged_session_falls_back_on_the_next_newest(tmp_path):
     assert problems == [str(tmp_path / "tamis_session.corrupt.json")]
 
 
+@needs_read_only_folders
 def test_damaged_session_in_a_read_only_folder_stays_put_and_is_reported(tmp_path):
     folder = tmp_path / "card"
     folder.mkdir()

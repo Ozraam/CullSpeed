@@ -15,7 +15,7 @@ import os
 import re
 from html import escape, unescape
 
-from .constants import RAW_EXTENSIONS
+from .constants import is_raw
 
 LABELS = ("Red", "Yellow", "Green", "Blue", "Purple")
 
@@ -39,14 +39,10 @@ _TEMPLATE = """<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 """
 
 
-def _is_raw(path):
-    return os.path.splitext(path)[1].lower() in RAW_EXTENSIONS
-
-
 def _candidates(path):
     """Sidecar names for `path`, most standard first: `IMG.xmp` (RAWs), `IMG.CR2.xmp`."""
     name = os.path.basename(path)
-    names = [os.path.splitext(name)[0] + ".xmp"] if _is_raw(path) else []
+    names = [os.path.splitext(name)[0] + ".xmp"] if is_raw(path) else []
     return [*names, name + ".xmp"]
 
 
@@ -134,7 +130,7 @@ def write(paths, rating, label, names):
         existing = _existing(path, names)
         if existing:
             targets += existing
-        elif _is_raw(path) and (rating or label):
+        elif is_raw(path) and (rating or label):
             name = _candidates(path)[0]
             names[name.lower()] = name
             targets.append(os.path.join(os.path.dirname(path), name))

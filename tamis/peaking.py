@@ -13,6 +13,7 @@ from PyQt6.QtCore import QObject, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 
 from .imaging import gray_array
+from .workers import emit_safely
 
 # Difference between neighbouring pixels (out of 255) that counts as in focus.
 # A fixed value, like on cameras: a photo that is sharp nowhere must show nothing.
@@ -93,8 +94,7 @@ class FocusPeaker(QObject):
                 if generation == self._generation and key in self._wanted:
                     with suppress(Exception):  # a bad photo must not kill a worker
                         result = overlay_image(image)
-                with suppress(RuntimeError):  # already destroyed during shutdown
-                    self._done.emit(generation, key, result)
+                emit_safely(self._done, generation, key, result)
 
             self._pool.start(job)
         return None

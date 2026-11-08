@@ -12,6 +12,8 @@ import numpy as np
 from PyQt6.QtCore import QObject, Qt, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 
+from .workers import emit_safely
+
 # A little inside the limits: JPEG compression leaves blown areas speckled with 254.
 HIGHLIGHT = 254  # a channel at or above this has lost its detail
 SHADOW = 1  # every channel at or below this is black
@@ -127,8 +129,7 @@ class ToneReader(QObject):
                 if generation == self._generation and key in self._wanted:
                     with suppress(Exception):  # a bad photo must not kill a worker
                         result = work(image)
-                with suppress(RuntimeError):  # already destroyed during shutdown
-                    self._done.emit(generation, key, result)
+                emit_safely(self._done, generation, key, result)
 
             self._pool.start(job)
         return None

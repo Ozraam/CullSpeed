@@ -9,8 +9,7 @@ from dataclasses import dataclass, field
 from PyQt6.QtCore import QFile
 
 from . import exif, exportsettings
-from .constants import EXPORT_DIR, KEEP, KEEP_DIR, REJECT, REJECT_DIR, SUPPORTED_EXTENSIONS
-from .imaging import is_raw
+from .constants import EXPORT_DIR, KEEP, KEEP_DIR, REJECT, REJECT_DIR, SUPPORTED_EXTENSIONS, is_raw
 
 
 @dataclass

@@ -26,17 +26,21 @@ Tamis is a PyQt6 desktop application for rapidly reviewing and triaging large ph
 - **Rotate and straighten**: `]` / `⇧R` and `[` / `⇧L` turn the current or selected photos by 90°, while culling too; the **Straighten** slider levels a horizon by up to 15°, enlarging the picture so that no empty corner shows. A crop stays on the same part of the picture through a quarter turn. Like a crop, these belong to their photo's framing: they are undoable, exported and cleared by Reset, but neither copied nor kept in a preset, and vignette and grain follow the final frame.
 - **Presets**: **Presets > Save Current Look…** keeps a look (without its framing) under a name, and choosing it applies it to the current or selected photos, on this shoot or any other, as one undo step. They are stored in `presets.json` in the app's data folder.
 - **Crop** (`R`): drag the frame's corners and edges, or inside it to move it, with a free or fixed shape (original, 1:1, 3:2, 4:5, 16:9…). `Enter`, `R` or a double-click applies it, `Esc` cancels; moving to another photo applies it too. Vignette and grain follow the final frame. A crop is part of the photo's edit (undoable, exported, cleared by Reset), but it stays with its photo: copying and pasting an edit carries the look over and leaves each photo's own crop alone.
-- New or removed files are picked up automatically while the folder is open (or with **Refresh**, `⌘R`).
+- Folders are read in the background, so a slow disk or network share doesn't freeze the window: the folder open until then stays usable, and a count of the photos found shows while it takes a while. New or removed files are picked up automatically while the folder is open (or with **Refresh**, `⌘R`): only the new ones are read, and the rest stays as it is, selection and Compare included. A RAW landing after its JPEG joins it as a pair, with the JPEG's marks.
 - Undo for every marking, rating and labelling action.
 - Marks are saved automatically in `tamis_session.json` inside each photo folder.
 - **Process Files** moves photos into `_KEEPS` / `_REJECTS` (or back to the root when unmarked). XMP sidecars move with their photo, and existing files are never overwritten (`IMG_1 (1).jpg` instead). Unless you untick the export box in its confirmation (ticked by default), it then fills the export folder (`_EXPORTS` unless the export settings say otherwise): edited photos are exported as JPEGs and unedited ones get their JPEG (the photo itself, or the JPEG of a RAW+JPEG pair) copied. The confirmation lets you choose what is exported: *everything except rejects* (the default) or *keeps only*, remembered for next time. Earlier exports of the same photos are replaced, so processing again refreshes them, and exports of photos rejected since are removed, from whichever folder they were written to (Tamis remembers what it exported: other files there, and exports changed since, stay). The confirmation lists the photos without a JPEG, which are not exported (`⌘⇧E` renders them), and those whose film simulation is no longer in the LUT folder, which would be exported without it. A photo whose files can't all be moved stays where it is, with its pair and sidecars, and exports are written to a temporary file first, so a failure never leaves a truncated JPEG behind.
 - **Export settings** (**Options ▾ > Export Settings…**, or the button in the Process Files confirmation): the longest edge (full size by default), the JPEG quality (92), the folder (relative to the shoot folder, such as `_EXPORTS` or `web/large`, or a full path; never the shoot folder itself, `_KEEPS` or `_REJECTS`) and a name pattern made of `{name}` (the original name), `{date}` (capture date, `YYYY-MM-DD`), `{seq}` (`001`, `002`… in the order of one export) and `{folder}` (the shoot folder's name). Save them as named profiles (web, client, print…) to switch between them. Rendered exports are tagged sRGB, with an ICC profile, and carry the EXIF of their original (camera, lens, date, exposure, copyright, GPS), with the orientation reset since their pixels are upright. Unedited JPEGs are copied as they are, unless they have to be resized.
 - Reopens the last folder and photo on launch. Drop a folder onto the window to open it.
+- **Options ▾ > About Tamis…** shows the version, and those of Python, Qt and LibRaw, for bug reports.
 - **Plugins**: add your own actions and shortcuts with a small Python file (see [Plugins](#plugins)).
 
 ## Requirements
 - Python 3.10+
 - PyQt6 (6.9+), rawpy and numpy, installed from `pyproject.toml`
+
+### Platforms
+macOS is the supported platform: it is what Tamis is used and built on, and the only one with a ready-made app (see [Releases](#releases)). CI also runs the tests on Linux and Windows, from source (`python -m tamis`), so that the app keeps working there, but they get less use; reports are welcome. On Windows, a read-only folder can't be simulated in the tests, so falling back to the app's data folder for marks isn't tested there.
 
 ## Quick Start
 ```bash
@@ -117,13 +121,14 @@ def register(tamis):
 | `set_edit(photos, edit)` | Replaces the edit with the settings of `develop.DEFAULTS`; `{}` removes it |
 | `toast(text)`, `message(title, text, details=None)` | A short message, or a dialog |
 | `get_setting(key, default=None)`, `set_setting(key, value)` | Values kept across launches, private to the plugin; anything JSON can represent |
+| `version` | Tamis's version, such as `"0.1.0"`, to check compatibility (`"unknown"` when run from a checkout that was never installed) |
 | `window` | The main window, for anything else. It is not a stable interface: it may change between versions |
 
 `photos` is a photo or a path, or a list of them, and every `set_…` call is one undo step. A photo is a read-only snapshot with `path`, `name`, `files` (with its companions), `status`, `location`, `rating`, `label` and `edit`.
 
 | Event | Arguments | When |
 | --- | --- | --- |
-| `folder_opened` / `folder_refreshed` | `folder` | A folder was opened / the open one was scanned again |
+| `folder_opened` / `folder_refreshed` | `folder` | A folder was opened (once it is read) / photos were added to or removed from the open one |
 | `photo_changed` | `photo` | Another photo became the current one |
 | `photos_edited` | `[photos]` | Marks, ratings, labels or edits changed, undo included |
 | `files_moved` | `{old path: new path}` | Process Files moved photos. Photos are identified by path, so a plugin keeping data per photo must follow this |
@@ -149,7 +154,10 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | --- | --- |
 | `tamis/main.py` | Application entry point |
 | `tamis/migration.py` | Brings over settings and sessions from when the app was called CullSpeed |
-| `tamis/app.py` | Main window: navigation, marking, processing |
+| `tamis/app.py` | Main window: opening folders, navigation, marking, editing, compare |
+| `tamis/processing.py` | Exporting, Process Files, importing and the Trash, behind a progress dialog (part of the main window) |
+| `tamis/scanning.py` | Reading folders in the background, whole or just what changed |
+| `tamis/workers.py` | Helpers shared by the background engines |
 | `tamis/models.py` | Photo list model, gallery filter, folder scan and session file |
 | `tamis/loader.py` | Background preview/thumbnail loading, caching and prefetching |
 | `tamis/thumbcache.py` | Thumbnails on disk |
@@ -171,22 +179,29 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `tamis/shortcuts.py` | The table of keyboard shortcuts: defaults, the user's changes, conflicts |
 | `tamis/shortcutsdialog.py` | The shortcut overview (`?`) and the editor |
 | `tamis/plugins.py` | Loading plugins, the API they receive and the Plugins menu |
-| `tamis/widgets.py` | Image and compare views, thumbnail delegate, bars, toast and dialogs |
+| `tamis/views.py` | The Cull tab's photo view (zoom, crop, overlays) and Compare's views |
+| `tamis/widgets.py` | Thumbnail delegate, bars, toast and dialogs |
 | `tamis/theme.py` | Dark palette and stylesheet |
 
 ## Development
 ```bash
 pip install -e ".[dev]"
-pytest                     # main window, plugins, edits, crop, presets, tones, LUTs, file moves, sessions, XMP, EXIF
+pytest                     # main window, plugins, edits, crop, presets, tones, LUTs, RAWs, file moves, sessions, XMP, EXIF
+pytest --cov=tamis --cov-report=term-missing   # and what the tests don't reach
 ruff check .
 ```
-CI runs both on every push and pull request (`.github/workflows/ci.yml`).
+CI runs both on every push and pull request (`.github/workflows/ci.yml`), on macOS, Linux and Windows. The RAW tests use tiny DNGs written on the fly (`tests/rawfiles.py`), so no camera file is shipped.
 
 To build a standalone app (`dist/Tamis.app` on macOS):
 ```bash
 pip install -e ".[build]"
 ./scripts/build_app.sh
 ```
+
+### Releases
+`scripts/build_app.sh` gives the bundle the version of `pyproject.toml` (`CFBundleShortVersionString`) and signs it ad hoc, which is enough on the Mac that built it. For anyone else, `scripts/package_macos.sh` signs it with a Developer ID (hardened runtime, `scripts/entitlements.plist`), wraps it in `dist/Tamis-<version>.dmg`, and notarizes and staples that; its header lists the environment variables it needs.
+
+Pushing a tag such as `v0.2.0` (matching `pyproject.toml`) runs `.github/workflows/release.yml`, which does all of that and publishes the DMG as a GitHub release. It needs an Apple Developer account and these repository secrets: `MACOS_CERTIFICATE` (the Developer ID Application certificate and key, as a base64 `.p12`), `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`, and an App Store Connect API key for notarization: `NOTARY_KEY` (base64 `.p8`), `NOTARY_KEY_ID`, `NOTARY_ISSUER`.
 
 ## Development Notes
 - Worker threads only produce `QImage`; `QPixmap` is created on the GUI thread.

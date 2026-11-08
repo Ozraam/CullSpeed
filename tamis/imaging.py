@@ -3,14 +3,13 @@
 Everything here runs in worker threads, so it only ever produces QImage
 (QPixmap must only be created on the GUI thread).
 """
-import os
 
 import numpy as np
 import rawpy
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt
 from PyQt6.QtGui import QColorSpace, QImage, QImageIOHandler, QImageReader, QTransform
 
-from .constants import RAW_EXTENSIONS
+from .constants import is_raw
 
 
 class ImageLoadError(Exception):
@@ -23,10 +22,6 @@ _FLIP_ROTATION = {3: 180, 5: 270, 6: 90}
 # At full resolution, an embedded preview smaller than this fraction of the
 # sensor is not good enough to judge focus: develop the RAW instead.
 _FULL_PREVIEW_MIN_RATIO = 0.6
-
-
-def is_raw(path):
-    return os.path.splitext(path)[1].lower() in RAW_EXTENSIONS
 
 
 def load_image(path, max_size):
