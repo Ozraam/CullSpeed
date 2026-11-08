@@ -1,7 +1,7 @@
 """Rendering edits: developing photos for editing, live previews and JPEG export.
 
 A photo is developed once into linear RGB (RAWs straight from LibRaw at 16
-bits, other images decoded from sRGB), kept small for previews. Renders run
+bits, other images converted to sRGB, then decoded), kept small for previews. Renders run
 on one background thread, newest request first, and split each image into
 strips processed in parallel (numpy releases the GIL while it computes).
 While a slider is being dragged a half-size preview is rendered, which
@@ -27,7 +27,7 @@ from PyQt6.QtGui import QColorSpace, QImage, QImageReader, QPixmap
 from . import develop, exif, lut
 from .constants import THUMBNAIL_CACHE_BYTES
 from .fileops import atomic_write, free_name
-from .imaging import array_to_image, image_to_array, is_raw, resize_array
+from .imaging import array_to_image, image_to_array, is_raw, resize_array, to_srgb
 from .loader import file_state, pixmap_bytes, thumbnail_decode_size
 
 EDIT_PREVIEW_SIZE = 2048  # longest edge of the image edits are previewed on
@@ -41,16 +41,22 @@ class EditError(Exception):
 
 # -- sources -------------------------------------------------------------------
 
-def _source(path, max_size):
-    """(pixels, kind): uint16 linear for RAWs ("linear16"), uint16 sRGB-encoded otherwise ("srgb16")."""
+def process_of(path, edit):
+    """How `edit` develops `path` (develop.PROCESS): what a developed photo is cached by."""
+    return edit.get("process", develop.PROCESS) if is_raw(path) else develop.PROCESS
+
+
+def _source(path, max_size, process=develop.PROCESS):
+    """(pixels, kind): uint16 linear for RAWs ("raw16", or "linear16" for process 1), uint16 sRGB otherwise ("srgb16")."""
     if is_raw(path):
+        options = {"gamma": (1, 1), "output_bps": 16, "use_camera_wb": True, "half_size": max_size is not None}
+        if process >= 2:
+            # A fixed gain (in _linearize) instead of LibRaw's automatic brightness, which clips
+            # the brightest 1% and changes from one photo to the next; clipped channels are blended.
+            options.update(no_auto_bright=True, highlight_mode=rawpy.HighlightMode.Blend)
         with rawpy.imread(path) as raw:
-            # Linear output with LibRaw's automatic brightness (the darkest 99% of the
-            # range fills the output), which looks like a neutral starting point.
-            pixels = raw.postprocess(
-                gamma=(1, 1), output_bps=16, use_camera_wb=True, half_size=max_size is not None
-            )
-        return (resize_array(pixels, max_size) if max_size else pixels), "linear16"
+            pixels = raw.postprocess(**options)
+        return (resize_array(pixels, max_size) if max_size else pixels), ("raw16" if process >= 2 else "linear16")
 
     reader = QImageReader(path)
     reader.setAutoTransform(True)
@@ -60,20 +66,21 @@ def _source(path, max_size):
     image = reader.read()
     if image.isNull():
         raise EditError(reader.errorString())
-    pixels = image_to_array(image)
+    pixels = image_to_array(to_srgb(image, deep=True))  # 16 bits: a 16-bit source keeps its precision
     return (resize_array(pixels, max_size) if max_size else pixels), "srgb16"
 
 
 def _linearize(block, kind):
+    if kind == "raw16":
+        return block.astype(np.float32) * np.float32(develop.RAW_GAIN / 65535)
     if kind == "linear16":
         return block.astype(np.float32) / 65535
-    # 16-bit sRGB from an 8-bit source: decode through the exact 8-bit table.
-    return develop.DECODE_8BIT[(block >> 8).astype(np.uint8)]
+    return develop.DECODE_16BIT[block]  # exact for 8- and 16-bit sources alike
 
 
-def develop_base(path, max_size=EDIT_PREVIEW_SIZE):
+def develop_base(path, max_size=EDIT_PREVIEW_SIZE, process=develop.PROCESS):
     """Linear float32 RGB of `path`, longest edge at most `max_size`."""
-    pixels, kind = _source(path, max_size)
+    pixels, kind = _source(path, max_size, process)
     return _linearize(pixels, kind)
 
 
@@ -81,13 +88,13 @@ def _seed(path):
     return zlib.crc32(os.path.basename(path).encode("utf-8"))
 
 
-def render_parallel(linear, edit, table, seed):
+def render_parallel(linear, edit, table, seed, raw=False):
     """develop.render() over strips of `linear`, in parallel."""
     height, width = linear.shape[:2]
     step = max(16, -(-height // (_STRIP_THREADS * 2)))
     starts = range(0, height, step)
     parts = _strip_pool.map(
-        lambda top: develop.render(linear[top:top + step], edit, table, seed, (top, 0), (height, width)), starts
+        lambda top: develop.render(linear[top:top + step], edit, table, seed, (top, 0), (height, width), raw), starts
     )
     return np.concatenate(list(parts))
 
@@ -122,7 +129,8 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=N
             tables[lut_path] = lut.build_table(lut.load_grid(lut_path))
         table = tables[lut_path]
 
-    pixels, kind = _source(path, None)
+    pixels, kind = _source(path, None, process_of(path, edit))
+    raw = is_raw(path)
     pixels = develop.turn_array(pixels, edit.get("rotate", 0))
     if edit.get("straighten"):
         pixels = straighten_parallel(pixels, edit["straighten"])
@@ -137,7 +145,7 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=N
         steps = range(0, rows, 240)
         parts = _strip_pool.map(
             lambda y, block=block, top=top: develop.render(
-                block[y:y + 240], edit, table, seed, (top + y, 0), (height, width)
+                block[y:y + 240], edit, table, seed, (top + y, 0), (height, width), raw
             ),
             steps,
         )
@@ -191,7 +199,7 @@ class EditRenderer(QObject):
         self._pool.setMaxThreadCount(1)
         self._lock = threading.Lock()  # guards everything a worker touches
         self._generation = 0
-        self._bases = OrderedDict()  # path -> (full preview, half-size preview)
+        self._bases = OrderedDict()  # (path, process) -> (full preview, half-size preview)
         self._tables = OrderedDict()  # LUT path -> table
         self._turned = OrderedDict()  # (path, quick, rotate, straighten) -> pixels
         self._wanted = {}  # path -> (key, edit, lut path, quick): the newest request
@@ -224,6 +232,12 @@ class EditRenderer(QObject):
     def error(self, path):
         return path in self._errors
 
+    def keep_requests(self, paths):
+        """Drop the requests not rendered yet of photos other than `paths`: they are no longer shown."""
+        with self._lock:
+            for path in [path for path in self._wanted if path not in paths]:
+                del self._wanted[path]
+
     def _request(self, path, key, edit, lut_path, quick):
         with self._lock:
             self._wanted[path] = (key, edit, lut_path, quick)
@@ -242,10 +256,12 @@ class EditRenderer(QObject):
                         return
                 key, edit, lut_path, quick = wanted
                 try:
-                    full, half = self._base(path)
+                    process = process_of(path, edit)
+                    full, half = self._base(path, process)
                     table = self.table(lut_path) if lut_path else None
-                    linear = develop.crop_array(self._upright(path, quick, half if quick else full, edit), edit.get("crop"))
-                    image = array_to_image(render_parallel(linear, edit, table, _seed(path)))
+                    upright = self._upright(path, process, quick, half if quick else full, edit)
+                    linear = develop.crop_array(upright, edit.get("crop"))
+                    image = array_to_image(render_parallel(linear, edit, table, _seed(path), is_raw(path)))
                     error = ""
                 except Exception as exc:  # a bad photo or LUT must not kill the worker
                     image, error = QImage(), str(exc) or type(exc).__name__
@@ -259,25 +275,26 @@ class EditRenderer(QObject):
 
         return job
 
-    def _base(self, path):
+    def _base(self, path, process):
+        key = (path, process)
         with self._lock:
-            if path in self._bases:
-                self._bases.move_to_end(path)
-                return self._bases[path]
-        full = develop_base(path)
+            if key in self._bases:
+                self._bases.move_to_end(key)
+                return self._bases[key]
+        full = develop_base(path, process=process)
         half = np.ascontiguousarray(full[::2, ::2])
         with self._lock:
-            self._bases[path] = (full, half)
+            self._bases[key] = (full, half)
             while len(self._bases) > self.BASES:
                 self._bases.popitem(last=False)
         return full, half
 
-    def _upright(self, path, quick, base, edit):
+    def _upright(self, path, process, quick, base, edit):
         """`base` turned and straightened as `edit` says."""
         rotate, straighten = edit.get("rotate", 0), edit.get("straighten", 0)
         if not rotate and not straighten:
             return base
-        key = (path, quick, rotate, straighten)
+        key = (path, process, quick, rotate, straighten)
         with self._lock:
             if key in self._turned:
                 self._turned.move_to_end(key)
@@ -327,9 +344,7 @@ class EditRenderer(QObject):
 
     def rename_paths(self, mapping):
         with self._lock:
-            for old, new in mapping.items():
-                if old in self._bases:
-                    self._bases[new] = self._bases.pop(old)
+            _rename_keys(self._bases, mapping)
             self._turned.clear()
         for cache in (self._renders, self._errors):
             for old, new in mapping.items():
@@ -352,7 +367,15 @@ class EditRenderer(QObject):
         self._pool.waitForDone()
 
 
+def _rename_keys(cache, mapping):
+    """Move the entries of `cache`, keyed by (path, …), to the new paths in `mapping`."""
+    for key in [key for key in cache if key[0] in mapping]:
+        cache[(mapping[key[0]], *key[1:])] = cache.pop(key)
+
+
 # -- thumbnails ------------------------------------------------------------------
+
+PIPELINE = 2  # goes up when renders of the same edit change (2: RAW process 2, colour spaces, 16-bit sources)
 
 class EditThumbnails(QObject):
     """Small renders of edits; results arrive as `ready(path)`.
@@ -377,7 +400,7 @@ class EditThumbnails(QObject):
         self._priority = count()
         self._lock = threading.Lock()  # guards everything a worker touches
         self._generation = 0
-        self._bases = OrderedDict()  # path -> linear pixels
+        self._bases = OrderedDict()  # (path, process) -> linear pixels
         self._wanted = {}  # path -> (key, edit, lut path, size): the newest request
         self._running = set()  # paths with a job queued or running
         self._pixmaps = OrderedDict()  # path -> (key, QPixmap), LRU order; GUI thread only
@@ -432,32 +455,34 @@ class EditThumbnails(QObject):
     def _render(self, path, key, edit, lut_path, size):
         state = file_state(path)
         lut_state = file_state(lut_path) if lut_path else None
-        digest = hashlib.sha1(f"{key}\0{lut_state}".encode("utf-8", "surrogateescape")).hexdigest()
+        # PIPELINE: thumbnails rendered by an older pipeline, from an edit that reads the same, are a miss.
+        digest = hashlib.sha1(f"{PIPELINE}\0{key}\0{lut_state}".encode("utf-8", "surrogateescape")).hexdigest()
         disk_key = f"{size}:{digest}"
         if self._disk and state:
             cached = self._disk.load(path, state, disk_key)
             if cached is not None:
                 return cached
         table = self._renderer.table(lut_path) if lut_path else None
-        linear = develop.turn_array(self._base(path, size), edit.get("rotate", 0))
+        linear = develop.turn_array(self._base(path, size, process_of(path, edit)), edit.get("rotate", 0))
         if edit.get("straighten"):
             linear = develop.straighten_rows(linear, edit["straighten"], 0, linear.shape[0])
         linear = develop.crop_array(linear, edit.get("crop"))
-        image = array_to_image(develop.render(linear, edit, table, _seed(path))).scaled(
+        image = array_to_image(develop.render(linear, edit, table, _seed(path), raw=is_raw(path))).scaled(
             size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
         )
         if self._disk and state:
             self._disk.save(path, state, disk_key, image)
         return image
 
-    def _base(self, path, size):
+    def _base(self, path, size, process):
+        key = (path, process)
         with self._lock:
-            if path in self._bases:
-                self._bases.move_to_end(path)
-                return self._bases[path]
-        base = develop_base(path, size * 2)  # twice the size, for what a crop leaves
+            if key in self._bases:
+                self._bases.move_to_end(key)
+                return self._bases[key]
+        base = develop_base(path, size * 2, process)  # twice the size, for what a crop leaves
         with self._lock:
-            self._bases[path] = base
+            self._bases[key] = base
             while len(self._bases) > self.BASES:
                 self._bases.popitem(last=False)
         return base
@@ -487,13 +512,12 @@ class EditThumbnails(QObject):
         self._drop(path)
         self._failed.pop(path, None)
         with self._lock:
-            self._bases.pop(path, None)
+            for key in [key for key in self._bases if key[0] == path]:
+                del self._bases[key]
 
     def rename_paths(self, mapping):
         with self._lock:
-            for old, new in mapping.items():
-                if old in self._bases:
-                    self._bases[new] = self._bases.pop(old)
+            _rename_keys(self._bases, mapping)
         for cache in (self._pixmaps, self._failed):
             for old, new in mapping.items():
                 if old in cache:

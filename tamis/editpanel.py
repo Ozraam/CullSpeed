@@ -226,6 +226,7 @@ class EditPanel(QFrame):
         self._updating = False
         self._crop = None  # the photo's crop and quarter turns: not sliders, but part of edit()
         self._rotate = 0
+        self._process = develop.PROCESS  # how the photo's RAW is developed: not a slider either
 
         # Stays visible above the scrolling sliders, which are what it is there to judge.
         header = QWidget()
@@ -249,6 +250,7 @@ class EditPanel(QFrame):
         hint = QLabel("Double-click a slider to reset it.")
         hint.setObjectName("Muted")
         layout.addWidget(hint)
+        layout.addWidget(self._raw_note())
 
         for section, rows in _SECTIONS:
             heading = QLabel(section.upper())
@@ -319,6 +321,33 @@ class EditPanel(QFrame):
         outer.addWidget(header)
         outer.addWidget(scroll, 1)
         outer.addWidget(footer)
+
+    def _raw_note(self):
+        """What a RAW is edited from, and the switch of older edits to the current development."""
+        box = QWidget()
+        rows = QVBoxLayout(box)
+        rows.setContentsMargins(0, 4, 0, 0)
+        rows.setSpacing(6)
+        self.raw_note = QLabel(
+            "RAW: edits start from Tamis's own development of the file, not from the camera's JPEG "
+            "that culling shows, so its colours can differ a little."
+        )
+        self.raw_note.setObjectName("Muted")
+        self.raw_note.setWordWrap(True)
+        self.process_note = QLabel(
+            "This edit uses the earlier RAW development, which clipped the brightest highlights."
+        )
+        self.process_note.setObjectName("Muted")
+        self.process_note.setWordWrap(True)
+        self.process_button = QPushButton("Use the New Development")
+        self.process_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.process_button.setToolTip("Develop this RAW the current way: its highlights can be brought back (undoable)")
+        self.process_button.clicked.connect(self._update_process)
+        for widget in (self.raw_note, self.process_note, self.process_button):
+            rows.addWidget(widget)
+        self._raw_box = box
+        box.hide()
+        return box
 
     def _button(self, text, signal):
         button = QPushButton(text)
@@ -429,11 +458,16 @@ class EditPanel(QFrame):
             index = self.lut_combo.count() - 1
         self.lut_combo.setCurrentIndex(index)
 
-    def set_edit(self, edit):
-        """Show `edit` without emitting `changed`."""
+    def set_edit(self, edit, raw=False):
+        """Show `edit`, of a RAW if `raw`, without emitting `changed`."""
         values = develop.settings(edit)
         self._crop = values["crop"]
         self._rotate = values["rotate"]
+        self._process = edit.get("process", develop.PROCESS)
+        legacy = raw and self._process < develop.PROCESS
+        self._raw_box.setVisible(raw)
+        self.process_note.setVisible(legacy)
+        self.process_button.setVisible(legacy)
         self._updating = True
         for key, (slider, scale) in self._sliders.items():
             slider.setValue(round(values[key] * scale))
@@ -446,6 +480,7 @@ class EditPanel(QFrame):
         values["lut"] = self.lut_combo.currentData()
         values["crop"] = self._crop
         values["rotate"] = self._rotate
+        values["process"] = self._process
         return develop.clean(values)
 
     def set_cropping(self, cropping):
@@ -473,6 +508,12 @@ class EditPanel(QFrame):
         if not self._updating:
             # Dragging previews; a click on the track or the wheel is a final change.
             self.changed.emit(self.edit(), not slider.isSliderDown())
+
+    def _update_process(self):
+        self._process = develop.PROCESS
+        self.process_note.hide()
+        self.process_button.hide()
+        self.changed.emit(self.edit(), True)
 
     def _commit(self):
         if not self._updating:

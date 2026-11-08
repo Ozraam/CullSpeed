@@ -284,8 +284,32 @@ def _set_aside(path):
     return target
 
 
+# Stored in the session under FORMAT_KEY. Sessions without it come from before format 2,
+# whose RAW edits were made with LibRaw's automatic brightness (develop "process" 1).
+FORMAT_KEY = "_format"
+SESSION_FORMAT = 2
+
+
+def _upgrade(data):
+    """`data`, a session as read, in the current format: older RAW edits keep their process."""
+    if data.get(FORMAT_KEY) == SESSION_FORMAT:
+        return data
+    upgraded = {}
+    for key, value in data.items():
+        if key == FORMAT_KEY:
+            continue
+        edit = value.get("edit") if isinstance(value, dict) else None
+        if _is_raw(key) and isinstance(edit, dict) and develop.clean(edit) and "process" not in edit:
+            value = {**value, "edit": {**edit, "process": 1}}
+        upgraded[key] = value
+    return upgraded
+
+
 def _read_session(folder, fallback_dir, problems):
-    """The newest readable session as stored, {} if none. Damaged ones are set aside and listed in `problems`."""
+    """The newest readable session, in the current format ({} if none), without its format key.
+
+    Damaged ones are set aside and listed in `problems`.
+    """
     paths = [*_session_paths(folder, fallback_dir), os.path.join(folder, LEGACY_SESSION_FILENAME)]
     existing = [path for path in paths if os.path.isfile(path)]
     for path in sorted(existing, key=os.path.getmtime, reverse=True):
@@ -297,7 +321,7 @@ def _read_session(folder, fallback_dir, problems):
         except ValueError:
             data = None
         if isinstance(data, dict):
-            return data
+            return {key: value for key, value in _upgrade(data).items() if key != FORMAT_KEY}
         location = _set_aside(path)
         if problems is not None:
             problems.append(location)
@@ -369,6 +393,7 @@ def save_session(folder, photos, fallback_dir=None, forget=(), problems=None):
     """
     data = {relative_key(folder, photo.path): _session_value(photo) for photo in photos}
     data.update(_absent_entries(folder, _read_session(folder, fallback_dir, problems), photos, data, forget))
+    data[FORMAT_KEY] = SESSION_FORMAT  # older versions skip it: it isn't a valid entry
     folder_path, *fallback = _session_paths(folder, fallback_dir)
     try:
         write_json(folder_path, data)

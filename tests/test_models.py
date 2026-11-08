@@ -4,7 +4,14 @@ import os
 import pytest
 
 from tamis.constants import KEEP, KEEP_DIR, LEGACY_SESSION_FILENAME, REJECT, REJECT_DIR, SESSION_FILENAME
-from tamis.models import Photo, PhotoModel, load_session, save_session, scan_folder
+from tamis.models import FORMAT_KEY, SESSION_FORMAT, Photo, PhotoModel, load_session, save_session, scan_folder
+
+
+def stored(folder):
+    """The session saved in `folder`, without its format key (which must be the current one)."""
+    data = json.loads((folder / SESSION_FILENAME).read_text())
+    assert data.pop(FORMAT_KEY) == SESSION_FORMAT
+    return data
 
 
 def touch(path):
@@ -300,7 +307,7 @@ def test_session_stores_ratings_and_labels(tmp_path):
     touch(tmp_path / "b.jpg")
     save_session(folder, [Photo(f"{folder}/a.jpg", KEEP, rating=3, label="Green"), Photo(f"{folder}/b.jpg", REJECT)])
 
-    data = json.loads((tmp_path / SESSION_FILENAME).read_text())
+    data = stored(tmp_path)
     assert data == {"a.jpg": {"status": KEEP, "rating": 3, "label": "Green"}, "b.jpg": REJECT}
     photos = {p.name: (p.status, p.rating, p.label) for p in scan_folder(folder)}
     assert photos == {"a.jpg": (KEEP, 3, "Green"), "b.jpg": (REJECT, 0, None)}
@@ -317,7 +324,7 @@ def test_session_stores_edits(tmp_path):
     edit = {"exposure": 0.5, "lut": "Fuji/Velvia 50.png"}
     save_session(folder, [Photo(f"{folder}/a.jpg", edit=edit)])
 
-    assert json.loads((tmp_path / SESSION_FILENAME).read_text())["a.jpg"]["edit"] == edit
+    assert stored(tmp_path)["a.jpg"]["edit"] == edit
     [photo] = scan_folder(folder)
     assert photo.edit == edit
 
@@ -370,7 +377,7 @@ def test_session_forgets_moved_photos_and_entries_with_nothing_in_them(tmp_path)
         "moved.jpg": KEEP, "gone.jpg": REJECT, "unmarked.jpg": None, "invalid.jpg": "maybe",
     })
     save_session(folder, [], forget={"moved.jpg"})
-    assert set(json.loads((tmp_path / SESSION_FILENAME).read_text())) == {"gone.jpg"}
+    assert set(stored(tmp_path)) == {"gone.jpg"}
 
 
 def test_session_drops_a_filename_key_once_a_photo_has_taken_it_over(tmp_path):
@@ -382,7 +389,7 @@ def test_session_drops_a_filename_key_once_a_photo_has_taken_it_over(tmp_path):
 
     save_session(folder, photos)
 
-    assert set(json.loads((tmp_path / SESSION_FILENAME).read_text())) == {f"{KEEP_DIR}/a.jpg"}
+    assert set(stored(tmp_path)) == {f"{KEEP_DIR}/a.jpg"}
 
 
 def test_session_drops_the_entry_of_a_file_that_is_no_longer_a_photo_of_its_own(tmp_path):
@@ -391,7 +398,7 @@ def test_session_drops_the_entry_of_a_file_that_is_no_longer_a_photo_of_its_own(
     touch(tmp_path / "IMG.CR2")
     write_session(tmp_path, {"IMG.jpg": KEEP})
     save_session(folder, [Photo(f"{folder}/IMG.CR2", companions=[f"{folder}/IMG.jpg"])])
-    assert set(json.loads((tmp_path / SESSION_FILENAME).read_text())) == {"IMG.CR2"}
+    assert set(stored(tmp_path)) == {"IMG.CR2"}
 
 
 @pytest.mark.parametrize("content", ["{not json", "[1, 2]", ""])
@@ -512,3 +519,30 @@ def test_natural_sort_ties_fall_back_on_the_path(tmp_path):
         (tmp_path / folder / "a1.jpg").write_bytes(b"x")
     paths = [p.path for p in scan_folder(str(tmp_path))]
     assert paths == sorted(paths)
+
+
+# -- edits made with an earlier RAW development -------------------------------------------------
+
+def test_raw_edits_of_older_sessions_keep_the_earlier_process(tmp_path):
+    for name in ("a.CR2", "b.CR2", "c.jpg"):
+        touch(tmp_path / name)
+    write_session(tmp_path, {
+        "a.CR2": {"status": KEEP, "edit": {"exposure": 1.0}},
+        "b.CR2": KEEP,  # not edited: gets the current process once it is
+        "c.jpg": {"status": KEEP, "edit": {"exposure": 1.0}},  # not a RAW: the process changes nothing
+    })
+    edits = {p.name: p.edit for p in scan_folder(str(tmp_path))}
+    assert edits == {"a.CR2": {"exposure": 1.0, "process": 1}, "b.CR2": {}, "c.jpg": {"exposure": 1.0}}
+
+    save_session(str(tmp_path), scan_folder(str(tmp_path)))
+    assert stored(tmp_path)["a.CR2"]["edit"] == {"exposure": 1.0, "process": 1}
+    # Read again, in the current format: edits without a process are current ones.
+    write_session(tmp_path, {FORMAT_KEY: SESSION_FORMAT, "a.CR2": {"status": KEEP, "edit": {"exposure": 1.0}}})
+    assert {p.name: p.edit for p in scan_folder(str(tmp_path))}["a.CR2"] == {"exposure": 1.0}
+
+
+def test_entries_of_absent_photos_are_upgraded_too(tmp_path):
+    touch(tmp_path / "a.jpg")
+    write_session(tmp_path, {"gone.NEF": {"status": KEEP, "edit": {"contrast": 20}}})
+    save_session(str(tmp_path), scan_folder(str(tmp_path)))
+    assert stored(tmp_path)["gone.NEF"]["edit"] == {"contrast": 20, "process": 1}

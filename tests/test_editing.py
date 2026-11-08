@@ -2,10 +2,10 @@ import os
 
 import numpy as np
 import pytest
-from PyQt6.QtGui import QColor, QImage
+from PyQt6.QtGui import QColor, QColorSpace, QImage
 
 from tamis import editing
-from tamis.imaging import image_to_array
+from tamis.imaging import image_to_array, load_image
 
 
 def jpeg(path, width=300, height=200, grey=100):
@@ -131,3 +131,76 @@ def test_export_scales_down_to_the_long_edge(tmp_path):
     large = editing.export_photo(source, {}, None, str(tmp_path / "out"), name="large.jpg", long_edge=1000)
     assert QImage(small).size().width() == 150 and QImage(small).size().height() == 100
     assert QImage(large).size().width() == 300  # never enlarged
+
+
+# -- sources -----------------------------------------------------------------------
+
+class FakeRaw:
+    """rawpy.imread() of a RAW whose development is `pixels`, recording how it was asked for."""
+
+    calls = []
+
+    def __init__(self, pixels):
+        self.pixels = pixels
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def postprocess(self, **options):
+        FakeRaw.calls.append(options)
+        return self.pixels
+
+
+def test_raws_are_developed_without_automatic_brightness(tmp_path, monkeypatch):
+    pixels = np.full((20, 30, 3), 6000, dtype=np.uint16)
+    monkeypatch.setattr(editing.rawpy, "imread", lambda path: FakeRaw(pixels))
+    FakeRaw.calls.clear()
+    path = str(tmp_path / "a.CR2")
+
+    base = editing.develop_base(path)
+    assert FakeRaw.calls[-1]["no_auto_bright"] and FakeRaw.calls[-1]["highlight_mode"] == editing.rawpy.HighlightMode.Blend
+    assert np.allclose(base, 6000 / 65535 * editing.develop.RAW_GAIN)  # one gain for every photo
+
+    legacy = editing.develop_base(path, process=1)
+    assert "no_auto_bright" not in FakeRaw.calls[-1]
+    assert np.allclose(legacy, 6000 / 65535)
+    assert editing.process_of(path, {"exposure": 1, "process": 1}) == 1
+    assert editing.process_of(path, {"exposure": 1}) == editing.develop.PROCESS
+    assert editing.process_of(str(tmp_path / "a.jpg"), {"process": 1}) == editing.develop.PROCESS
+
+
+def test_16_bit_sources_keep_their_precision(tmp_path):
+    width = 1024
+    ramp = np.linspace(20000, 24000, width).astype(np.uint16)  # 4000 levels, about 16 in 8 bits
+    rgbx = np.empty((4, width, 4), dtype=np.uint16)
+    rgbx[..., :3] = ramp[None, :, None]
+    rgbx[..., 3] = 65535
+    data = rgbx.tobytes()
+    image = QImage(data, width, 4, width * 8, QImage.Format.Format_RGBX64).copy()
+    path = str(tmp_path / "deep.png")
+    assert image.save(path)
+
+    base = editing.develop_base(path, max_size=None)
+    assert len(np.unique(base[0, :, 1])) > 1000
+    assert abs(float(base[0, 0, 1]) - float(editing.develop.DECODE_16BIT[20000])) < 1e-4
+
+
+def test_sources_in_another_colour_space_are_converted_to_srgb(tmp_path):
+    image = QImage(40, 30, QImage.Format.Format_RGB32)
+    image.fill(QColor(30, 200, 40))
+    image.setColorSpace(QColorSpace(QColorSpace.NamedColorSpace.DisplayP3))
+    path = str(tmp_path / "p3.png")
+    assert image.save(path)  # with its ICC profile
+
+    base = editing.develop_base(path, max_size=None)
+    expected = image.convertedToColorSpace(QColorSpace(QColorSpace.NamedColorSpace.SRgb))
+    green = editing.develop.DECODE_16BIT[expected.pixelColor(0, 0).green() * 257]
+    assert abs(float(base[0, 0, 1]) - float(green)) < 0.01
+    # P3 green is beyond sRGB: decoded as sRGB, the photo would be duller.
+    assert float(base[0, 0, 1]) > float(editing.develop.DECODE_16BIT[200 * 257]) + 0.02
+
+    preview, _native = load_image(path, None)  # culling shows it alike
+    assert abs(preview.pixelColor(0, 0).green() - expected.pixelColor(0, 0).green()) <= 1

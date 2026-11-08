@@ -8,7 +8,7 @@ import os
 import numpy as np
 import rawpy
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt
-from PyQt6.QtGui import QImage, QImageIOHandler, QImageReader, QTransform
+from PyQt6.QtGui import QColorSpace, QImage, QImageIOHandler, QImageReader, QTransform
 
 from .constants import RAW_EXTENSIONS
 
@@ -89,6 +89,7 @@ def _read(source, max_size, raw_flip=0):
     image = reader.read()
     if image.isNull():
         raise ImageLoadError(reader.errorString())
+    image = to_srgb(image)
 
     transform = reader.transformation()
     rotate_raw = bool(raw_flip) and transform == QImageIOHandler.Transformation.TransformationNone
@@ -142,6 +143,24 @@ def _embedded_preview(raw, max_size):
         image = _rotate(_from_array(thumb.data), flip)
         return image, image.size()
     return None
+
+
+_SRGB = QColorSpace(QColorSpace.NamedColorSpace.SRgb)
+
+
+def to_srgb(image, deep=False):
+    """`image` in sRGB, which is how everything shows and edits it: an Adobe RGB or Display P3
+    photo would look washed out otherwise. Images without a colour space are taken as sRGB.
+
+    `deep` converts at 16 bits per channel, for editing; previews keep their 8 bits.
+    """
+    space = image.colorSpace()
+    if not space.isValid() or space == _SRGB:
+        return image
+    if deep and image.depth() < 64:
+        image = image.convertToFormat(QImage.Format.Format_RGBA64)
+    converted = image.convertedToColorSpace(_SRGB)
+    return image if converted.isNull() else converted
 
 
 def image_to_array(image):
