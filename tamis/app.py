@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import bursts, cropping, develop, exportsettings, lut, xmp
+from . import bursts, cropping, develop, exportsettings, lut, shortcuts, xmp
 from .analysis import PhotoAnalyzer
 from .constants import (
     FALLBACK_SESSIONS_DIR,
@@ -79,6 +79,7 @@ from .models import SORT_KEYS, PhotoModel, StatusFilterProxy, by_name, photo_fil
 from .peaking import FocusPeaker
 from .plugins import PhotoInfo, PluginManager
 from .presets import PresetStore
+from .shortcutsdialog import ShortcutsDialog, ShortcutsEditor
 from .thumbcache import ThumbnailCache
 from .tones import ToneReader
 from .widgets import (
@@ -313,6 +314,7 @@ class TamisApp(QMainWindow):
 
         self._build_ui()
         self.analyzer.progressed.connect(self.stats.set_analysis_progress)
+        self.shortcut_keys = shortcuts.load(self.settings)
         self._build_shortcuts()
         self._load_luts(quiet=True)
         self._restore_window()
@@ -467,60 +469,101 @@ class TamisApp(QMainWindow):
             marks.addAction(action)
             self.xmp_mark_actions[value] = action
         menu.addAction("Export Settings…", self.edit_export_settings)
+        menu.addAction("Keyboard Shortcuts…", self.edit_shortcuts)
         return menu
 
-    def _build_shortcuts(self):
-        self.cull_shortcuts = []
-
-        def bind(keys, slot, cull_only=False, repeat=True):
-            for key in keys:
-                shortcut = QShortcut(QKeySequence(key), self)
-                shortcut.setAutoRepeat(repeat)
-                shortcut.activated.connect(slot)
-                if cull_only:
-                    self.cull_shortcuts.append(shortcut)
-
-        bind(["P", "1"], lambda: self.mark(KEEP))
-        bind(["Shift+P"], self.keep_one_of_burst)
-        bind(["B"], lambda: self.set_bursts(not self.show_bursts))
-        bind(["X", "3"], lambda: self.mark(REJECT))
-        bind(["U", "2", "Backspace"], lambda: self.mark(None))
-        # Stars and colour labels follow Lightroom's 0–5 and 6–9, with ⌘/Ctrl
-        # since the bare digits already keep, unmark and reject.
+    def _shortcut_slots(self):
+        """What each command of `shortcuts.COMMANDS` does."""
+        slots = {
+            "keep": lambda: self.mark(KEEP),
+            "reject": lambda: self.mark(REJECT),
+            "unmark": lambda: self.mark(None),
+            "keep_cull": lambda: self.mark(KEEP),
+            "reject_cull": lambda: self.mark(REJECT),
+            "keep_one_of_burst": self.keep_one_of_burst,
+            "undo": self.undo,
+            "next": lambda: self.step(1),
+            "previous": lambda: self.step(-1),
+            "first": lambda: self.go_to_end(first=True),
+            "last": lambda: self.go_to_end(first=False),
+            "next_unmarked": self.next_unmarked,
+            "toggle_tab": self.toggle_tab,
+            "keeps_only": self.toggle_keeps_only,
+            "zoom": self.toggle_zoom,
+            "escape": self.escape,
+            "compare": self.toggle_compare,
+            "info": self.toggle_info,
+            "bursts": lambda: self.set_bursts(not self.show_bursts),
+            "peaking": self.toggle_peaking,
+            "clipping": lambda: self.set_clipping(not self.show_clipping),
+            "before": self._hold_before,
+            "shortcuts": self.show_shortcuts,
+            "edit_panel": self.toggle_edit_panel,
+            "crop": self.toggle_crop,
+            "confirm_crop": self._confirm_crop,
+            "rotate_right": lambda: self.rotate_photos(90),
+            "rotate_left": lambda: self.rotate_photos(-90),
+            "copy_edit": self.copy_edit,
+            "paste_edit": self.paste_edit,
+            "open": self.choose_folder,
+            "import": self.import_photos,
+            "refresh": self.refresh,
+            "export": self.export_photos,
+        }
         for stars in range(6):
-            bind([f"Ctrl+{stars}"], lambda stars=stars: self.rate(stars))
-        for key, label in zip("6789", xmp.LABELS, strict=False):
-            bind([f"Ctrl+{key}"], lambda label=label: self.set_label(label))
-        bind([QKeySequence.StandardKey.Undo], self.undo)
-        bind([QKeySequence.StandardKey.Open], self.choose_folder)
-        bind(["Ctrl+I"], self.import_photos)
-        bind(["Ctrl+R", "F5"], self.refresh)
-        bind(["G"], self.toggle_tab)
-        bind(["C"], self.toggle_compare)
-        bind(["I"], self.toggle_info)
-        bind(["E"], self.toggle_edit_panel)
-        bind(["R"], self.toggle_crop)
-        bind(["]", "Shift+R"], lambda: self.rotate_photos(90))
-        bind(["[", "Shift+L"], lambda: self.rotate_photos(-90))
-        bind(["Ctrl+C", "Ctrl+Shift+C"], self.copy_edit)
-        bind(["Ctrl+V", "Ctrl+Shift+V"], self.paste_edit)
-        bind(["Ctrl+Shift+E"], self.export_photos)
+            slots[f"rate_{stars}"] = lambda stars=stars: self.rate(stars)
+        for label in xmp.LABELS:
+            slots[f"label_{label.lower()}"] = lambda label=label: self.set_label(label)
+        return slots
 
-        # In the gallery the arrow keys move through the grid instead.
-        bind(["Up"], lambda: self.mark(KEEP), cull_only=True)
-        bind(["Down"], lambda: self.mark(REJECT), cull_only=True)
-        bind(["Right", "L", "Space"], lambda: self.step(1), cull_only=True)
-        bind(["Left", "H"], lambda: self.step(-1), cull_only=True)
-        bind(["Home"], lambda: self.go_to_end(first=True), cull_only=True)
-        bind(["End"], lambda: self.go_to_end(first=False), cull_only=True)
-        bind(["N"], self.next_unmarked, cull_only=True)
-        bind(["K"], self.toggle_keeps_only, cull_only=True)
-        bind(["Z"], self.toggle_zoom, cull_only=True)
-        bind(["F"], self.toggle_peaking, cull_only=True)
-        bind(["J"], lambda: self.set_clipping(not self.show_clipping), cull_only=True)
-        bind(["Y", "\\"], self._hold_before, cull_only=True, repeat=False)
-        bind(["Escape"], self.escape, cull_only=True)
-        bind(["Return", "Enter"], self._confirm_crop, cull_only=True)
+    def _build_shortcuts(self):
+        """Bind the keys of `self.shortcut_keys`, replacing any bound before.
+
+        Must run before plugins load, so that the plugins' shortcuts that are taken are refused.
+        """
+        for shortcut in getattr(self, "app_shortcuts", ()):
+            shortcut.setParent(None)  # at once: plugins look for the taken keys among the children
+            shortcut.deleteLater()
+        self.app_shortcuts = []
+        self.cull_shortcuts = []
+        slots = self._shortcut_slots()
+        in_cull = self.tabs.currentIndex() == CULL_TAB
+        for command in shortcuts.COMMANDS:
+            for key in self.shortcut_keys[command.id]:
+                shortcut = QShortcut(QKeySequence(key), self)
+                shortcut.setAutoRepeat(command.repeat)
+                shortcut.activated.connect(slots[command.id])
+                self.app_shortcuts.append(shortcut)
+                if command.cull_only:  # in the gallery the arrow keys move through the grid instead
+                    shortcut.setEnabled(in_cull)
+                    self.cull_shortcuts.append(shortcut)
+        self.stats.set_hint(shortcuts.hint(self.shortcut_keys))
+
+    def _plugin_shortcuts(self):
+        """{key: "Plugins > title"} for the plugins' actions that have a shortcut."""
+        return {
+            action.shortcut().toString(): f"{plugin.name} > {action.text()}"
+            for plugin in self.plugins.plugins
+            for action in plugin.actions
+            if not action.shortcut().isEmpty()
+        }
+
+    def show_shortcuts(self):
+        """The overview of every shortcut, from which they can be changed."""
+        dialog = ShortcutsDialog(self, self.shortcut_keys, self._plugin_shortcuts())
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.customize:
+            self.edit_shortcuts()
+
+    def edit_shortcuts(self):
+        """Change the keys; returns whether they were changed."""
+        dialog = ShortcutsEditor(self, self.shortcut_keys, self._plugin_shortcuts())
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.bindings == self.shortcut_keys:
+            return False
+        self.shortcut_keys = dialog.bindings
+        shortcuts.save(self.settings, self.shortcut_keys)
+        self._build_shortcuts()
+        self.toast.show_message("Keyboard shortcuts saved")
+        return True
 
     # -- folder ------------------------------------------------------------
 

@@ -919,16 +919,7 @@ class StatsBar(QFrame):
         self.lbl_analysis = QLabel()
         self.lbl_analysis.setObjectName("Muted")
 
-        native = QKeySequence.SequenceFormat.NativeText
-        undo = QKeySequence(QKeySequence.StandardKey.Undo).toString(native)
-        mod = QKeySequence("Ctrl+1").toString(native)[:-1]  # "⌘" on macOS, "Ctrl+" elsewhere
-        hint = QLabel(
-            f"P keep · X reject · U unmark · {mod}1–5 stars · {mod}6–9 label · N next unmarked · K keeps only · "
-            f"B bursts · ⇧P keep one of a burst · C compare · E edit · Y hold for before · R crop · [ ] rotate · "
-            f"J clipping · {mod}C / {mod}V copy / paste edit · "
-            f"Z zoom · F focus peaking · I info · G gallery · {undo} undo"
-        )
-        hint.setToolTip(hint.text())
+        self.hint = hint = QLabel()
         # May be cut off in a narrow window rather than force the window wider.
         hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         hint.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -943,6 +934,10 @@ class StatsBar(QFrame):
         layout.addWidget(self.lbl_analysis)
         layout.addWidget(hint, 1)
         self.update_counts(0, 0, 0)
+
+    def set_hint(self, text):
+        self.hint.setText(text)
+        self.hint.setToolTip(text)
 
     def update_counts(self, keeps, rejects, unmarked):
         self.lbl_keep.setText(f"Keeps  {keeps}")
