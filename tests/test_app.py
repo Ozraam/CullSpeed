@@ -1,5 +1,6 @@
 """The main window, driven by its real shortcuts and mouse events, on a throwaway folder."""
 import json
+import math
 import os
 
 import numpy as np
@@ -1921,3 +1922,61 @@ def test_the_editor_refuses_a_key_used_twice(window):
     assert not dialog.confirm_button.isEnabled()  # a plugin has it
     dialog.set_bindings(shortcuts.defaults())
     assert dialog.confirm_button.isEnabled() and dialog.bindings == shortcuts.defaults()
+
+
+# -- RAWs while editing ----------------------------------------------------------
+
+def raw_photo(window, tmp_path, monkeypatch, level=3000):
+    """A RAW in the folder whose development is a flat `level`, shown; returns its row."""
+    from tamis import editing
+
+    pixels = np.full((200, 300, 3), level, dtype=np.uint16)
+    monkeypatch.setattr(editing, "_source", lambda path, max_size, process=2: (pixels, "raw16" if process >= 2 else "linear16"))
+    (tmp_path / "shot.CR2").write_bytes(b"no embedded preview: culling can't show it")
+    window.load_folder(str(tmp_path), select="shot.CR2")
+    row = window.model.row_of(str(tmp_path / "shot.CR2"))
+    assert window.current_row == row
+    return row
+
+
+def test_an_unedited_raw_shows_its_development_while_editing(window, tmp_path, monkeypatch):
+    row = raw_photo(window, tmp_path, monkeypatch)
+    assert window.model.photo(row).edit == {}
+    if not window.edit_panel.isVisible():
+        window.toggle_edit_panel()
+    expected = develop.render(np.full((1, 1, 3), 3000 / 65535 * develop.RAW_GAIN, dtype=np.float32), {}, raw=True)[0, 0]
+    assert wait_until(lambda: window.image_view._pixmap is not None)
+    assert abs(window.image_view._pixmap.toImage().pixelColor(5, 5).green() - int(expected[1])) <= 1
+    assert window.edit_panel._raw_box.isVisibleTo(window.edit_panel)
+    assert not window.edit_panel.process_button.isVisibleTo(window.edit_panel)
+
+    window.toggle_edit_panel()  # culling: the camera's preview, which this RAW lacks
+    assert window.image_view._pixmap is None
+
+
+def test_an_older_raw_edit_keeps_its_process_until_updated(window, tmp_path, monkeypatch):
+    row = raw_photo(window, tmp_path, monkeypatch)
+    if not window.edit_panel.isVisible():
+        window.toggle_edit_panel()
+    window.model.set_field([row], "edit", {"exposure": 0.5, "process": 1})
+    window.go_to(row)
+    assert window.edit_panel.process_button.isVisibleTo(window.edit_panel)
+    assert window.edit_panel.edit() == {"exposure": 0.5, "process": 1}
+
+    # A look pasted over it leaves its process alone, like its framing.
+    window.edit_clipboard = {"contrast": 20}
+    window.paste_edit()
+    assert window.model.photo(row).edit == {"contrast": 20, "process": 1}
+
+    # The earlier development gave the same pixels without the fixed gain: exposure makes up for it.
+    window.edit_panel.process_button.click()
+    assert window.model.photo(row).edit == {"contrast": 20, "exposure": round(-math.log2(develop.RAW_GAIN), 2)}
+    assert not window.edit_panel.process_button.isVisibleTo(window.edit_panel)
+    window.undo()
+    assert window.model.photo(row).edit == {"contrast": 20, "process": 1}
+
+
+def test_the_raw_note_is_only_for_raws(window):
+    if not window.edit_panel.isVisible():
+        window.toggle_edit_panel()
+    assert not window.edit_panel._raw_box.isVisibleTo(window.edit_panel)

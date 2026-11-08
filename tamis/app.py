@@ -52,7 +52,7 @@ from .constants import (
     SESSION_FILENAME,
     UNDO_LIMIT,
 )
-from .editing import EditRenderer, EditThumbnails, export_photo
+from .editing import EditRenderer, EditThumbnails, export_photo, exposure_shift
 from .editpanel import EditPanel
 from .exif import summary
 from .exportsettings import ExportSettings
@@ -74,6 +74,7 @@ from .fileops import (
     trash_size,
     without_export,
 )
+from .imaging import is_raw
 from .loader import ImageLoader
 from .models import SORT_KEYS, PhotoModel, StatusFilterProxy, by_name, photo_files, relative_key, save_session, scan_folder
 from .peaking import FocusPeaker
@@ -370,6 +371,7 @@ class TamisApp(QMainWindow):
         self.edit_panel.preset_chosen.connect(self.apply_preset)
         self.edit_panel.preset_save_requested.connect(self.save_preset)
         self.edit_panel.preset_delete_requested.connect(self.delete_preset)
+        self.edit_panel.process_update_requested.connect(self.update_process)
         self.edit_panel.set_presets(self.presets.names())
         self.edit_panel.setVisible(self.settings.value("edit_panel", False, type=bool))
 
@@ -778,7 +780,7 @@ class TamisApp(QMainWindow):
         others = [r for r in self._shown_rows() if r != row] + nearby
         self.loader.ensure_previews(photo.path, [self.model.photo(r).path for r in dict.fromkeys(others)])
         self.live_edit = None
-        self.edit_panel.set_edit(photo.edit)
+        self.edit_panel.set_edit(photo.edit, is_raw(photo.path))
         self._refresh_view()
         if moved_on:
             self.plugins.emit("photo_changed", PhotoInfo.of(photo))
@@ -903,6 +905,7 @@ class TamisApp(QMainWindow):
         self.tones.begin()
         # Previews are downscaled, so while zoomed the photos load at full resolution.
         self.loader.ensure_full([self.model.photo(row).path for _, row in shown], load=zoomed)
+        self.editor.keep_requests({self.model.photo(row).path for _, row in shown})
         for view, row in shown:
             self._show_in(view, row, zoomed)
 
@@ -963,15 +966,26 @@ class TamisApp(QMainWindow):
         """Whether the photo is being shown without an edit it has."""
         return self.before and not self.cropping and bool(develop.look(self._shown_edit(photo)))
 
+    def _develops(self, photo):
+        """Whether the photo shows its own development even unedited: a RAW, while the edit panel is open.
+
+        A RAW's preview is the camera's JPEG, which edits don't start from: shown while
+        editing, it would change all at once with the first slider moved.
+        """
+        return self.edit_panel.isVisible() and is_raw(photo.path)
+
     def _edited_pixmap(self, photo):
-        """The render of the photo's edit (or of the one being dragged), if it has one."""
-        if self.before and not self.cropping:
-            return None  # the preview any unedited photo shows, which _framed() keeps in its frame
-        live = self.live_edit is not None and self.live_edit[0] == photo.path
+        """The render of the photo's edit (or of the one being dragged), if it has one, or of its development."""
+        develops = self._develops(photo)
         edit = self._shown_edit(photo)
+        if self.before and not self.cropping:
+            if not develops:
+                return None  # the preview any unedited photo shows, which _framed() keeps in its frame
+            edit = develop.own(edit)  # the development, framed, without the look
+        live = self.live_edit is not None and self.live_edit[0] == photo.path
         if self.cropping:
             edit = {key: value for key, value in edit.items() if key != "crop"}
-        if not edit:
+        if not edit and not develops:
             return None
         return self.editor.pixmap(photo.path, edit, self._lut_path(edit), quick=live, same_crop=self.cropping)
 
@@ -1110,9 +1124,35 @@ class TamisApp(QMainWindow):
         if visible:
             self.tabs.setCurrentIndex(CULL_TAB)
             if self.current_row >= 0:
-                self.edit_panel.set_edit(self.model.photo(self.current_row).edit)
+                self._show_edit_in_panel()
         self.live_edit = None
         self._refresh_view()
+
+    def update_process(self):
+        """Develop the current RAW the current way, with the exposure that keeps it as bright as it was."""
+        if self.current_row < 0:
+            return
+        photo = self.model.photo(self.current_row)
+        edit = photo.edit
+        old = edit.get("process", develop.PROCESS)
+        if not is_raw(photo.path) or old >= develop.PROCESS:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            shift = exposure_shift(photo.path, old)
+        except Exception as exc:  # a RAW LibRaw can't read: nothing to compare, nothing changed
+            self.toast.show_message(f"Could not develop {photo.name}: {exc}", 4000)
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        exposure = edit.get("exposure", 0.0) + shift
+        self.live_edit = None
+        self._set_edit([self.current_row], develop.clean({**edit, "process": develop.PROCESS, "exposure": exposure}))
+        self.toast.show_message(f"New development · exposure {shift:+.2f} EV, to keep the photo as bright")
+
+    def _show_edit_in_panel(self):
+        photo = self.model.photo(self.current_row)
+        self.edit_panel.set_edit(photo.edit, is_raw(photo.path))
 
     def _on_edit_changed(self, edit, final):
         if self.current_row < 0:
@@ -1136,8 +1176,8 @@ class TamisApp(QMainWindow):
                 self.editor.forget(self.model.photo(row).path)
 
     def _apply_look(self, rows, look):
-        """Give `rows` this look. Each photo keeps its own framing."""
-        self._set_edits({row: {**look, **develop.framing(self.model.photo(row).edit)} for row in rows})
+        """Give `rows` this look. Each photo keeps its own framing and process."""
+        self._set_edits({row: develop.clean({**look, **develop.own(self.model.photo(row).edit)}) for row in rows})
 
     def copy_edit(self):
         """Copy the current photo's look. Its framing belongs to that photo: it is not copied."""
@@ -1261,7 +1301,7 @@ class TamisApp(QMainWindow):
             self.image_view.set_crop_frame(cropping.FULL)
         elif self.current_row >= 0:
             edit = self.model.photo(self.current_row).edit
-            self._set_edit([self.current_row], {key: value for key, value in edit.items() if key != "crop"})
+            self._set_edit([self.current_row], develop.clean({key: value for key, value in edit.items() if key != "crop"}))
 
     def _on_crop_ratio_changed(self):
         if self.cropping:
@@ -1552,7 +1592,7 @@ class TamisApp(QMainWindow):
         # Even when everything is sorted, processing refreshes _EXPORTS.
         self.header.set_can_process(bool(self.folder) and self.model.rowCount() > 0)
         if self.current_row in rows and self.live_edit is None:
-            self.edit_panel.set_edit(self.model.photo(self.current_row).edit)  # undo, paste, reset…
+            self._show_edit_in_panel()  # undo, paste, reset…
         if set(rows) & set(self._shown_rows()):
             self._refresh_view()
         self._update_counter()

@@ -39,6 +39,8 @@ DEFAULTS = {
     "grain": 0,
     "grain_size": 1,
     "vignette": 0,  # negative darkens the corners
+    # How a RAW is developed (see PROCESS); edits made before process 2 keep 1, so they keep their look.
+    "process": 2,
 }
 RANGES = {
     "straighten": (-15.0, 15.0),
@@ -53,10 +55,22 @@ RANGES = {
     "grain": (0, 100),
     "grain_size": (1, 3),
     "vignette": (-100, 100),
+    "process": (1, 2),
 }
 
 # What belongs to one photo's framing: not part of its look, so neither copied nor kept in a preset.
 FRAMING = ("crop", "rotate", "straighten")
+# What belongs to one photo, its framing and how it is developed: what copy, paste and presets leave alone.
+OWN = (*FRAMING, "process")
+
+# How RAWs are developed. 1: LibRaw's automatic brightness, which clips the brightest 1%
+# and differs from photo to photo. 2: no automatic brightness and blended highlights,
+# then a fixed gain and, in render(), a shoulder that rolls the highlights off instead of
+# clipping them, so that Exposure and Highlights can bring them back. Gain and shoulder
+# were fitted to camera JPEGs (Panasonic RW2), so that a RAW looks close to its preview.
+PROCESS = 2
+RAW_GAIN = 2.0 ** 2.5
+RAW_SHOULDER = 0.2  # linear value where the roll-off starts
 
 LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
@@ -64,8 +78,9 @@ LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 _ENCODE_STEPS = 65535
 _x = np.linspace(0.0, 1.0, _ENCODE_STEPS + 1, dtype=np.float64)
 _ENCODE = np.where(_x <= 0.0031308, _x * 12.92, 1.055 * np.power(_x, 1 / 2.4) - 0.055).astype(np.float32)
-_v = np.arange(256, dtype=np.float64) / 255
-DECODE_8BIT = np.where(_v <= 0.04045, _v / 12.92, np.power((_v + 0.055) / 1.055, 2.4)).astype(np.float32)
+# 16-bit sRGB -> linear, exact for 8-bit sources too (an 8-bit value v arrives as v * 257).
+_v = np.arange(65536, dtype=np.float64) / 65535
+DECODE_16BIT = np.where(_v <= 0.04045, _v / 12.92, np.power((_v + 0.055) / 1.055, 2.4)).astype(np.float32)
 del _x, _v
 
 
@@ -99,8 +114,13 @@ def crop_array(pixels, crop):
 
 
 def look(edit):
-    """`edit` without its framing: what can be carried over to another photo."""
-    return {key: value for key, value in edit.items() if key not in FRAMING}
+    """`edit` without what belongs to its photo (see OWN): what can be carried over to another photo."""
+    return {key: value for key, value in edit.items() if key not in OWN}
+
+
+def own(edit):
+    """Only what of `edit` belongs to its photo: its framing and how it is developed."""
+    return {key: edit[key] for key in OWN if key in edit}
 
 
 def framing(edit):
@@ -190,6 +210,8 @@ def clean(edit):
             value = round(float(value), 2) if key == "exposure" else int(round(value))
         if value != default:
             result[key] = value
+    if set(result) == {"process"}:
+        return {}  # nothing else is edited: the photo isn't, and gets the current process when it is
     return result
 
 
@@ -202,6 +224,16 @@ def encode(linear):
     """Linear [0, 1] -> sRGB-encoded [0, 1] (values outside are clipped)."""
     index = (np.clip(linear, 0.0, 1.0) * _ENCODE_STEPS).astype(np.uint16)
     return _ENCODE[index]
+
+
+def shoulder(rgb):
+    """The highlight roll-off of RAWs (process 2): unchanged below RAW_SHOULDER, then towards 1, never reaching it."""
+    t = np.float32(RAW_SHOULDER)
+    above = rgb > t
+    if not above.any():
+        return rgb
+    rolled = t + (1 - t) * -np.expm1(-(np.maximum(rgb, t) - t) / (1 - t))
+    return np.where(above, rolled, rgb).astype(np.float32, copy=False)
 
 
 def _smoothstep(low, high, x):
@@ -243,10 +275,11 @@ def _grain(shape, origin, full_width, amount, size, seed):
     return noise[row_offset:row_offset + height, col_offset:col_offset + width] * (amount / 100 * 0.12)
 
 
-def render(linear, edit, table=None, seed=0, origin=(0, 0), full_size=None):
+def render(linear, edit, table=None, seed=0, origin=(0, 0), full_size=None, raw=False):
     """Apply `edit` to `linear` (float32, h×w×3); returns sRGB uint8 h×w×3.
 
-    `table` is the film simulation LUT from lut.build_table() (None: no LUT).
+    `raw` says that `linear` is a RAW's development, which process 2 rolls off
+    in the highlights. `table` is the film simulation LUT from lut.build_table() (None: no LUT).
     `origin` (row, column) and `full_size` (height, width) place this block
     in the full image when rendering in strips.
     """
@@ -264,6 +297,9 @@ def render(linear, edit, table=None, seed=0, origin=(0, 0), full_size=None):
         if s["shadows"]:
             stops += s["shadows"] / 100 * 1.5 * (1 - _smoothstep(0.0, 0.5, perceived))
         rgb *= np.exp2(stops)[..., None]
+
+    if raw and edit.get("process", PROCESS) >= 2:  # (not settings(): clean() drops a process left alone)
+        rgb = shoulder(rgb)
 
     tone = _tone_table(s["contrast"])
     out = tone[(np.clip(rgb, 0.0, 1.0) * _ENCODE_STEPS).astype(np.uint16)]

@@ -96,8 +96,11 @@ def test_rendering_in_strips_matches_rendering_whole(edit):
 
 def test_decode_table_inverts_encode():
     values = np.arange(256)
-    round_trip = (encode(develop.DECODE_8BIT[values]) * 255 + 0.5).astype(int)
+    round_trip = (encode(develop.DECODE_16BIT[values * 257]) * 255 + 0.5).astype(int)  # 8-bit values, as 16 bits
     assert np.array_equal(round_trip, values)
+    v = np.arange(65536) / 65535  # 16-bit values decode with the sRGB formula itself
+    exact = np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
+    assert np.abs(develop.DECODE_16BIT - exact).max() < 1e-6
 
 
 # -- framing -------------------------------------------------------------------
@@ -175,3 +178,34 @@ def test_straightening_in_strips_gives_the_same_result_and_keeps_the_type():
     strips = np.concatenate([develop.straighten_rows(pixels, -3.2, top, top + 20) for top in range(0, 60, 20)])
     assert whole.dtype == np.uint16
     assert np.array_equal(whole, strips)
+
+
+# -- RAW development -------------------------------------------------------------
+
+def test_shoulder_rolls_highlights_off_and_leaves_the_rest_alone():
+    values = np.array([0.0, 0.1, develop.RAW_SHOULDER, 0.5, 1.0, 2.0, 4.0, 50.0], dtype=np.float32)
+    rolled = develop.shoulder(values)
+    assert np.array_equal(rolled[:3], values[:3])
+    assert np.all(np.diff(rolled) > 0)  # still increasing
+    assert np.all(rolled < 1.0 + 1e-6) and rolled[-2] > 0.99
+
+
+def test_raw_highlights_beyond_white_can_be_brought_back():
+    # Two highlights that both blow out once developed, as LibRaw's automatic brightness would leave them.
+    linear = np.array([[[1.5, 1.5, 1.5], [3.0, 3.0, 3.0]]], dtype=np.float32)
+    current = render(linear, {}, raw=True)
+    assert current[0, 0, 0] < current[0, 1, 0] < 255  # rolled off: still apart
+    assert render(linear, {"process": 1}, raw=True)[0, 0, 0] == 255  # the earlier process clips them
+    assert render(linear, {}, raw=False)[0, 0, 0] == 255  # not a RAW: no roll-off
+    darker = render(linear, {"exposure": -2.0}, raw=True)
+    assert darker[0, 0, 0] < darker[0, 1, 0] < current[0, 1, 0]
+
+
+def test_process_belongs_to_the_photo():
+    assert clean({"process": 1}) == {}  # nothing edited: the photo gets the current process
+    assert clean({"process": 2, "contrast": 10}) == {"contrast": 10}
+    assert clean({"process": 1, "contrast": 10}) == {"process": 1, "contrast": 10}
+    edit = {"process": 1, "contrast": 10, "rotate": 90}
+    assert develop.look(edit) == {"contrast": 10}
+    assert develop.own(edit) == {"process": 1, "rotate": 90}
+    assert develop.turned(edit, 90)["process"] == 1
