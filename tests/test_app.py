@@ -1262,7 +1262,7 @@ def test_damaged_session_is_reported_once_and_kept(window, tmp_path, monkeypatch
 
 def test_rating_that_cannot_reach_the_sidecar_survives_and_is_written_later(window, tmp_path, monkeypatch):
     sidecar = tmp_path / "IMG_0.jpg.xmp"
-    sidecar.write_text(xmp.update(xmp._TEMPLATE, 2, None))
+    sidecar.write_text(xmp.update(xmp._TEMPLATE, 2, None), encoding="utf-8")
     open_folder(window, str(tmp_path))
     real_write = xmp.write
 
@@ -1281,12 +1281,12 @@ def test_rating_that_cannot_reach_the_sidecar_survives_and_is_written_later(wind
     monkeypatch.setattr(xmp, "write", real_write)
     window.save_session()  # tried again without any new change
     assert not window.model.photo(0).xmp_pending
-    assert xmp.parse(sidecar.read_text())[0] == 5
+    assert xmp.parse(sidecar.read_text(encoding="utf-8"))[0] == 5
     assert "xmp_pending" not in stored_session(tmp_path)["IMG_0.jpg"]
 
 
 def test_rating_still_waiting_for_its_sidecar_follows_a_move(window, tmp_path, monkeypatch):
-    (tmp_path / "IMG_0.jpg.xmp").write_text(xmp.update(xmp._TEMPLATE, 2, None))
+    (tmp_path / "IMG_0.jpg.xmp").write_text(xmp.update(xmp._TEMPLATE, 2, None), encoding="utf-8")
     open_folder(window, str(tmp_path))
     real_write = xmp.write
 
@@ -1302,7 +1302,7 @@ def test_rating_still_waiting_for_its_sidecar_follows_a_move(window, tmp_path, m
 
     monkeypatch.setattr(xmp, "write", real_write)
     window.save_session()
-    assert xmp.parse((tmp_path / "_KEEPS" / "IMG_0.jpg.xmp").read_text())[0] == 5
+    assert xmp.parse((tmp_path / "_KEEPS" / "IMG_0.jpg.xmp").read_text(encoding="utf-8"))[0] == 5
 
 
 # -- filters by stars and labels -------------------------------------------------
@@ -1558,7 +1558,7 @@ def test_trash_moves_rejects_and_everything_follows(window, tmp_path, monkeypatc
     seen = confirm_dialogs(monkeypatch)
     statuses(window, keep=[0], reject=[1, 2])
     process(window, monkeypatch, export=False)
-    (tmp_path / "_REJECTS" / "IMG_1.jpg.xmp").write_text("<x/>")
+    (tmp_path / "_REJECTS" / "IMG_1.jpg.xmp").write_text("<x/>", encoding="utf-8")
     window.go_to(window.model.row_of(str(tmp_path / "_REJECTS" / "IMG_1.jpg")))
     window.model.set_status([window.model.row_of(str(tmp_path / "IMG_3.jpg"))], REJECT)  # not in _REJECTS: stays
     events = []
@@ -1664,7 +1664,7 @@ def test_rejects_as_rating_minus_one_keep_the_stars_in_tamis(window, tmp_path):
     window.model.set_field([row], "rating", 3)
     window.model.set_status([row], REJECT)
     window.save_session()
-    assert 'xmp:Rating="-1"' in sidecar.read_text()
+    assert 'xmp:Rating="-1"' in sidecar.read_text(encoding="utf-8")
 
     open_folder(window, str(tmp_path), keep_state=True)  # the -1 isn't taken for stars
     row = window.model.row_of(str(tmp_path / "RAW_1.cr2"))
@@ -1672,7 +1672,7 @@ def test_rejects_as_rating_minus_one_keep_the_stars_in_tamis(window, tmp_path):
 
     window.model.set_status([row], KEEP)
     window.save_session()
-    assert 'xmp:Rating="3"' in sidecar.read_text()
+    assert 'xmp:Rating="3"' in sidecar.read_text(encoding="utf-8")
 
 
 def test_marks_touch_no_sidecar_by_default(window, tmp_path):

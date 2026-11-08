@@ -694,7 +694,7 @@ class TamisApp(ProcessingMixin, QMainWindow):
     def _legacy_global_state():
         """Last folder from the pre-QSettings `~/.cullspeed_global.json`."""
         try:
-            with open(os.path.join(os.path.expanduser("~"), LEGACY_GLOBAL_CONFIG_FILENAME)) as file:
+            with open(os.path.join(os.path.expanduser("~"), LEGACY_GLOBAL_CONFIG_FILENAME), encoding="utf-8") as file:
                 config = json.load(file)
             return config.get("last_folder") or "", config.get("last_file") or ""
         except (OSError, ValueError, AttributeError):

@@ -351,7 +351,7 @@ def test_edit_changes_undo_and_do_not_touch_xmp(model):
 
 def test_sidecar_rating_wins_over_session(tmp_path):
     touch(tmp_path / "IMG.CR2")
-    (tmp_path / "IMG.xmp").write_text('<rdf:Description xmp:Rating="5" xmp:Label="Blue"/>')
+    (tmp_path / "IMG.xmp").write_text('<rdf:Description xmp:Rating="5" xmp:Label="Blue"/>', encoding="utf-8")
     write_session(tmp_path, {"IMG.CR2": {"status": KEEP, "rating": 2, "label": None}})
 
     [photo] = scan_folder(str(tmp_path))
@@ -460,7 +460,7 @@ def test_damaged_session_in_a_read_only_folder_stays_put_and_is_reported(tmp_pat
 def test_rating_not_yet_in_the_sidecar_wins_over_it(tmp_path):
     folder = str(tmp_path)
     touch(tmp_path / "a.jpg")
-    (tmp_path / "a.jpg.xmp").write_text('<rdf:Description xmp:Rating="2"/>')
+    (tmp_path / "a.jpg.xmp").write_text('<rdf:Description xmp:Rating="2"/>', encoding="utf-8")
     [photo] = scan_folder(folder)
     assert photo.rating == 2
     photo.rating, photo.label, photo.xmp_pending = 5, "Red", True
@@ -478,7 +478,7 @@ def test_rating_not_yet_in_the_sidecar_wins_over_it(tmp_path):
 def test_removing_a_rating_is_remembered_until_the_sidecar_has_it(tmp_path):
     folder = str(tmp_path)
     touch(tmp_path / "a.jpg")
-    (tmp_path / "a.jpg.xmp").write_text('<rdf:Description xmp:Rating="2"/>')
+    (tmp_path / "a.jpg.xmp").write_text('<rdf:Description xmp:Rating="2"/>', encoding="utf-8")
     [photo] = scan_folder(folder)
     photo.rating, photo.xmp_pending = 0, True
     save_session(folder, [photo])
