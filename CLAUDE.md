@@ -69,7 +69,9 @@ RAWs are edited from LibRaw's 16-bit linear development, not their embedded JPEG
 
 `plan_import` / `execute_import` and `plan_trash` / `execute_trash` work the same way. Imports never change the source and verify every copy; the Trash takes a photo's files all together or not at all, and `TamisApp._forget_trashed` makes everything path-keyed follow. Nothing in the app deletes photos.
 
-`Photo.exports` records what was written to `_EXPORTS` for a photo (name, size, modification time), in the session. `remove_rejected_exports` only deletes files that still match their record, so files the user added or changed in `_EXPORTS` are safe.
+`Photo.exports` records what was exported of a photo (name, size, modification time, and `dir`, the export folder as the settings gave it, when it isn't `_EXPORTS`), in the session. `remove_rejected_exports` only deletes files that still match their record, so files the user added or changed in the export folder are safe.
+
+`ExportSettings` (`exportsettings.py`) holds the size, quality, folder and name pattern, in QSettings with the named profiles and the Process Files scope (`export_scope`, "all" but rejects or "keeps"). `ExportSettings.problem` refuses a folder among the photos, since exports replace files of the same name. Rendered exports are tagged sRGB and carry EXIF built by `exif.export_segment` from the source (orientation reset); resizing happens on the assembled output, after `render()`.
 
 ### Plugins
 `plugins.py` loads `<name>.py` or `<name>/__init__.py` from `plugins/` in the app's data folder at startup and calls `register(tamis)` with a `PluginApi`; the README documents that API for plugin authors, so keep it up to date. `TamisApp(plugins_dir=...)` overrides the folder, and the tests' `window` fixture always does so they never run the real app's plugins.

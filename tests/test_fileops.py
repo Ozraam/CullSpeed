@@ -320,7 +320,7 @@ def test_exports_of_rejected_photos_are_removed(tmp_path):
     users_own = touch(tmp_path / "_EXPORTS" / "c.jpg")
     photos = [rejected, kept, Photo(str(tmp_path / "c.jpg"), REJECT)]  # c.jpg never was an export of that photo
 
-    removed, errors = remove_rejected_exports(photos, str(tmp_path / "_EXPORTS"))
+    removed, errors = remove_rejected_exports(photos, str(tmp_path))
 
     assert (removed, errors) == ([path], [])
     assert not os.path.exists(path)
@@ -332,7 +332,7 @@ def test_export_changed_since_is_not_removed(tmp_path):
     photo, path = exported_photo(tmp_path)
     touch(path, "retouched by hand")
 
-    dest_dir = str(tmp_path / "_EXPORTS")
+    dest_dir = str(tmp_path)  # the shoot folder: records are of _EXPORTS by default
     assert rejected_exports([photo], dest_dir) == ([], [path])
     assert remove_rejected_exports([photo], dest_dir) == ([], [])
     assert read(path) == "retouched by hand"
@@ -346,7 +346,7 @@ def test_export_that_cannot_be_removed_is_remembered(tmp_path, monkeypatch):
         raise PermissionError(13, "Permission denied", _path)
 
     monkeypatch.setattr("tamis.fileops.os.remove", locked)
-    removed, errors = remove_rejected_exports([photo], str(tmp_path / "_EXPORTS"))
+    removed, errors = remove_rejected_exports([photo], str(tmp_path))
 
     assert removed == [] and errors == ["a.jpg: Permission denied"]
     assert photo.exports
@@ -355,7 +355,7 @@ def test_export_that_cannot_be_removed_is_remembered(tmp_path, monkeypatch):
 def test_export_already_gone_is_ignored(tmp_path):
     photo, path = exported_photo(tmp_path)
     os.remove(path)
-    assert rejected_exports([photo], str(tmp_path / "_EXPORTS")) == ([], [])
+    assert rejected_exports([photo], str(tmp_path)) == ([], [])
 
 
 # -- the Trash ---------------------------------------------------------------
@@ -499,3 +499,41 @@ def test_find_card_looks_for_a_dcim_folder(tmp_path):
     (tmp_path / "EOS_DIGITAL" / "DCIM").mkdir(parents=True)
     assert fileops.find_card([str(tmp_path)]) == str(tmp_path / "EOS_DIGITAL")
     assert fileops.find_card([str(tmp_path / "Macintosh HD")]) == ""
+
+
+def test_plan_exports_keeps_only_leaves_unmarked_photos_out(tmp_path):
+    from tamis.fileops import plan_exports
+
+    folder = str(tmp_path)
+    photos = [Photo(f"{folder}/a.jpg", KEEP), Photo(f"{folder}/b.jpg"), Photo(f"{folder}/c.png"), Photo(f"{folder}/d.jpg", REJECT)]
+    assert [job.name for job in plan_exports(photos)] == ["a.jpg", "b.jpg"]
+    assert [job.name for job in plan_exports(photos, keeps_only=True)] == ["a.jpg"]
+    assert without_export(photos) == [photos[2]]
+    assert without_export(photos, keeps_only=True) == []
+
+
+def test_plan_exports_names_files_by_the_pattern(tmp_path):
+    from tamis.fileops import plan_exports
+
+    folder = str(tmp_path)
+    photos = [
+        Photo(f"{folder}/a.CR2", KEEP, companions=[f"{folder}/a.JPG"], capture_time=0.0),
+        Photo(f"{folder}/b.png", KEEP, edit={"exposure": 1.0}, capture_time=86400.0),
+        Photo(f"{folder}/c.jpg", KEEP, capture_time=86400.0),
+    ]
+    names = [job.name for job in plan_exports(photos, pattern="{folder}_{date}", folder_name="Trip")]
+    assert names == ["Trip_1970-01-01.JPG", "Trip_1970-01-02.jpg", "Trip_1970-01-02 (1).jpg"]
+    assert [job.name for job in plan_exports(photos, pattern="x{seq}")] == ["x001.JPG", "x002.jpg", "x003.jpg"]
+
+
+def test_exports_in_another_folder_are_removed_there(tmp_path):
+    path = touch(tmp_path / "web" / "a.jpg", "export")
+    photo = Photo(str(tmp_path / "a.jpg"), REJECT, exports=[export_record(path, "web")])
+    assert photo.exports[0]["dir"] == "web"
+    assert export_record(path)  # (no "dir" for _EXPORTS)
+    assert "dir" not in export_record(path)
+
+    removed, errors = remove_rejected_exports([photo], str(tmp_path))
+
+    assert (removed, errors) == ([os.path.normpath(path)], [])
+    assert not os.path.exists(path) and photo.exports == []

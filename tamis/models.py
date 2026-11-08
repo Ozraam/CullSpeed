@@ -69,7 +69,7 @@ class Photo:
     # The rating and label could not be written to the XMP sidecar yet: until
     # they are, the session has the newer values and wins over the sidecar.
     xmp_pending: bool = False
-    # What was written to _EXPORTS for this photo, see fileops.export_record().
+    # What was exported of this photo (to _EXPORTS or the folder of the settings), see fileops.export_record().
     exports: list = field(default_factory=list)
     # From the background analysis (analysis.py), not saved in the session: None until known.
     capture_time: float | None = None  # seconds, on the camera's clock
@@ -227,7 +227,10 @@ def _session_paths(folder, fallback_dir):
 
 
 def _export_records(value):
-    """The valid records in a session's "exports": plain file names only, as they get deleted by name."""
+    """The valid records in a session's "exports": plain file names only, as they get deleted by name.
+
+    "dir", when there, is the export folder as the settings gave it (absent: _EXPORTS).
+    """
     if not isinstance(value, list):
         return []
     return [
@@ -238,6 +241,7 @@ def _export_records(value):
         and os.path.basename(record["name"]) == record["name"]
         and isinstance(record.get("size"), int)
         and isinstance(record.get("mtime"), int)
+        and (isinstance(record.get("dir"), str) and record["dir"].strip() if "dir" in record else True)
     ]
 
 

@@ -20,7 +20,7 @@ Tamis is a PyQt6 desktop application for rapidly reviewing and triaging large ph
 - **Keep and reject in other editors**, off by default (**Options ▾ > Show Keep and Reject in Other Editors**), as no flag is common to them. *Rejected as rating −1* writes the `xmp:Rating="-1"` that darktable and Bridge read as rejected; the photo keeps its stars in Tamis, but other editors no longer see them. *Keep green, reject red* gives photos those colour labels, for editors that read `xmp:Label` such as Lightroom, whose own flags are not in XMP at all. A label you gave a photo yourself stays, except that unmarking clears a green or red one. As with ratings, new sidecars are only created for RAWs.
 - **RAW+JPEG pairs** (same name, same folder) are culled as one photo and always move together.
 - **Shooting info** (exposure, aperture, ISO, focal length, camera, lens, date) read from EXIF; `I` shows or hides it.
-- **Quick edits** (`E`): exposure, contrast, highlights, shadows, white balance (temperature / tint), saturation, film simulation LUTs with strength, grain and vignette. Edits are non-destructive (stored in the session, originals untouched), previewed live, can be copied and pasted across photos, and exported as full-size JPEGs to `_EXPORTS`. RAWs are edited from LibRaw's 16-bit linear development, not from their embedded JPEG.
+- **Quick edits** (`E`): exposure, contrast, highlights, shadows, white balance (temperature / tint), saturation, film simulation LUTs with strength, grain and vignette. Edits are non-destructive (stored in the session, originals untouched), previewed live, can be copied and pasted across photos, and exported as JPEGs (see **Export settings**). RAWs are edited from LibRaw's 16-bit linear development, not from their embedded JPEG.
 - **Histogram and clipping**: the edit panel shows the red, green and blue histogram of what is on screen, updated in the background, with the share of the photo clipped at either end. `J` (or **Clipping**) shows them in the Cull view, panel open or not: red where all three channels are at the top (blown out, no detail left), a discreet orange where only one or two are (a vivid colour, flatter but not blown out), and blue where all three are at the bottom. The histogram's figures only count the red and the blue, so a very colourful photo doesn't look overexposed.
 - **Before / after**: hold `Y` or `\` (or the **Before** button) to see the photo without its edit, in the same frame; the edit itself doesn't change. It shows the same preview as an unedited photo, so for a RAW that is the camera's embedded JPEG, which can differ from LibRaw's development even with no edit.
 - **Rotate and straighten**: `]` / `⇧R` and `[` / `⇧L` turn the current or selected photos by 90°, while culling too; the **Straighten** slider levels a horizon by up to 15°, enlarging the picture so that no empty corner shows. A crop stays on the same part of the picture through a quarter turn. Like a crop, these belong to their photo's framing: they are undoable, exported and cleared by Reset, but neither copied nor kept in a preset, and vignette and grain follow the final frame.
@@ -29,7 +29,8 @@ Tamis is a PyQt6 desktop application for rapidly reviewing and triaging large ph
 - New or removed files are picked up automatically while the folder is open (or with **Refresh**, `⌘R`).
 - Undo for every marking, rating and labelling action.
 - Marks are saved automatically in `tamis_session.json` inside each photo folder.
-- **Process Files** moves photos into `_KEEPS` / `_REJECTS` (or back to the root when unmarked). XMP sidecars move with their photo, and existing files are never overwritten (`IMG_1 (1).jpg` instead). Unless you untick the export box in its confirmation (ticked by default), it then fills `_EXPORTS`: edited photos are exported as JPEGs and unedited ones get their JPEG (the photo itself, or the JPEG of a RAW+JPEG pair) copied; rejected photos are left out. Earlier exports of the same photos are replaced, so processing again refreshes them, and exports of photos rejected since are removed (Tamis remembers what it exported: other files in `_EXPORTS`, and exports changed since, stay). The confirmation lists the photos without a JPEG, which are not exported (`⌘⇧E` renders them), and those whose film simulation is no longer in the LUT folder, which would be exported without it. A photo whose files can't all be moved stays where it is, with its pair and sidecars, and exports are written to a temporary file first, so a failure never leaves a truncated JPEG behind.
+- **Process Files** moves photos into `_KEEPS` / `_REJECTS` (or back to the root when unmarked). XMP sidecars move with their photo, and existing files are never overwritten (`IMG_1 (1).jpg` instead). Unless you untick the export box in its confirmation (ticked by default), it then fills the export folder (`_EXPORTS` unless the export settings say otherwise): edited photos are exported as JPEGs and unedited ones get their JPEG (the photo itself, or the JPEG of a RAW+JPEG pair) copied. The confirmation lets you choose what is exported: *everything except rejects* (the default) or *keeps only*, remembered for next time. Earlier exports of the same photos are replaced, so processing again refreshes them, and exports of photos rejected since are removed, from whichever folder they were written to (Tamis remembers what it exported: other files there, and exports changed since, stay). The confirmation lists the photos without a JPEG, which are not exported (`⌘⇧E` renders them), and those whose film simulation is no longer in the LUT folder, which would be exported without it. A photo whose files can't all be moved stays where it is, with its pair and sidecars, and exports are written to a temporary file first, so a failure never leaves a truncated JPEG behind.
+- **Export settings** (**Options ▾ > Export Settings…**, or the button in the Process Files confirmation): the longest edge (full size by default), the JPEG quality (92), the folder (relative to the shoot folder, such as `_EXPORTS` or `web/large`, or a full path; never the shoot folder itself, `_KEEPS` or `_REJECTS`) and a name pattern made of `{name}` (the original name), `{date}` (capture date, `YYYY-MM-DD`), `{seq}` (`001`, `002`… in the order of one export) and `{folder}` (the shoot folder's name). Save them as named profiles (web, client, print…) to switch between them. Rendered exports are tagged sRGB, with an ICC profile, and carry the EXIF of their original (camera, lens, date, exposure, copyright, GPS), with the orientation reset since their pixels are upright. Unedited JPEGs are copied as they are, unless they have to be resized.
 - Reopens the last folder and photo on launch. Drop a folder onto the window to open it.
 - **Plugins**: add your own actions and shortcuts with a small Python file (see [Plugins](#plugins)).
 
@@ -67,7 +68,7 @@ tamis                  # or: python Tamis.py, python -m tamis
 | Show the photo without its edit, while held (Cull view) | `Y` or `\` |
 | Clipping warnings, on / off (Cull view) | `J` |
 | Copy / paste edit (paste applies to the selection) | `⌘C` / `⌘V` or `⌘⇧C` / `⌘⇧V` (`Ctrl+C` / `V`, `Ctrl+Shift+C` / `V`) |
-| Export JPEG (current or selected photos: edited ones and those without a JPEG are rendered, others copied) | `⌘⇧E` / `Ctrl+Shift+E` |
+| Export JPEG with the export settings (current or selected photos: edited ones and those without a JPEG are rendered, others copied unless resized) | `⌘⇧E` / `Ctrl+Shift+E` |
 | Refresh the folder | `⌘R` / `Ctrl+R`, `F5` |
 | Show bursts, on / off | `B` |
 | Keep this photo, reject the rest of its burst | `⇧P` / `Shift+P` |
@@ -81,7 +82,7 @@ In the Cull view, marking a photo as keep or reject moves on to the next one (in
 ## Film simulations
 Film simulations are 3D LUTs, in the same HaldCLUT format RawTherapee uses (`.png` / `.tif`), or `.cube` files. Tamis does not ship any: choose a folder of them with **Folder…** in the edit panel (sub-folders become groups). RawTherapee's [film simulation collection](https://rawpedia.rawtherapee.com/Film_Simulation) (CC BY-SA) works as is, and gives the same looks as in RawTherapee. The base development of RAWs (LibRaw) is close to, but not identical with, RawTherapee's own.
 
-Things the first version does not do yet: the 1:1 zoom shows the original inside the frame (for focus checking), and exported JPEGs carry no EXIF.
+Things the first version does not do yet: the 1:1 zoom shows the original inside the frame (for focus checking).
 
 ## Plugins
 A plugin is a Python file (or a package folder) in the plugins folder, which **Plugins ▾ > Open Plugins Folder** creates and opens. Plugins load at launch, so restart Tamis after adding one. This is all it takes:
@@ -122,7 +123,7 @@ def register(tamis):
 | `photo_changed` | `photo` | Another photo became the current one |
 | `photos_edited` | `[photos]` | Marks, ratings, labels or edits changed, undo included |
 | `files_moved` | `{old path: new path}` | Process Files moved photos. Photos are identified by path, so a plugin keeping data per photo must follow this |
-| `photos_exported` | `[paths]` | JPEGs were written to `_EXPORTS` |
+| `photos_exported` | `[paths]` | JPEGs were written to the export folder |
 | `photos_trashed` | `[paths]` | Photos of `_REJECTS` were moved to the Trash |
 | `closing` | | The window is closing; changes made now are still saved |
 
@@ -152,7 +153,7 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `tamis/bursts.py` | Grouping shots taken in quick succession |
 | `tamis/peaking.py` | Focus peaking overlay and its background worker |
 | `tamis/imaging.py` | Thread-safe decoding of RAW and standard images (QImage only) |
-| `tamis/exif.py` | Minimal EXIF reader for shooting info |
+| `tamis/exif.py` | Minimal EXIF reader for shooting info, and the EXIF of exported JPEGs |
 | `tamis/xmp.py` | Reading and editing ratings and labels in XMP sidecars |
 | `tamis/develop.py` | Edit pipeline (numpy): turns and straightening, exposure, tone, colour, LUT, grain, vignette |
 | `tamis/cropping.py` | Geometry of the crop frame while it is dragged |
@@ -161,7 +162,8 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `tamis/editpanel.py` | The edit panel and its histogram |
 | `tamis/tones.py` | Histograms and clipping overlays, and their background worker |
 | `tamis/presets.py` | Named looks, kept in the app's data folder |
-| `tamis/fileops.py` | Planning and executing file moves, the Trash and imports |
+| `tamis/exportsettings.py` | Export size, quality, folder, name pattern and profiles |
+| `tamis/fileops.py` | Planning and executing file moves, exports, the Trash and imports |
 | `tamis/plugins.py` | Loading plugins, the API they receive and the Plugins menu |
 | `tamis/widgets.py` | Image and compare views, thumbnail delegate, bars, toast and dialogs |
 | `tamis/theme.py` | Dark palette and stylesheet |

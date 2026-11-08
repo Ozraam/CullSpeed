@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 from PyQt6.QtCore import QFile
 
+from . import exif, exportsettings
 from .constants import EXPORT_DIR, KEEP, KEEP_DIR, REJECT, REJECT_DIR, SUPPORTED_EXTENSIONS
 from .imaging import is_raw
 
@@ -24,7 +25,7 @@ class Move:
 class ExportJob:
     path: str  # the file rendered or copied
     edit: dict  # {}: copied as it is
-    name: str  # file name in _EXPORTS
+    name: str  # file name in the export folder
 
 
 @dataclass
@@ -185,13 +186,30 @@ def free_name(dest_dir, stem, ext):
     return name
 
 
-def plan_exports(photos):
-    """What "Process Files" puts in _EXPORTS: edited photos rendered, the JPEG of the others copied.
+def exported_statuses(keeps_only=False):
+    """The marks whose photos Process Files exports."""
+    return (KEEP,) if keeps_only else (KEEP, None)
 
-    Rejected photos are left out. Names are unique within the plan (` (n)`
-    added when two photos share one); a file of the same name already in
-    _EXPORTS is replaced, so processing again refreshes the exports.
+
+def plan_exports(photos, keeps_only=False, pattern="{name}", folder_name=""):
+    """What "Process Files" exports: edited photos rendered, the JPEG of the others copied.
+
+    Rejected photos are left out, and unmarked ones too with `keeps_only`.
+    Files are named by `pattern` (see exportsettings.file_stem()), made unique
+    within the plan (` (n)` added when two photos share one name); a file of
+    the same name already at the destination is replaced, so processing again
+    refreshes the exports.
     """
+    wanted = exported_statuses(keeps_only)
+    chosen = []
+    for photo in photos:
+        if photo.status not in wanted:
+            continue
+        if photo.edit:
+            chosen.append((photo, photo.path, os.path.splitext(photo.name)[0], ".jpg"))
+        elif (jpeg := jpeg_file(photo)) is not None:
+            chosen.append((photo, jpeg, *os.path.splitext(os.path.basename(jpeg))))
+
     jobs, taken = [], set()
 
     def unique(stem, ext):
@@ -201,20 +219,20 @@ def plan_exports(photos):
         taken.add(name.lower())
         return name
 
-    for photo in photos:
-        if photo.status == REJECT:
-            continue
-        if photo.edit:
-            stem = os.path.splitext(photo.name)[0]
-            jobs.append(ExportJob(photo.path, photo.edit, unique(stem, ".jpg")))
-        elif (jpeg := jpeg_file(photo)) is not None:
-            jobs.append(ExportJob(jpeg, {}, unique(*os.path.splitext(os.path.basename(jpeg)))))
+    for seq, (photo, path, stem, ext) in enumerate(chosen, 1):
+        date = ""
+        if exportsettings.uses_date(pattern):
+            moment = photo.capture_time if photo.capture_time is not None else exif.capture_time(photo.files)
+            date = exportsettings.date_text(moment)
+        stem = exportsettings.file_stem(pattern, stem, date, seq, len(chosen), folder_name)
+        jobs.append(ExportJob(path, photo.edit, unique(stem, ext)))
     return jobs
 
 
-def without_export(photos):
-    """The photos plan_exports() leaves out for having no edit and no JPEG, rejected ones aside."""
-    return [photo for photo in photos if photo.status != REJECT and not photo.edit and jpeg_file(photo) is None]
+def without_export(photos, keeps_only=False):
+    """The photos plan_exports() leaves out for having no edit and no JPEG, those it leaves out anyway aside."""
+    wanted = exported_statuses(keeps_only)
+    return [photo for photo in photos if photo.status in wanted and not photo.edit and jpeg_file(photo) is None]
 
 
 @contextmanager
@@ -236,44 +254,62 @@ def atomic_write(dest):
         raise
 
 
-def export_record(path):
-    """What Photo.exports remembers of an export, to tell later whether the file is still that export."""
+def export_record(path, folder=EXPORT_DIR):
+    """What Photo.exports remembers of an export, to tell later whether the file is still that export.
+
+    `folder` is the export folder as the settings give it (relative to the
+    shoot folder, or absolute); _EXPORTS, the default, isn't written down.
+    """
     stat = os.stat(path)
-    return {"name": os.path.basename(path), "size": stat.st_size, "mtime": stat.st_mtime_ns}
+    record = {"name": os.path.basename(path), "size": stat.st_size, "mtime": stat.st_mtime_ns}
+    if folder != EXPORT_DIR:
+        record["dir"] = folder
+    return record
 
 
-def rejected_exports(photos, dest_dir):
+def record_path(shoot_folder, record):
+    """Where the export a record describes is."""
+    folder = os.path.expanduser(record.get("dir", EXPORT_DIR))
+    return os.path.normpath(os.path.join(shoot_folder, folder, record["name"]))
+
+
+def _same_record(path, record):
+    current = export_record(path)
+    return all(current[key] == record[key] for key in ("name", "size", "mtime"))
+
+
+def rejected_exports(photos, shoot_folder):
     """(removable, changed): paths of the exports of rejected photos, as they were written or changed since.
 
     Only files recorded as exports of a photo are considered, so what the user
-    added to _EXPORTS is never touched, even under a photo's name.
+    added to the export folder is never touched, even under a photo's name.
     """
     removable, changed = [], []
     for photo in photos:
         if photo.status == REJECT:
             for record in photo.exports:
-                path = os.path.join(dest_dir, record["name"])
+                path = record_path(shoot_folder, record)
                 with suppress(OSError):  # already gone
-                    (removable if export_record(path) == record else changed).append(path)
+                    (removable if _same_record(path, record) else changed).append(path)
     return removable, changed
 
 
-def remove_rejected_exports(photos, dest_dir):
+def remove_rejected_exports(photos, shoot_folder):
     """Delete what rejected_exports() calls removable; returns (paths removed, errors).
 
     Rejected photos then only remember the exports that could not be removed.
     """
     removed, errors, failed = [], [], set()
-    for path in rejected_exports(photos, dest_dir)[0]:
+    for path in rejected_exports(photos, shoot_folder)[0]:
         try:
             os.remove(path)
             removed.append(path)
         except OSError as exc:
             errors.append(f"{os.path.basename(path)}: {exc.strerror or exc}")
-            failed.add(os.path.basename(path))
+            failed.add(path)
     for photo in photos:
         if photo.status == REJECT:
-            photo.exports = [record for record in photo.exports if record["name"] in failed]
+            photo.exports = [record for record in photo.exports if record_path(shoot_folder, record) in failed]
     return removed, errors
 
 

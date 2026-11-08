@@ -14,10 +14,11 @@ from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 from tamis import develop, fileops, loader, tones, xmp  # noqa: E402
 from tamis.app import CULL_TAB, GALLERY_TAB, TamisApp  # noqa: E402
 from tamis.constants import KEEP, REJECT, SESSION_FILENAME  # noqa: E402
+from tamis.exportsettings import ExportSettings  # noqa: E402
 from tamis.fileops import MoveResult, plan_moves  # noqa: E402
 from tamis.imaging import image_to_array  # noqa: E402
 from tamis.plugins import PhotoInfo, Plugin, PluginApi  # noqa: E402
-from tamis.widgets import ImportDialog, MessageDialog, NameDialog, ProcessDialog  # noqa: E402
+from tamis.widgets import ExportSettingsDialog, ImportDialog, MessageDialog, NameDialog, ProcessDialog  # noqa: E402
 
 CTRL = Qt.KeyboardModifier.ControlModifier
 PHOTOS = 6
@@ -537,6 +538,102 @@ def test_exports_stay_when_the_export_box_is_unticked(window, tmp_path, monkeypa
     process_seeing_dialog(window, monkeypatch, export=False)
 
     assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").exists()
+
+
+def process_with_scope(win, monkeypatch, scope):
+    def confirm(dialog):
+        dialog.scope_combo.setCurrentIndex(dialog.scope_combo.findData(scope))
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ProcessDialog, "exec", confirm)
+    win.process_files()
+
+
+def test_process_files_can_export_keeps_only(window, tmp_path, monkeypatch):
+    statuses(window, keep=[0], reject=[1])
+    process_with_scope(window, monkeypatch, "keeps")
+    assert os.listdir(tmp_path / "_EXPORTS") == ["IMG_0.jpg"]
+    assert window.settings.value("export_scope") == "keeps"
+
+
+def test_process_files_exports_unmarked_photos_by_default(window, tmp_path, monkeypatch):
+    statuses(window, keep=[0], reject=[1])
+    process(window, monkeypatch, export=True)
+    assert sorted(os.listdir(tmp_path / "_EXPORTS")) == [f"IMG_{i}.jpg" for i in (0, 2, 3, 4, 5)]
+
+
+def test_process_dialog_follows_the_scope(window, monkeypatch):
+    statuses(window, reject=[1])
+    seen = []
+
+    def confirm(dialog):
+        seen.append((dialog.export_check.text(), dialog.export_requested))
+        dialog.scope_combo.setCurrentIndex(dialog.scope_combo.findData("keeps"))
+        seen.append((dialog.export_check.text(), dialog.export_requested, dialog.confirm_button.isEnabled()))
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(ProcessDialog, "exec", confirm)
+    window.process_files()
+
+    assert seen[0] == ("Export 5 photo(s) to _EXPORTS", True)
+    assert seen[1] == ("Nothing to export (no keeps)", False, True)  # the moves are still there to do
+    assert window.export_scope == "all"  # cancelled: not remembered
+
+
+def test_exports_follow_the_export_settings(window, tmp_path, monkeypatch):
+    window.export_settings = ExportSettings(long_edge=150, quality=70, folder="web", pattern="{folder}-{seq}")
+    statuses(window, keep=[0, 1])
+    process_with_scope(window, monkeypatch, "keeps")
+
+    web = tmp_path / "web"
+    assert sorted(os.listdir(web)) == [f"{tmp_path.name}-001.jpg", f"{tmp_path.name}-002.jpg"]
+    image = QImage(str(web / f"{tmp_path.name}-001.jpg"))
+    assert (image.width(), image.height()) == (150, 100)  # unedited, but resized: rendered
+    assert not (tmp_path / "_EXPORTS").exists()
+
+    # Rejected later, its export goes from where it was written, settings changed since or not.
+    window.export_settings = ExportSettings()
+    window.model.set_status([window.model.row_of(str(tmp_path / "_KEEPS" / "IMG_0.jpg"))], REJECT)
+    process(window, monkeypatch, export=True)
+    assert os.listdir(web) == [f"{tmp_path.name}-002.jpg"]
+
+
+def test_exports_never_go_among_the_photos(window, tmp_path, monkeypatch):
+    told = []
+    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, _text, details=None: told.append(title))
+    window.export_settings = ExportSettings(folder=".", pattern="IMG_1")
+    before = (tmp_path / "IMG_1.jpg").read_bytes()
+
+    window.export_photos()
+
+    assert told == ["Choose another export folder"]
+    assert (tmp_path / "IMG_1.jpg").read_bytes() == before
+
+
+def test_export_settings_dialog_saves_profiles(window, monkeypatch):
+    monkeypatch.setattr(NameDialog, "exec", lambda dialog: (dialog.field.setText("Web"), QDialog.DialogCode.Accepted)[1])
+
+    def configure(dialog):
+        dialog.long_edge.setValue(2000)
+        dialog.quality.setValue(80)
+        dialog.pattern_edit.setText("{name")
+        assert not dialog.confirm_button.isEnabled()
+        dialog.pattern_edit.setText("{date}_{name}")
+        assert dialog.confirm_button.isEnabled()
+        dialog.save_profile_button.click()
+        assert dialog.profile_combo.currentData() == "Web" and dialog.delete_profile_button.isEnabled()
+        dialog.folder_edit.setText("_KEEPS")
+        assert not dialog.confirm_button.isEnabled()
+        dialog.folder_edit.setText("")
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ExportSettingsDialog, "exec", configure)
+    assert window.edit_export_settings()
+
+    web = ExportSettings(2000, 80, "_EXPORTS", "{date}_{name}")
+    assert window.export_settings == web
+    assert json.loads(window.settings.value("export_settings")) == web.to_dict()
+    assert json.loads(window.settings.value("export_profiles")) == {"Web": web.to_dict()}
 
 
 def test_export_records_survive_reopening_the_folder(window, tmp_path, monkeypatch, tmp_path_factory):
