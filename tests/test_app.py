@@ -1522,9 +1522,13 @@ def test_thumbnails_come_back_from_disk_without_decoding(window, tmp_path, monke
     assert wait_until(lambda: any(files for _, _, files in os.walk(window.loader._disk_thumbnails.directory)))
 
     window.loader.reset()
-    monkeypatch.setattr(loader, "_decode", lambda *_: pytest.fail("decoded again"))
+    # Recorded, not failed on the spot: this runs in a worker, where pytest.fail() (a BaseException) aborts Qt.
+    decoded = []
+    real_decode = loader._decode
+    monkeypatch.setattr(loader, "_decode", lambda source, size: decoded.append((source, size)) or real_decode(source, size))
     window.loader.thumbnail(path)
     assert wait_until(lambda: window.loader._thumbnails.get(path) is not None)
+    assert (path, loader.thumbnail_decode_size()) not in decoded
 
 
 # -- the Trash -------------------------------------------------------------------
