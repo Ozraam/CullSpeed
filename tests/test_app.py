@@ -7,17 +7,18 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QEvent, QPoint, QSettings, QSize, Qt  # noqa: E402
-from PyQt6.QtGui import QColor, QImage, QPixmap  # noqa: E402
+from PyQt6.QtGui import QColor, QImage, QKeySequence, QPixmap  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
 
-from tamis import develop, fileops, loader, tones, xmp  # noqa: E402
+from tamis import develop, fileops, loader, shortcuts, tones, xmp  # noqa: E402
 from tamis.app import CULL_TAB, GALLERY_TAB, TamisApp  # noqa: E402
 from tamis.constants import KEEP, REJECT, SESSION_FILENAME  # noqa: E402
 from tamis.exportsettings import ExportSettings  # noqa: E402
 from tamis.fileops import MoveResult, plan_moves  # noqa: E402
 from tamis.imaging import image_to_array  # noqa: E402
 from tamis.plugins import PhotoInfo, Plugin, PluginApi  # noqa: E402
+from tamis.shortcutsdialog import ShortcutsDialog, ShortcutsEditor  # noqa: E402
 from tamis.widgets import ExportSettingsDialog, ImportDialog, MessageDialog, NameDialog, ProcessDialog  # noqa: E402
 
 CTRL = Qt.KeyboardModifier.ControlModifier
@@ -1839,3 +1840,84 @@ def test_thumbnails_of_edits_follow_moves(window):
     key = window.edit_thumbnails.pixmap(path, edit, None).cacheKey()
     window.edit_thumbnails.rename_paths({path: path + ".moved"})
     assert window.edit_thumbnails.pixmap(path + ".moved", edit, None).cacheKey() == key
+
+
+# -- keyboard shortcuts --------------------------------------------------------
+
+def test_purple_label_has_a_shortcut(window):
+    press(window, Qt.Key.Key_9, CTRL | Qt.KeyboardModifier.ShiftModifier)
+    assert window.model.photo(0).label == "Purple"
+    press(window, Qt.Key.Key_9, CTRL | Qt.KeyboardModifier.ShiftModifier)
+    assert window.model.photo(0).label is None
+
+
+def test_every_command_is_bound(window):
+    slots = window._shortcut_slots()
+    assert set(slots) == set(shortcuts.BY_ID)
+    bound = {shortcut.key().toString() for shortcut in window.app_shortcuts}
+    assert bound == {key for keys in shortcuts.defaults().values() for key in keys}
+
+
+def test_question_mark_lists_every_shortcut_with_the_plugins(window, monkeypatch):
+    load_plugin(window, "def register(tamis):\n    tamis.add_action('Mine', print, shortcut='Ctrl+Shift+J')")
+    shown = []
+
+    def look(dialog):
+        shown.append(dialog)
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(ShortcutsDialog, "exec", look)
+    press(window, Qt.Key.Key_Question)  # macOS and Windows match it without the Shift that typed it
+    assert len(shown) == 1
+    groups = shown[0].groups
+    titles = [title for entries in groups.values() for title, _keys in entries]
+    assert titles[: len(shortcuts.COMMANDS)] == [command.title for command in shortcuts.COMMANDS]
+    assert groups["Plugins"] == [(f"{window.plugins.plugins[-1].name} > Mine", shortcuts.native("Ctrl+Shift+J"))]
+
+
+def test_customize_from_the_overview_opens_the_editor(window, monkeypatch):
+    monkeypatch.setattr(ShortcutsDialog, "exec", lambda dialog: (dialog.accept(), QDialog.DialogCode.Accepted)[1])
+    opened = []
+    monkeypatch.setattr(ShortcutsEditor, "exec", lambda dialog: opened.append(dialog) or QDialog.DialogCode.Rejected)
+    window.show_shortcuts()
+    assert len(opened) == 1
+
+
+def test_changed_shortcuts_are_bound_and_remembered(window, monkeypatch):
+    def rebind(dialog):
+        dialog.edits["keep"][0].setKeySequence(QKeySequence("Q"))
+        dialog.edits["keep"][1].clear()
+        assert dialog.confirm_button.isEnabled()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(ShortcutsEditor, "exec", rebind)
+    assert window.edit_shortcuts()
+    press(window, Qt.Key.Key_1)
+    assert window.model.photo(0).status is None  # 1 no longer keeps
+    press(window, Qt.Key.Key_Q)
+    assert window.model.photo(0).status == KEEP
+    assert shortcuts.load(window.settings)["keep"] == ("Q",)
+    assert "Q keep" in window.stats.hint.text()
+
+
+def test_cull_only_shortcuts_stay_off_in_the_gallery_after_rebinding(window, monkeypatch):
+    window.tabs.setCurrentIndex(GALLERY_TAB)
+    monkeypatch.setattr(ShortcutsEditor, "exec", lambda dialog: (dialog.edits["next"][0].setKeySequence(QKeySequence("W")),
+                                                                 QDialog.DialogCode.Accepted)[1])
+    assert window.edit_shortcuts()
+    assert window.cull_shortcuts and not any(shortcut.isEnabled() for shortcut in window.cull_shortcuts)
+    window.tabs.setCurrentIndex(CULL_TAB)
+    assert all(shortcut.isEnabled() for shortcut in window.cull_shortcuts)
+
+
+def test_the_editor_refuses_a_key_used_twice(window):
+    load_plugin(window, "def register(tamis):\n    tamis.add_action('Mine', print, shortcut='Ctrl+Shift+J')")
+    dialog = ShortcutsEditor(window, window.shortcut_keys, window._plugin_shortcuts())
+    assert dialog.confirm_button.isEnabled()
+    dialog.edits["reject"][0].setKeySequence(QKeySequence("P"))
+    assert not dialog.confirm_button.isEnabled()
+    assert "P is used by" in dialog.conflict_label.text()
+    dialog.edits["reject"][0].setKeySequence(QKeySequence("Ctrl+Shift+J"))
+    assert not dialog.confirm_button.isEnabled()  # a plugin has it
+    dialog.set_bindings(shortcuts.defaults())
+    assert dialog.confirm_button.isEnabled() and dialog.bindings == shortcuts.defaults()

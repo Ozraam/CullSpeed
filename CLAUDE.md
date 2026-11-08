@@ -81,6 +81,9 @@ RAWs are edited from LibRaw's 16-bit linear development, not their embedded JPEG
 - App events go through `self.plugins.emit(name, ...)`; a new event also needs an entry in `plugins.EVENTS` and the README.
 - Plugin shortcuts that are already taken are refused, since Qt fires neither of two ambiguous shortcuts. That relies on the app's own being bound before `plugins.load()`.
 
+### Shortcuts
+`shortcuts.COMMANDS` is the one table of the app's shortcuts: `TamisApp._build_shortcuts` binds it (slots in `_shortcut_slots`), the `?` overview and the stats bar hint are generated from it, and `ShortcutsEditor` changes it. A new shortcut is a `Command` there plus its slot. The user's keys (`TamisApp.shortcut_keys`) are saved in QSettings as their differences from the defaults; rebinding replaces every `QShortcut` and must keep cull-only ones disabled outside the Cull tab. Hard-coded keys in tooltips and the README describe the defaults.
+
 ## Constraints
 
 - Do not use `QMessageBox`: with Qt 6.11 on recent macOS its native `NSAlert` crashes AppKit (`trace trap`). Use `inform` / `MessageDialog` from `widgets.py`.

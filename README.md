@@ -54,6 +54,7 @@ tamis                  # or: python Tamis.py, python -m tamis
 | Unmark | `U`, `2`, or `Backspace` |
 | Stars 0–5 | `⌘0`–`⌘5` / `Ctrl+0`–`Ctrl+5` |
 | Colour label red / yellow / green / blue (again to remove) | `⌘6`–`⌘9` / `Ctrl+6`–`Ctrl+9` |
+| Colour label purple (again to remove) | `⌘⇧9` / `Ctrl+Shift+9` |
 | Undo | `⌘Z` / `Ctrl+Z` |
 | Next / previous photo | `→` `L` `Space` / `←` `H` |
 | First / last photo | `Home` / `End` |
@@ -76,6 +77,9 @@ tamis                  # or: python Tamis.py, python -m tamis
 | Import from a memory card | `⌘I` / `Ctrl+I` |
 | Switch Cull ↔ Gallery | `G` (Enter or double-click in the gallery opens a photo) |
 | Open folder | `⌘O` / `Ctrl+O` |
+| List every shortcut, the plugins' included | `?` |
+
+These are the defaults. **Customize…** in the `?` overview, or **Options ▾ > Keyboard Shortcuts…**, changes them, with up to three keys per action; a key can only do one thing, so Save waits until no two actions (or an action and a plugin's shortcut) share one, and **Restore Defaults** brings these back. Only the changed ones are saved, in the app's settings. The stats bar's reminder follows the keys you chose.
 
 In the Cull view, marking a photo as keep or reject moves on to the next one (in Compare, it stays on the same photos). In the Gallery, marks, stars and labels apply to every selected photo.
 
@@ -104,7 +108,7 @@ def register(tamis):
 
 | `tamis.` | What it does |
 | --- | --- |
-| `add_action(title, callback, shortcut=None)` | Adds an entry to the Plugins menu; returns its `QAction`. A shortcut that is invalid or already taken is dropped and reported |
+| `add_action(title, callback, shortcut=None)` | Adds an entry to the Plugins menu; returns its `QAction`. A shortcut that is invalid or already taken (by the app, with the user's own keys, or another plugin) is dropped and reported. It shows in the `?` overview |
 | `on(event, callback)` | Calls `callback` when an event happens (below) |
 | `folder`, `photos()`, `current_photo()`, `selected_photos()` | The open folder and its photos. The current photo can be `None`; `selected_photos()` is what a mark would apply to |
 | `go_to(photo)` | Shows that photo |
@@ -164,6 +168,8 @@ If the photo folder is read-only (locked SD card, read-only share), marks are sa
 | `tamis/presets.py` | Named looks, kept in the app's data folder |
 | `tamis/exportsettings.py` | Export size, quality, folder, name pattern and profiles |
 | `tamis/fileops.py` | Planning and executing file moves, exports, the Trash and imports |
+| `tamis/shortcuts.py` | The table of keyboard shortcuts: defaults, the user's changes, conflicts |
+| `tamis/shortcutsdialog.py` | The shortcut overview (`?`) and the editor |
 | `tamis/plugins.py` | Loading plugins, the API they receive and the Plugins menu |
 | `tamis/widgets.py` | Image and compare views, thumbnail delegate, bars, toast and dialogs |
 | `tamis/theme.py` | Dark palette and stylesheet |
