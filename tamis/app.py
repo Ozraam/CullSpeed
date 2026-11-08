@@ -5,6 +5,7 @@ from contextlib import suppress
 from html import escape
 
 from PyQt6.QtCore import (
+    QEvent,
     QEventLoop,
     QFileSystemWatcher,
     QItemSelectionModel,
@@ -17,9 +18,10 @@ from PyQt6.QtCore import (
     QTimer,
     pyqtSignal,
 )
-from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QActionGroup, QKeySequence, QPainter, QPixmap, QShortcut, QTransform
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -44,12 +46,13 @@ from .constants import (
     PLUGINS_DIR,
     PREFETCH_AHEAD,
     PREFETCH_BEHIND,
+    PRESETS_FILENAME,
     REJECT,
     REJECT_DIR,
     SESSION_FILENAME,
     UNDO_LIMIT,
 )
-from .editing import EditRenderer, export_photo
+from .editing import EditRenderer, EditThumbnails, export_photo
 from .editpanel import EditPanel
 from .exif import summary
 from .fileops import (
@@ -73,7 +76,9 @@ from .loader import ImageLoader
 from .models import SORT_KEYS, PhotoModel, StatusFilterProxy, by_name, photo_files, relative_key, save_session, scan_folder
 from .peaking import FocusPeaker
 from .plugins import PhotoInfo, PluginManager
+from .presets import PresetStore
 from .thumbcache import ThumbnailCache
+from .tones import ToneReader
 from .widgets import (
     CompareView,
     GalleryToolbar,
@@ -81,6 +86,7 @@ from .widgets import (
     ImageView,
     ImportDialog,
     MessageDialog,
+    NameDialog,
     ProcessDialog,
     StatsBar,
     ThumbnailDelegate,
@@ -196,7 +202,7 @@ class WorkThread(QThread):
 
 
 class TamisApp(QMainWindow):
-    def __init__(self, plugins_dir=None, cache_dir=None):
+    def __init__(self, plugins_dir=None, cache_dir=None, presets_file=None):
         super().__init__()
         self.setWindowTitle("Tamis")
         self.setMinimumSize(900, 600)
@@ -217,7 +223,10 @@ class TamisApp(QMainWindow):
         self.live_edit = None  # (path, edit) while a slider is being dragged, before it is kept
         self.edit_clipboard = None
         self.cropping = False  # the crop tool is open on the current photo
-        self.crop_cache = {}  # (pixmap key, crop) -> cropped pixmap, for what the renderer doesn't crop
+        self.crop_cache = {}  # (pixmap key, framing) -> framed pixmap, for what the renderer doesn't frame
+        self.before = False  # the photo is being shown without its edit
+        self.show_clipping = False
+        self.presets = PresetStore(presets_file or os.path.join(data_dir, PRESETS_FILENAME))
         self.keeps_only = False  # the Cull view only shows and steps through keeps
         self.lut_folder = self.settings.value("lut_folder", "")
         self.luts = {}  # LUT id -> path, from lut_folder
@@ -234,7 +243,8 @@ class TamisApp(QMainWindow):
             self.xmp_marks = "off"
 
         cache_dir = cache_dir or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
-        self.loader = ImageLoader(self, ThumbnailCache(os.path.join(cache_dir, "thumbnails")))
+        thumbnail_cache = ThumbnailCache(os.path.join(cache_dir, "thumbnails"))
+        self.loader = ImageLoader(self, thumbnail_cache)
         self.loader.preview_loaded.connect(self._on_image_ready)
         self.loader.preview_failed.connect(lambda path, _error: self._on_image_ready(path))
         self.loader.full_loaded.connect(self._on_image_ready)
@@ -243,9 +253,13 @@ class TamisApp(QMainWindow):
         self.editor = EditRenderer(self)
         self.editor.rendered.connect(self._on_image_ready)
         self.editor.failed.connect(self._on_edit_failed)
+        self.edit_thumbnails = EditThumbnails(self.editor, thumbnail_cache, self)
 
         self.peaker = FocusPeaker(self)
         self.peaker.ready.connect(self._on_peaking_ready)
+
+        self.tones = ToneReader(self)
+        self.tones.ready.connect(self._refresh_view)
 
         self.analyzer = PhotoAnalyzer(os.path.join(cache_dir, "analysis"), self)
         self.analyzer.analyzed.connect(self._on_analyzed)
@@ -257,6 +271,7 @@ class TamisApp(QMainWindow):
         self.analysis_timer.timeout.connect(self._show_analysis)
 
         self.model = PhotoModel(self.loader, self)
+        self.model.set_edit_thumbnails(self.edit_thumbnails, self._lut_path)
         self.model.statuses_changed.connect(self._on_statuses_changed)
         self.model.ratings_changed.connect(lambda paths: self.xmp_dirty.update(paths))
         self.model.marks_changed.connect(self._on_marks_changed)
@@ -287,6 +302,8 @@ class TamisApp(QMainWindow):
         self.plugins_button.setMenu(self.plugins.menu)
         self.plugins.load()
         QTimer.singleShot(0, self._restore_last_folder)
+        if self.presets.problem:
+            QTimer.singleShot(0, lambda: self.toast.show_message(self.presets.problem, 6000))
 
     # -- UI ----------------------------------------------------------------
 
@@ -327,6 +344,13 @@ class TamisApp(QMainWindow):
         self.edit_panel.crop_requested.connect(self.toggle_crop)
         self.edit_panel.crop_cleared.connect(self.clear_crop)
         self.edit_panel.crop_ratio_changed.connect(self._on_crop_ratio_changed)
+        self.edit_panel.rotate_requested.connect(self.rotate_photos)
+        self.edit_panel.clipping_toggled.connect(self.set_clipping)
+        self.edit_panel.before_held.connect(self._set_before)
+        self.edit_panel.preset_chosen.connect(self.apply_preset)
+        self.edit_panel.preset_save_requested.connect(self.save_preset)
+        self.edit_panel.preset_delete_requested.connect(self.delete_preset)
+        self.edit_panel.set_presets(self.presets.names())
         self.edit_panel.setVisible(self.settings.value("edit_panel", False, type=bool))
 
         viewer = QHBoxLayout()
@@ -429,9 +453,10 @@ class TamisApp(QMainWindow):
     def _build_shortcuts(self):
         self.cull_shortcuts = []
 
-        def bind(keys, slot, cull_only=False):
+        def bind(keys, slot, cull_only=False, repeat=True):
             for key in keys:
                 shortcut = QShortcut(QKeySequence(key), self)
+                shortcut.setAutoRepeat(repeat)
                 shortcut.activated.connect(slot)
                 if cull_only:
                     self.cull_shortcuts.append(shortcut)
@@ -456,6 +481,8 @@ class TamisApp(QMainWindow):
         bind(["I"], self.toggle_info)
         bind(["E"], self.toggle_edit_panel)
         bind(["R"], self.toggle_crop)
+        bind(["]", "Shift+R"], lambda: self.rotate_photos(90))
+        bind(["[", "Shift+L"], lambda: self.rotate_photos(-90))
         bind(["Ctrl+C", "Ctrl+Shift+C"], self.copy_edit)
         bind(["Ctrl+V", "Ctrl+Shift+V"], self.paste_edit)
         bind(["Ctrl+Shift+E"], self.export_photos)
@@ -471,6 +498,8 @@ class TamisApp(QMainWindow):
         bind(["K"], self.toggle_keeps_only, cull_only=True)
         bind(["Z"], self.toggle_zoom, cull_only=True)
         bind(["F"], self.toggle_peaking, cull_only=True)
+        bind(["J"], lambda: self.set_clipping(not self.show_clipping), cull_only=True)
+        bind(["Y", "\\"], self._hold_before, cull_only=True, repeat=False)
         bind(["Escape"], self.escape, cull_only=True)
         bind(["Return", "Enter"], self._confirm_crop, cull_only=True)
 
@@ -511,6 +540,8 @@ class TamisApp(QMainWindow):
             self.crop_cache.clear()
             self.moved_keys.clear()
             self.peaker.reset()
+            self.tones.reset()
+            self.edit_thumbnails.reset()
             self.analyzer.open_folder(folder)
         self.analyzer.apply_known(photos)
         if self.show_bursts:
@@ -807,6 +838,7 @@ class TamisApp(QMainWindow):
             shown = [(self.image_view, self.current_row)]
         zoomed = self._zoomed()
         self.peaker.begin()
+        self.tones.begin()
         # Previews are downscaled, so while zoomed the photos load at full resolution.
         self.loader.ensure_full([self.model.photo(row).path for _, row in shown], load=zoomed)
         for view, row in shown:
@@ -815,13 +847,15 @@ class TamisApp(QMainWindow):
     def _show_in(self, view, row, zoomed):
         photo = self.model.photo(row)
         # The crop tool shows the whole photo. Otherwise what the renderer didn't
-        # make is cropped here, so a photo keeps its frame whatever is shown of it.
-        crop = None if self.cropping else self._shown_edit(photo).get("crop")
+        # make is framed here, so a photo keeps its frame whatever is shown of it.
+        framing = develop.framing(self._shown_edit(photo))
+        if self.cropping:
+            framing.pop("crop", None)
         pixmap = self._edited_pixmap(photo)
         if pixmap is None:
-            pixmap = self._cropped(self.loader.preview(photo.path), crop)
+            pixmap = self._framed(self.loader.preview(photo.path), framing)
         if pixmap is not None:
-            view.set_image(pixmap, native_size=self._framed_size(self.loader.native_size(photo.path), crop), keep_zoom=True)
+            view.set_image(pixmap, native_size=self._framed_size(self.loader.native_size(photo.path), framing), keep_zoom=True)
         else:
             error = self.loader.preview_error(photo.path)
             view.set_image(None, f"Could not load {photo.name}\n\n{error}" if error else "Loading…", keep_zoom=True)
@@ -833,12 +867,23 @@ class TamisApp(QMainWindow):
         if zoomed and pixmap is not None:
             full = self.loader.full_pixmap(photo.path)
             if full is not None:
-                shown = self._cropped(full, crop)
+                shown = self._framed(full, framing)
                 view.set_full_image(shown)
             else:
                 view.set_full_loading(self.loader.full_error(photo.path) is None)
         peaks = self.peaking and shown is not None and not self.cropping
         view.set_overlay(self.peaker.overlay(shown) if peaks else None)
+        clipping = self.show_clipping and shown is not None and not self.cropping
+        view.set_clipping(self.tones.clipping(shown) if clipping else None, photo.path if clipping else None)
+        view.set_note("Before" if self._showing_before(photo) else "")
+        if row == self.current_row and self.edit_panel.isVisible():
+            if pixmap is None:
+                self.edit_panel.histogram.set_tone(None)
+            else:
+                # Until the new one is known the last one stays up, so that a slider doesn't make it blink.
+                tone = self.tones.tone(pixmap)
+                if tone is not None:
+                    self.edit_panel.histogram.set_tone(tone)
 
     def _info_lines(self, photo):
         lines = summary(self.loader.info(photo.path))
@@ -852,8 +897,14 @@ class TamisApp(QMainWindow):
         """The photo's edit, or the one being dragged."""
         return self.live_edit[1] if self.live_edit is not None and self.live_edit[0] == photo.path else photo.edit
 
+    def _showing_before(self, photo):
+        """Whether the photo is being shown without an edit it has."""
+        return self.before and not self.cropping and bool(develop.look(self._shown_edit(photo)))
+
     def _edited_pixmap(self, photo):
         """The render of the photo's edit (or of the one being dragged), if it has one."""
+        if self.before and not self.cropping:
+            return None  # the preview any unedited photo shows, which _framed() keeps in its frame
         live = self.live_edit is not None and self.live_edit[0] == photo.path
         edit = self._shown_edit(photo)
         if self.cropping:
@@ -862,23 +913,46 @@ class TamisApp(QMainWindow):
             return None
         return self.editor.pixmap(photo.path, edit, self._lut_path(edit), quick=live, same_crop=self.cropping)
 
-    def _cropped(self, pixmap, crop):
-        if pixmap is None or not crop:
+    def _framed(self, pixmap, framing):
+        """`pixmap` turned, straightened and cropped as `framing` says, like the renderer does it."""
+        if pixmap is None or not framing:
             return pixmap
-        key = (pixmap.cacheKey(), tuple(crop))
+        key = (pixmap.cacheKey(), json.dumps(framing, sort_keys=True))
         if key not in self.crop_cache:
-            top, bottom, left, right = develop.crop_box(pixmap.height(), pixmap.width(), crop)
-            self.crop_cache[key] = pixmap.copy(QRect(left, top, right - left, bottom - top))
+            framed = pixmap
+            if framing.get("rotate"):
+                framed = framed.transformed(QTransform().rotate(framing["rotate"]))
+            if framing.get("straighten"):
+                framed = self._straightened(framed, framing["straighten"])
+            if framing.get("crop"):
+                top, bottom, left, right = develop.crop_box(framed.height(), framed.width(), framing["crop"])
+                framed = framed.copy(QRect(left, top, right - left, bottom - top))
+            self.crop_cache[key] = framed
             while len(self.crop_cache) > CROP_CACHE_SIZE:
                 del self.crop_cache[next(iter(self.crop_cache))]  # oldest
         return self.crop_cache[key]
 
     @staticmethod
-    def _framed_size(size, crop):
-        if size is None or not crop or not size.isValid():
+    def _straightened(pixmap, degrees):
+        width, height = pixmap.width(), pixmap.height()
+        zoom = develop.straighten_zoom(height, width, degrees)
+        result = QPixmap(pixmap.size())
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.translate(width / 2, height / 2)
+        painter.rotate(degrees)
+        painter.scale(zoom, zoom)
+        painter.translate(-width / 2, -height / 2)
+        painter.drawPixmap(0, 0, pixmap)
+        painter.end()
+        return result
+
+    @staticmethod
+    def _framed_size(size, framing):
+        if size is None or not framing or not size.isValid():
             return size
-        top, bottom, left, right = develop.crop_box(size.height(), size.width(), crop)
-        return QSize(right - left, bottom - top)
+        height, width = develop.framed_size(size.height(), size.width(), framing)
+        return QSize(width, height)
 
     def _lut_path(self, edit):
         return self.luts.get(edit.get("lut")) if edit.get("lut") else None
@@ -933,6 +1007,33 @@ class TamisApp(QMainWindow):
         if self.peaking:
             self._refresh_view()
 
+    def set_clipping(self, on):
+        self.show_clipping = on
+        self.edit_panel.set_clipping(on)
+        self.toast.show_message("Clipping warnings on" if on else "Clipping warnings off")
+        self._refresh_view()
+
+    def _hold_before(self):
+        """The key was pressed: show the photo without its edit until a key is let go."""
+        QApplication.instance().installEventFilter(self)
+        self._set_before(True)
+
+    def _set_before(self, on):
+        if not on:
+            QApplication.instance().removeEventFilter(self)
+        if on != self.before:
+            self.before = on
+            self._refresh_view()
+
+    def eventFilter(self, watched, event):
+        # Only while a key holds the before view. Any key that is let go ends it: with a layout
+        # where the key takes a modifier, it may be reported as another one, and this must never stick.
+        if event.type() == QEvent.Type.WindowDeactivate or (
+            event.type() == QEvent.Type.KeyRelease and not event.isAutoRepeat()
+        ):
+            self._set_before(False)
+        return super().eventFilter(watched, event)
+
     def toggle_info(self):
         self.show_info = not self.show_info
         self.settings.setValue("show_info", self.show_info)
@@ -963,32 +1064,32 @@ class TamisApp(QMainWindow):
         self._refresh_view()
 
     def _set_edit(self, rows, edit):
-        self._push_undo(self.model.set_field(rows, "edit", dict(edit)))
-        if not edit:
-            for row in rows:
+        self._set_edits({row: dict(edit) for row in rows})
+
+    def _set_edits(self, values):
+        """Give each row its own edit, as one undo step: `values` is {row: edit}."""
+        self._push_undo(self.model.set_values("edit", values))
+        for row, edit in values.items():
+            if not edit:
                 self.editor.forget(self.model.photo(row).path)
 
+    def _apply_look(self, rows, look):
+        """Give `rows` this look. Each photo keeps its own framing."""
+        self._set_edits({row: {**look, **develop.framing(self.model.photo(row).edit)} for row in rows})
+
     def copy_edit(self):
-        """Copy the current photo's look. A crop belongs to its photo's framing: it is not copied."""
+        """Copy the current photo's look. Its framing belongs to that photo: it is not copied."""
         if self.current_row >= 0:
-            edit = self.model.photo(self.current_row).edit
-            self.edit_clipboard = {key: value for key, value in edit.items() if key != "crop"}
+            self.edit_clipboard = develop.look(self.model.photo(self.current_row).edit)
             self.toast.show_message("Edit copied" if self.edit_clipboard else "Copied: no edit")
 
     def paste_edit(self):
-        """Paste the copied look on the target photos, which keep their own crop."""
+        """Paste the copied look on the target photos, which keep their own framing."""
         rows = self._target_rows()
         if self.edit_clipboard is None:
             self.toast.show_message("Nothing to paste: copy an edit first")
         elif rows:
-            values = {}
-            for row in rows:
-                crop = self.model.photo(row).edit.get("crop")
-                values[row] = {**self.edit_clipboard, "crop": crop} if crop else dict(self.edit_clipboard)
-            self._push_undo(self.model.set_values("edit", values))
-            for row in rows:
-                if not values[row]:
-                    self.editor.forget(self.model.photo(row).path)
+            self._apply_look(rows, self.edit_clipboard)
             self.toast.show_message(f"Edit pasted on {len(rows)} photo(s)")
 
     def reset_edit(self):
@@ -996,6 +1097,60 @@ class TamisApp(QMainWindow):
         rows = self._target_rows()
         if rows:
             self._set_edit(rows, {})
+
+    # -- presets -----------------------------------------------------------
+
+    def save_preset(self):
+        """Keep the current photo's look under a name, for this and other shoots."""
+        if self.current_row < 0:
+            return
+        look = develop.look(self.model.photo(self.current_row).edit)
+        if not look:
+            self.toast.show_message("Nothing to save: this photo has no look to keep")
+            return
+        dialog = NameDialog(self, "Save preset", "A name for this look. A crop or rotation is not part of it.", "Save")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dialog.name
+        if name in self.presets:
+            confirm = MessageDialog(
+                self, "Replace preset", f"Replace the preset <b>{escape(name)}</b>?", confirm_text="Replace"
+            )
+            if confirm.exec() != QDialog.DialogCode.Accepted:
+                return
+        self._change_presets(lambda: self.presets.save(name, look), f"Preset “{name}” saved")
+
+    def apply_preset(self, name):
+        look = self.presets.get(name)
+        rows = self._target_rows()
+        if look is not None and rows:
+            self._apply_look(rows, look)
+            self.toast.show_message(f"“{name}” applied to {len(rows)} photo(s)")
+
+    def delete_preset(self, name):
+        dialog = MessageDialog(
+            self, "Delete preset", f"Delete the preset <b>{escape(name)}</b>? Photos using its look keep it.", confirm_text="Delete"
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._change_presets(lambda: self.presets.delete(name), f"Preset “{name}” deleted")
+
+    def _change_presets(self, change, done):
+        try:
+            change()
+        except OSError as exc:
+            inform(self, "Could not save the presets", escape(str(exc)))
+            return
+        self.edit_panel.set_presets(self.presets.names())
+        self.toast.show_message(done)
+
+    # -- rotation ----------------------------------------------------------
+
+    def rotate_photos(self, degrees):
+        """Turn the target photos by a quarter turn (90 or -90): one undo step, also while culling."""
+        self._finish_crop(apply=True)
+        rows = self._target_rows()
+        if rows:
+            self._set_edits({row: develop.turned(self.model.photo(row).edit, degrees) for row in rows})
 
     # -- crop --------------------------------------------------------------
 
@@ -1065,6 +1220,7 @@ class TamisApp(QMainWindow):
         except OSError:
             self.luts = {}
         self.edit_panel.set_luts([(lut_id, lut.display_name(lut_id)) for lut_id in self.luts])
+        self.model.thumbnails_changed()
         if not quiet:
             self.toast.show_message(f"{len(self.luts)} film simulation(s) found")
         self._refresh_view()
@@ -1317,6 +1473,7 @@ class TamisApp(QMainWindow):
     # -- gallery -----------------------------------------------------------
 
     def _on_tab_changed(self, index):
+        self._set_before(False)
         for shortcut in self.cull_shortcuts:
             shortcut.setEnabled(index == CULL_TAB)
         self.keeps_button.setVisible(index == CULL_TAB)  # the gallery has its own filter
@@ -1559,6 +1716,7 @@ class TamisApp(QMainWindow):
         self.loader.forget(files)
         for path in gone:
             self.editor.forget(path)
+            self.edit_thumbnails.forget(path)
         self.xmp_dirty -= gone
         self.undo_stack = [kept for changes in self.undo_stack if (kept := [c for c in changes if c[0] not in gone])]
         self.current_row = -1
@@ -1723,6 +1881,7 @@ class TamisApp(QMainWindow):
         self.model.apply_moves({old: (new, locations[old]) for old, new in result.moved.items()})
         self.loader.rename_paths(result.moved)
         self.editor.rename_paths(result.moved)
+        self.edit_thumbnails.rename_paths(result.moved)
         self.xmp_dirty = {result.moved.get(path, path) for path in self.xmp_dirty}
         self.moved_keys.update(relative_key(self.folder, old) for old in result.moved)
         self.undo_stack.clear()  # undo entries refer to the old paths
@@ -1757,6 +1916,8 @@ class TamisApp(QMainWindow):
         self.loader.shutdown()
         self.editor.shutdown()
         self.peaker.shutdown()
+        self.tones.shutdown()
+        self.edit_thumbnails.shutdown()
         self.analyzer.shutdown()
         super().closeEvent(event)
 

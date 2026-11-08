@@ -25,18 +25,18 @@ def _emit(signal, *args):
         signal.emit(*args)
 
 
-def _pixmap_bytes(pixmap):
+def pixmap_bytes(pixmap):
     return pixmap.width() * pixmap.height() * pixmap.depth() // 8
 
 
-def _thumbnail_decode_size():
+def thumbnail_decode_size():
     """THUMBNAIL_MAX_SIZE in device pixels, so thumbnails stay sharp on HiDPI screens."""
     app = QGuiApplication.instance()
     ratio = app.devicePixelRatio() if app is not None else 1.0
     return math.ceil(THUMBNAIL_MAX_SIZE * ratio)
 
 
-def _file_state(path):
+def file_state(path):
     """What tells that a file has changed: (size, modification time), None if it can't be read."""
     try:
         stat = os.stat(path)
@@ -267,7 +267,7 @@ class ImageLoader(QObject):
         if pixmap is not None:
             self._thumbnails.move_to_end(path)
         elif path not in self._thumbnail_pending and (
-            path not in self._thumbnail_failed or self._thumbnail_failed[path] != _file_state(path)
+            path not in self._thumbnail_failed or self._thumbnail_failed[path] != file_state(path)
         ):
             self._request_thumbnail(path)  # (a failed one keeps showing as failed until this one is done)
         return pixmap
@@ -281,7 +281,7 @@ class ImageLoader(QObject):
         for path in paths:
             pixmap = self._thumbnails.pop(path, None)
             if pixmap is not None:
-                self._thumbnail_bytes -= _pixmap_bytes(pixmap)
+                self._thumbnail_bytes -= pixmap_bytes(pixmap)
             for cache in (self._previews, self._preview_errors, self._native_sizes, self._info,
                           self._thumbnail_failed, self._full, self._full_errors):
                 cache.pop(path, None)
@@ -296,12 +296,12 @@ class ImageLoader(QObject):
     def _request_thumbnail(self, path):
         self._thumbnail_pending.add(path)
         generation = self._generation
-        size = _thumbnail_decode_size()
+        size = thumbnail_decode_size()
 
         def job():
             if generation != self._generation:
                 return
-            state = _file_state(path)  # before decoding: a file that changes meanwhile is tried again
+            state = file_state(path)  # before decoding: a file that changes meanwhile is tried again
             image = self._disk_thumbnails.load(path, state, size) if self._disk_thumbnails and state else None
             if image is None:
                 image, _native, _error = _decode(path, size)
@@ -323,8 +323,8 @@ class ImageLoader(QObject):
         self._thumbnail_failed.pop(path, None)
         pixmap = QPixmap.fromImage(image)
         self._thumbnails[path] = pixmap
-        self._thumbnail_bytes += _pixmap_bytes(pixmap)
+        self._thumbnail_bytes += pixmap_bytes(pixmap)
         while self._thumbnail_bytes > THUMBNAIL_CACHE_BYTES and len(self._thumbnails) > 1:
             _old, evicted = self._thumbnails.popitem(last=False)  # reloaded if scrolled back to
-            self._thumbnail_bytes -= _pixmap_bytes(evicted)
+            self._thumbnail_bytes -= pixmap_bytes(evicted)
         self.thumbnail_loaded.emit(path)

@@ -60,3 +60,43 @@ def test_failed_export_leaves_the_earlier_one_alone(tmp_path, monkeypatch):
 
     assert (exports / "a.jpg").read_text() == "earlier"
     assert os.listdir(exports) == ["a.jpg"]
+
+
+def half_white(path, width=300, height=200):
+    """Black, with the right half white."""
+    image = QImage(width, height, QImage.Format.Format_RGB32)
+    image.fill(QColor(0, 0, 0))
+    for y in range(height):
+        for x in range(width // 2, width):
+            image.setPixelColor(x, y, QColor(255, 255, 255))
+    image.save(str(path), "PNG")
+    return str(path)
+
+
+def test_export_applies_turns_before_the_crop(tmp_path):
+    path = half_white(tmp_path / "a.png")
+    # Turned clockwise, the white half is at the bottom; the crop keeps that half.
+    dest = editing.export_photo(path, {"rotate": 90, "crop": [0, 0.5, 1, 1]}, None, str(tmp_path / "_EXPORTS"))
+    exported = image_to_array(QImage(dest))
+    assert exported.shape == (150, 200, 3)
+    assert exported.mean() / 257 > 250
+
+
+def test_export_straightens_at_the_same_size(tmp_path):
+    path = jpeg(tmp_path / "a.jpg", 400, 300, grey=100)
+    dest = editing.export_photo(path, {"straighten": 4.0}, None, str(tmp_path / "_EXPORTS"))
+    exported = image_to_array(QImage(dest))
+    assert exported.shape == (300, 400, 3)
+    assert abs(exported.mean() / 257 - 100) < 2  # no empty corner darkens it
+
+
+def test_export_and_preview_frame_alike(tmp_path):
+    path = half_white(tmp_path / "a.png")
+    edit = {"straighten": 6.0, "crop": [0.1, 0.1, 0.9, 0.9]}
+    dest = editing.export_photo(path, edit, None, str(tmp_path / "_EXPORTS"))
+    exported = image_to_array(QImage(dest)) / 257
+    base = editing.develop_base(path, max_size=None)
+    upright = editing.straighten_parallel(base, edit["straighten"])
+    preview = editing.develop.render(editing.develop.crop_array(upright, edit["crop"]), edit).astype(np.float32)
+    assert exported.shape == preview.shape
+    assert np.abs(exported - preview).mean() < 6  # JPEG blurs the edge a little
