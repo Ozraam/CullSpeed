@@ -84,6 +84,20 @@ def develop_base(path, max_size=EDIT_PREVIEW_SIZE, process=develop.PROCESS):
     return _linearize(pixels, kind)
 
 
+def exposure_shift(path, old, new=develop.PROCESS, max_size=512):
+    """The EV that keeps an edit of the RAW `path` as bright when it goes from process `old` to `new`.
+
+    Process 1's automatic brightness depends on each photo, so this is measured: the
+    median ratio of the two developments, where neither is black or clipped.
+    """
+    before = develop_base(path, max_size, old) @ develop.LUMA
+    after = develop_base(path, max_size, new) @ develop.LUMA
+    usable = (before > 0.002) & (before < 0.9) & (after > 1e-4)
+    if not usable.any():
+        return 0.0
+    return float(np.median(np.log2(before[usable] / after[usable])))
+
+
 def _seed(path):
     return zlib.crc32(os.path.basename(path).encode("utf-8"))
 

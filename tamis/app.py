@@ -52,7 +52,7 @@ from .constants import (
     SESSION_FILENAME,
     UNDO_LIMIT,
 )
-from .editing import EditRenderer, EditThumbnails, export_photo
+from .editing import EditRenderer, EditThumbnails, export_photo, exposure_shift
 from .editpanel import EditPanel
 from .exif import summary
 from .exportsettings import ExportSettings
@@ -371,6 +371,7 @@ class TamisApp(QMainWindow):
         self.edit_panel.preset_chosen.connect(self.apply_preset)
         self.edit_panel.preset_save_requested.connect(self.save_preset)
         self.edit_panel.preset_delete_requested.connect(self.delete_preset)
+        self.edit_panel.process_update_requested.connect(self.update_process)
         self.edit_panel.set_presets(self.presets.names())
         self.edit_panel.setVisible(self.settings.value("edit_panel", False, type=bool))
 
@@ -1126,6 +1127,28 @@ class TamisApp(QMainWindow):
                 self._show_edit_in_panel()
         self.live_edit = None
         self._refresh_view()
+
+    def update_process(self):
+        """Develop the current RAW the current way, with the exposure that keeps it as bright as it was."""
+        if self.current_row < 0:
+            return
+        photo = self.model.photo(self.current_row)
+        edit = photo.edit
+        old = edit.get("process", develop.PROCESS)
+        if not is_raw(photo.path) or old >= develop.PROCESS:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            shift = exposure_shift(photo.path, old)
+        except Exception as exc:  # a RAW LibRaw can't read: nothing to compare, nothing changed
+            self.toast.show_message(f"Could not develop {photo.name}: {exc}", 4000)
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        exposure = edit.get("exposure", 0.0) + shift
+        self.live_edit = None
+        self._set_edit([self.current_row], develop.clean({**edit, "process": develop.PROCESS, "exposure": exposure}))
+        self.toast.show_message(f"New development · exposure {shift:+.2f} EV, to keep the photo as bright")
 
     def _show_edit_in_panel(self):
         photo = self.model.photo(self.current_row)

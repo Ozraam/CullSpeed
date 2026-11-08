@@ -214,6 +214,7 @@ class EditPanel(QFrame):
     preset_chosen = pyqtSignal(str)
     preset_save_requested = pyqtSignal()
     preset_delete_requested = pyqtSignal(str)
+    process_update_requested = pyqtSignal()  # the RAW is to be developed the current way
 
     WIDTH = 300
 
@@ -341,7 +342,10 @@ class EditPanel(QFrame):
         self.process_note.setWordWrap(True)
         self.process_button = QPushButton("Use the New Development")
         self.process_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.process_button.setToolTip("Develop this RAW the current way: its highlights can be brought back (undoable)")
+        self.process_button.setToolTip(
+            "Develop this RAW the current way, so its highlights can be brought back. "
+            "Exposure is adjusted to keep it as bright (undoable)."
+        )
         self.process_button.clicked.connect(self._update_process)
         for widget in (self.raw_note, self.process_note, self.process_button):
             rows.addWidget(widget)
@@ -510,10 +514,7 @@ class EditPanel(QFrame):
             self.changed.emit(self.edit(), not slider.isSliderDown())
 
     def _update_process(self):
-        self._process = develop.PROCESS
-        self.process_note.hide()
-        self.process_button.hide()
-        self.changed.emit(self.edit(), True)
+        self.process_update_requested.emit()  # the app works out the exposure that keeps the photo as bright
 
     def _commit(self):
         if not self._updating:

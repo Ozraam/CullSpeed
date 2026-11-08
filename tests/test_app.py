@@ -1,5 +1,6 @@
 """The main window, driven by its real shortcuts and mouse events, on a throwaway folder."""
 import json
+import math
 import os
 
 import numpy as np
@@ -1967,8 +1968,9 @@ def test_an_older_raw_edit_keeps_its_process_until_updated(window, tmp_path, mon
     window.paste_edit()
     assert window.model.photo(row).edit == {"contrast": 20, "process": 1}
 
+    # The earlier development gave the same pixels without the fixed gain: exposure makes up for it.
     window.edit_panel.process_button.click()
-    assert window.model.photo(row).edit == {"contrast": 20}
+    assert window.model.photo(row).edit == {"contrast": 20, "exposure": round(-math.log2(develop.RAW_GAIN), 2)}
     assert not window.edit_panel.process_button.isVisibleTo(window.edit_panel)
     window.undo()
     assert window.model.photo(row).edit == {"contrast": 20, "process": 1}

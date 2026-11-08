@@ -204,3 +204,11 @@ def test_sources_in_another_colour_space_are_converted_to_srgb(tmp_path):
 
     preview, _native = load_image(path, None)  # culling shows it alike
     assert abs(preview.pixelColor(0, 0).green() - expected.pixelColor(0, 0).green()) <= 1
+
+
+def test_exposure_shift_keeps_an_older_raw_edit_as_bright(tmp_path, monkeypatch):
+    pixels = np.full((20, 30, 3), 6000, dtype=np.uint16)
+    pixels[0, 0] = 65535  # clipped: left out
+    monkeypatch.setattr(editing.rawpy, "imread", lambda path: FakeRaw(pixels))
+    shift = editing.exposure_shift(str(tmp_path / "a.CR2"), 1)
+    assert shift == pytest.approx(-np.log2(editing.develop.RAW_GAIN), abs=1e-4)
