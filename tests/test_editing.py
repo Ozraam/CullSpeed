@@ -47,15 +47,20 @@ def test_failed_export_leaves_the_earlier_one_alone(tmp_path, monkeypatch):
     exports.mkdir()
     (exports / "a.jpg").write_text("earlier")
 
-    class FullDisk:
-        def save(self, path, _format, _quality):
-            with open(path, "w") as file:
-                file.write("trunc")
+    class Unencodable(QImage):
+        def save(self, *_args):
             return False
 
-    monkeypatch.setattr(editing, "array_to_image", lambda _pixels: FullDisk())
-
+    monkeypatch.setattr(editing, "array_to_image", lambda _pixels: Unencodable(8, 8, QImage.Format.Format_RGB32))
     with pytest.raises(editing.EditError):
+        editing.export_photo(source, {"exposure": 1.0}, None, str(exports), name="a.jpg")
+    monkeypatch.undo()
+
+    def full_disk(_fd):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("tamis.fileops.os.fsync", full_disk)
+    with pytest.raises(OSError):
         editing.export_photo(source, {"exposure": 1.0}, None, str(exports), name="a.jpg")
 
     assert (exports / "a.jpg").read_text() == "earlier"
@@ -100,3 +105,29 @@ def test_export_and_preview_frame_alike(tmp_path):
     preview = editing.develop.render(editing.develop.crop_array(upright, edit["crop"]), edit).astype(np.float32)
     assert exported.shape == preview.shape
     assert np.abs(exported - preview).mean() < 6  # JPEG blurs the edge a little
+
+
+def test_export_carries_an_srgb_profile_and_the_source_exif(tmp_path):
+    from tamis import exif
+
+    source = jpeg(tmp_path / "a.jpg")
+    with open(source, "rb") as file:
+        plain = file.read()
+    shot = b"MM\0*" + bytes.fromhex("00000008") + bytes.fromhex("0001" "0110 0002 00000004" "4F4D3100" "00000000")
+    app1 = b"Exif\0\0" + shot
+    with open(source, "wb") as file:
+        file.write(plain[:2] + b"\xff\xe1" + len(app1 + b"..").to_bytes(2, "big") + app1 + plain[2:])
+
+    dest = editing.export_photo(source, {"exposure": 0.5}, None, str(tmp_path / "_EXPORTS"))
+
+    image = QImage(dest)
+    assert image.colorSpace().isValid() and image.colorSpace().description() == "sRGB"
+    assert exif.read_info(dest)["camera"] == "OM1"
+
+
+def test_export_scales_down_to_the_long_edge(tmp_path):
+    source = jpeg(tmp_path / "a.jpg", 300, 200)
+    small = editing.export_photo(source, {}, None, str(tmp_path / "out"), name="small.jpg", long_edge=150, quality=60)
+    large = editing.export_photo(source, {}, None, str(tmp_path / "out"), name="large.jpg", long_edge=1000)
+    assert QImage(small).size().width() == 150 and QImage(small).size().height() == 100
+    assert QImage(large).size().width() == 300  # never enlarged

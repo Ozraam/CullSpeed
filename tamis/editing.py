@@ -21,10 +21,10 @@ from itertools import count
 
 import numpy as np
 import rawpy
-from PyQt6.QtCore import QObject, Qt, QThread, QThreadPool, pyqtSignal
-from PyQt6.QtGui import QImage, QImageReader, QPixmap
+from PyQt6.QtCore import QBuffer, QIODevice, QObject, Qt, QThread, QThreadPool, pyqtSignal
+from PyQt6.QtGui import QColorSpace, QImage, QImageReader, QPixmap
 
-from . import develop, lut
+from . import develop, exif, lut
 from .constants import THUMBNAIL_CACHE_BYTES
 from .fileops import atomic_write, free_name
 from .imaging import array_to_image, image_to_array, is_raw, resize_array
@@ -104,9 +104,12 @@ def straighten_parallel(pixels, degrees):
 
 # -- export --------------------------------------------------------------------
 
-def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=None):
-    """Render `path` with `edit` at full resolution into `dest_dir` as JPEG; returns the new path.
+def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=None, long_edge=0):
+    """Render `path` with `edit` into `dest_dir` as JPEG; returns the new path.
 
+    The photo is rendered at full resolution, then scaled down to `long_edge`
+    pixels if that is set and smaller. The JPEG is tagged sRGB (with an ICC
+    profile) and carries the EXIF of its source, see exif.export_segment().
     `tables` caches LUT tables between photos of one export (path -> table).
     With `name` the file is written under that name, replacing one already
     there; without, it gets a free name (`IMG_1 (1).jpg`).
@@ -145,9 +148,20 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=N
     if name is None:
         name = free_name(dest_dir, os.path.splitext(os.path.basename(path))[0], ".jpg")
     dest = os.path.join(dest_dir, name)
-    with atomic_write(dest) as tmp_path:
-        if not array_to_image(out).save(tmp_path, "JPG", quality):
-            raise EditError(f"could not write {name}")
+    image = array_to_image(out)
+    del out
+    if long_edge and max(width, height) > long_edge:
+        image = image.scaled(
+            long_edge, long_edge, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
+    image.setColorSpace(QColorSpace(QColorSpace.NamedColorSpace.SRgb))  # written as an ICC profile
+    buffer = QBuffer()
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    if not image.save(buffer, "JPG", quality):
+        raise EditError(f"could not write {name}")
+    data = exif.with_exif(bytes(buffer.data()), exif.export_segment(path, (image.width(), image.height())))
+    with atomic_write(dest) as tmp_path, open(tmp_path, "wb") as file:
+        file.write(data)
     return dest
 
 

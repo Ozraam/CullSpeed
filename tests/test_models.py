@@ -488,9 +488,12 @@ def test_session_exports_only_name_files_directly_in_exports(tmp_path):
             {"name": "b.jpg", "size": "1", "mtime": 2},
             "c.jpg",
             {"name": "ok.jpg", "size": 1, "mtime": 2},
+            {"name": "web.jpg", "size": 1, "mtime": 2, "dir": "web"},
+            {"name": "bad_dir.jpg", "size": 1, "mtime": 2, "dir": 3},
+            {"name": "blank_dir.jpg", "size": 1, "mtime": 2, "dir": " "},
         ]},
     }))
-    assert [record["name"] for record in load_session(str(tmp_path))["a.jpg"]["exports"]] == ["ok.jpg"]
+    assert [record["name"] for record in load_session(str(tmp_path))["a.jpg"]["exports"]] == ["ok.jpg", "web.jpg"]
 
 
 # -- natural sort ------------------------------------------------------------

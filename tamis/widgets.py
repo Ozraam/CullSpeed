@@ -1,6 +1,7 @@
 import os
 import shutil
 from functools import partial
+from html import escape
 
 from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFontMetrics, QKeySequence, QPainter, QPainterPath, QPen, QPixmap
@@ -22,6 +23,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QStyle,
     QStyledItemDelegate,
     QVBoxLayout,
@@ -38,10 +40,12 @@ from .constants import (
     COLOR_REJECT,
     COLOR_STAR,
     COLOR_TEXT,
+    EXPORT_DIR,
     KEEP,
     LABEL_COLORS,
     REJECT,
 )
+from .exportsettings import LONG_EDGE_MAX, QUALITY_RANGE, SCOPES, TOKENS, ExportSettings, file_stem, pattern_problem
 from .fileops import import_size, plan_import
 from .models import (
     BURST_ROLE,
@@ -1150,35 +1154,228 @@ class NameDialog(MessageDialog):
 
 
 class ProcessDialog(MessageDialog):
-    """Confirms "Process Files", with a choice of whether to fill _EXPORTS too.
+    """Confirms "Process Files", with a choice of whether to fill the export folder too.
 
     Without an export_label there is nothing to export, so no choice is shown.
+    With `describe`, the dialog also offers what to export (exportsettings.SCOPES)
+    and a button for the export settings: `describe(scope)` gives the
+    (label, details, anything to export) to show for a scope, and is asked
+    again when the scope or the settings change. `edit_settings()` opens the
+    settings, returning whether they changed.
     """
 
-    def __init__(self, parent, moves_text, export_label=None, export_text=""):
+    def __init__(self, parent, moves_text, export_label=None, export_text="", scope="all", describe=None, edit_settings=None):
         super().__init__(parent, "Process files", moves_text, confirm_text="Process")
         self.body.setVisible(bool(moves_text))
         self._has_moves = bool(moves_text)
+        self._describe = describe
+        self._can_export = True
         self.export_check = None
-        if export_label:
-            self.export_check = QCheckBox(export_label)
-            self.export_check.setChecked(True)
-            self.export_details = QLabel(export_text)
-            self.export_details.setWordWrap(True)
-            self.export_details.setTextFormat(Qt.TextFormat.RichText)
-            self.export_check.toggled.connect(self._on_export_toggled)
-            # Between the text and the buttons, which are the last item.
-            layout = self.layout()
-            layout.insertWidget(layout.count() - 1, self.export_check)
-            layout.insertWidget(layout.count() - 1, self.export_details)
+        self.scope_combo = None
+        if not export_label:
+            return
+        self.export_check = QCheckBox(export_label)
+        self.export_check.setChecked(True)
+        self.export_details = QLabel(export_text)
+        self.export_details.setWordWrap(True)
+        self.export_details.setTextFormat(Qt.TextFormat.RichText)
+        self.export_check.toggled.connect(self._update_confirm)
+        widgets = [self.export_check]
+        if describe is not None:
+            self.scope_combo = QComboBox()
+            for value, title in SCOPES:
+                self.scope_combo.addItem(title, value)
+            self.scope_combo.setCurrentIndex(max(0, self.scope_combo.findData(scope)))
+            self.scope_combo.currentIndexChanged.connect(lambda _index: self.refresh())
+            row = QHBoxLayout()
+            row.setContentsMargins(24, 0, 0, 0)
+            row.addWidget(QLabel("Export"))
+            row.addWidget(self.scope_combo, 1)
+            if edit_settings is not None:
+                settings_button = QPushButton("Export Settings…")
+                settings_button.clicked.connect(lambda: edit_settings() and self.refresh())
+                row.addWidget(settings_button)
+            widgets.append(row)
+        widgets.append(self.export_details)
+        # Between the text and the buttons, which are the last item.
+        layout = self.layout()
+        for widget in widgets:
+            if isinstance(widget, QHBoxLayout):
+                layout.insertLayout(layout.count() - 1, widget)
+            else:
+                layout.insertWidget(layout.count() - 1, widget)
+        if describe is not None:
+            self.refresh()
 
-    def _on_export_toggled(self, checked):
-        self.export_details.setEnabled(checked)
-        self.confirm_button.setEnabled(checked or self._has_moves)  # otherwise there is nothing to do
+    @property
+    def scope(self):
+        return self.scope_combo.currentData() if self.scope_combo is not None else "all"
+
+    def refresh(self):
+        """Show what the chosen scope would export."""
+        label, details, can_export = self._describe(self.scope)
+        self.export_check.setText(label)
+        self.export_details.setText(details)
+        self._can_export = can_export
+        self.export_check.setEnabled(can_export)
+        self._update_confirm()
+
+    def _update_confirm(self, _checked=None):
+        self.export_details.setEnabled(self.export_requested)
+        self.confirm_button.setEnabled(self.export_requested or self._has_moves)  # otherwise there is nothing to do
 
     @property
     def export_requested(self):
-        return self.export_check is not None and self.export_check.isChecked()
+        return self.export_check is not None and self._can_export and self.export_check.isChecked()
+
+
+class ExportSettingsDialog(MessageDialog):
+    """Size, quality, destination and names of exports, with named profiles.
+
+    Accepted, `settings` is what was chosen. Profiles are saved and deleted
+    straight away, through `save_profiles(profiles)`, which may raise OSError.
+    """
+
+    def __init__(self, parent, settings, profiles, shoot_folder="", save_profiles=None):
+        super().__init__(parent, "Export settings", "", confirm_text="OK")
+        self.setMinimumWidth(520)
+        self.profiles = dict(profiles)
+        self.shoot_folder = shoot_folder
+        self._save_profiles = save_profiles
+
+        self.profile_combo = QComboBox()
+        self.save_profile_button = QPushButton("Save as Profile…")
+        self.delete_profile_button = QPushButton("Delete")
+        self.long_edge = QSpinBox()
+        self.long_edge.setRange(0, LONG_EDGE_MAX)
+        self.long_edge.setSingleStep(100)
+        self.long_edge.setSpecialValueText("Full size")
+        self.long_edge.setSuffix(" px")
+        self.quality = QSpinBox()
+        self.quality.setRange(*QUALITY_RANGE)
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setPlaceholderText(EXPORT_DIR)
+        self.folder_edit.setToolTip("Relative to the shoot folder, or a full path")
+        browse = QPushButton("Choose…")
+        browse.clicked.connect(self._browse)
+        self.pattern_edit = QLineEdit()
+        self.pattern_edit.setToolTip("Fields: " + ", ".join(f"{{{token}}}" for token in TOKENS))
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(self.profile_combo, 1)
+        profile_row.addWidget(self.save_profile_button)
+        profile_row.addWidget(self.delete_profile_button)
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(self.folder_edit, 1)
+        folder_row.addWidget(browse)
+        rows = (
+            ("Profile", profile_row),
+            ("Long edge", self.long_edge),
+            ("Quality", self.quality),
+            ("Folder", folder_row),
+            ("Name", self.pattern_edit),
+        )
+        for row, (title, item) in enumerate(rows):
+            grid.addWidget(QLabel(title), row, 0)
+            if isinstance(item, QHBoxLayout):
+                grid.addLayout(item, row, 1)
+            else:
+                grid.addWidget(item, row, 1)
+        self.layout().insertLayout(1, grid)  # under the heading, above the summary
+
+        self._fill_profiles()
+        self._show(settings)
+        self.profile_combo.activated.connect(self._on_profile_chosen)
+        self.save_profile_button.clicked.connect(self._save_profile)
+        self.delete_profile_button.clicked.connect(self._delete_profile)
+        for spin in (self.long_edge, self.quality):
+            spin.valueChanged.connect(self._update)
+        for edit in (self.folder_edit, self.pattern_edit):
+            edit.textChanged.connect(self._update)
+        self._update()
+
+    @property
+    def settings(self):
+        return ExportSettings(
+            self.long_edge.value(),
+            self.quality.value(),
+            self.folder_edit.text().strip() or EXPORT_DIR,
+            self.pattern_edit.text().strip(),
+        )
+
+    def _show(self, settings):
+        self.long_edge.setValue(settings.long_edge)
+        self.quality.setValue(settings.quality)
+        self.folder_edit.setText(settings.folder)
+        self.pattern_edit.setText(settings.pattern)
+
+    def _fill_profiles(self):
+        self.profile_combo.clear()
+        self.profile_combo.addItem("Choose a profile…", None)
+        for name in sorted(self.profiles, key=str.casefold):
+            self.profile_combo.addItem(name, name)
+
+    def _matching_profile(self):
+        settings = self.settings
+        return next((name for name, saved in self.profiles.items() if saved == settings), None)
+
+    def _on_profile_chosen(self, index):
+        name = self.profile_combo.itemData(index)
+        if name in self.profiles:
+            self._show(self.profiles[name])
+
+    def _store(self, profiles):
+        try:
+            if self._save_profiles is not None:
+                self._save_profiles(profiles)
+        except OSError as exc:
+            inform(self, "The profiles could not be saved", str(exc))
+            return
+        self.profiles = profiles
+        self._fill_profiles()
+        self._update()
+
+    def _save_profile(self):
+        dialog = NameDialog(self, "Save export profile", "Name of the profile:", "Save")
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._store({**self.profiles, dialog.name: self.settings})
+
+    def _delete_profile(self):
+        name = self._matching_profile()
+        if name is not None:
+            self._store({key: value for key, value in self.profiles.items() if key != name})
+
+    def _browse(self):
+        start = self.settings.dest_dir(self.shoot_folder) if self.shoot_folder else os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(self, "Export folder", start)
+        if folder:
+            self.folder_edit.setText(folder)
+
+    def _problem(self):
+        problem = pattern_problem(self.pattern_edit.text())
+        if problem is None and self.shoot_folder:
+            problem = self.settings.problem(self.shoot_folder)
+        return problem
+
+    def _update(self):
+        name = self._matching_profile()
+        self.profile_combo.setCurrentIndex(max(0, self.profile_combo.findData(name)) if name else 0)
+        self.delete_profile_button.setEnabled(name is not None)
+        problem = self._problem()
+        self.confirm_button.setEnabled(problem is None)
+        if problem:
+            self.body.setText(f"<b>{escape(problem)}</b>")
+            return
+        settings = self.settings
+        example = file_stem(settings.pattern, "IMG_0042", "2026-05-17", 7, 120, "Wedding")
+        self.body.setText(
+            f"For example: IMG_0042 → <b>{escape(example)}.jpg</b>"
+            "<br>Fields: " + ", ".join(f"{{{token}}}" for token in TOKENS) + " ({seq} counts the photos of one export)."
+            "<br>Unedited JPEGs are copied as they are unless they need resizing; rendered ones "
+            "carry the original's EXIF and an sRGB profile."
+        )
 
 
 class ImportDialog(MessageDialog):

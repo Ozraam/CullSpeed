@@ -112,3 +112,64 @@ def test_capture_time_ignores_an_empty_date(tmp_path):
     path.write_bytes(tiff([], [(0x9003, 2, "0000:00:00 00:00:00")]))
     os.utime(path, (1_000_000_000, 1_000_000_000))
     assert capture_time([str(path)]) is not None
+
+
+# -- EXIF for exports ------------------------------------------------------------
+
+def test_export_segment_keeps_the_shot_and_resets_the_orientation(tmp_path):
+    from tamis.exif import _jpeg_tiff, _tiff_ifds, export_segment
+
+    path = tmp_path / "a.jpg"
+    turned = tiff([(0x010F, 2, "Canon"), (0x0110, 2, "Canon EOS R5"), (0x0112, 3, 6), (0x8298, 2, "Me")],
+                  [(0x829D, 5, (28, 10)), (0x9003, 2, "2024:05:01 12:34:56"), (0x927C, 2, "maker note")], endian=">")
+    path.write_bytes(jpeg_with_exif(turned))
+
+    segment = export_segment(str(path), (640, 480))
+    exported = tmp_path / "b.jpg"
+    exported.write_bytes(b"\xff\xd8\xff\xe1" + struct.pack(">H", len(segment) + 2) + segment + b"\xff\xda\0\0")
+
+    info = read_info(str(exported))
+    assert info["camera"] == "Canon EOS R5" and info["aperture"] == "f/2.8" and info["date"] == "2024-05-01 12:34"
+    ifds = _tiff_ifds(_jpeg_tiff(exported.read_bytes()))
+    assert 0x8298 in ifds["ifd0"]  # copyright
+    assert 0x927C not in ifds["exif"]  # no MakerNote: its offsets would break
+    orientation = _tiff_ifds_all(exported.read_bytes())
+    assert orientation[0x0112] == 1 and orientation[0xA001] == 1  # upright, sRGB
+    assert (orientation[0xA002], orientation[0xA003]) == (640, 480)
+
+
+def _tiff_ifds_all(jpeg):
+    """{tag: first value} of IFD0 and the EXIF IFD, whatever the tag."""
+    from tamis import exif
+
+    tiff_bytes = exif._jpeg_tiff(jpeg)
+    (offset,) = struct.unpack("<I", tiff_bytes[4:8])
+    fields = exif._raw_ifd(tiff_bytes, offset, "<", None)
+    (exif_at,) = struct.unpack("<I", fields[0x8769][2])
+    fields.update(exif._raw_ifd(tiff_bytes, exif_at, "<", None))
+    values = {}
+    for tag, (kind, _count, raw) in fields.items():
+        values[tag] = struct.unpack("<H", raw[:2])[0] if kind == 3 else struct.unpack("<I", raw[:4])[0] if kind == 4 else raw
+    return values
+
+
+def test_export_segment_without_source_exif_still_says_srgb(tmp_path):
+    from tamis.exif import export_segment
+
+    path = tmp_path / "a.png"
+    path.write_bytes(b"\x89PNG not much")
+    segment = export_segment(str(path), (10, 20))
+    exported = b"\xff\xd8\xff\xe1" + struct.pack(">H", len(segment) + 2) + segment + b"\xff\xda\0\0"
+    values = _tiff_ifds_all(exported)
+    assert values[0xA001] == 1 and values[0x0112] == 1
+
+
+def test_with_exif_replaces_an_earlier_exif_after_jfif():
+    from tamis.exif import with_exif
+
+    jfif = b"\xff\xe0" + struct.pack(">H", 6) + b"JFIF"
+    old = b"\xff\xe1" + struct.pack(">H", 8) + b"Exif\0\0"
+    jpeg = b"\xff\xd8" + jfif + old + b"\xff\xdb\0\x02" + b"\xff\xda\0\x02scan"
+    out = with_exif(jpeg, b"Exif\0\0NEW")
+    new = b"\xff\xe1" + struct.pack(">H", 11) + b"Exif\0\0NEW"
+    assert out == b"\xff\xd8" + jfif + new + b"\xff\xdb\0\x02" + b"\xff\xda\0\x02scan"
