@@ -487,6 +487,8 @@ class TamisApp(ProcessingMixin, QMainWindow):
         """
         if self.moving:
             return
+        # A folder dropped on the window ends with a separator: paths are joined to it and compared.
+        folder = os.path.normpath(os.path.abspath(folder))
         self._finish_crop(apply=True)
         self.save_session()
         self.refresh_timer.stop()

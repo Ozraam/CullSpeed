@@ -298,6 +298,15 @@ def test_a_folder_is_read_in_the_background(window, tmp_path_factory):
     assert [photo.name for photo in window.model.photos] == ["A.jpg"]
 
 
+def test_a_folder_given_with_a_trailing_separator_opens(window, tmp_path_factory):
+    other = tmp_path_factory.mktemp("other")
+    save_jpeg(other / "A.jpg")
+    save_jpeg(other / "B.jpg")
+    open_folder(window, str(other) + os.sep)  # as a folder dropped on the window
+    assert window.folder == str(other)
+    assert [photo.name for photo in window.model.photos] == ["A.jpg", "B.jpg"]
+
+
 def test_opening_another_folder_while_one_is_read_supersedes_it(window, tmp_path_factory):
     first, second = tmp_path_factory.mktemp("first"), tmp_path_factory.mktemp("second")
     save_jpeg(first / "A.jpg")
