@@ -7,7 +7,6 @@ Superseded requests are skipped rather than terminated.
 import math
 import os
 from collections import OrderedDict
-from contextlib import suppress
 from itertools import count
 
 from PyQt6.QtCore import QObject, QSize, QThread, QThreadPool, pyqtSignal
@@ -16,13 +15,9 @@ from PyQt6.QtGui import QGuiApplication, QImage, QPixmap
 from .constants import PREVIEW_CACHE_SIZE, PREVIEW_MAX_SIZE, THUMBNAIL_CACHE_BYTES, THUMBNAIL_MAX_SIZE
 from .exif import read_info
 from .imaging import load_image
+from .workers import emit_safely
 
 _CANCELLED = "\0cancelled"
-
-
-def _emit(signal, *args):
-    with suppress(RuntimeError):  # loader already destroyed during shutdown
-        signal.emit(*args)
 
 
 def pixmap_bytes(pixmap):
@@ -176,11 +171,11 @@ class ImageLoader(QObject):
 
         def job():
             if generation != self._generation or path not in self._wanted_previews:
-                _emit(self._preview_done, generation, path, QImage(), QSize(), {}, _CANCELLED)
+                emit_safely(self._preview_done, generation, path, QImage(), QSize(), {}, _CANCELLED)
                 return
             image, native, error = _decode(path, PREVIEW_MAX_SIZE)
             info = {} if error else read_info(path)
-            _emit(self._preview_done, generation, path, image, native, info, error)
+            emit_safely(self._preview_done, generation, path, image, native, info, error)
 
         self._preview_pool.start(job, 1 if urgent else 0)
 
@@ -239,10 +234,10 @@ class ImageLoader(QObject):
     def _full_job(self, path, generation):
         def job():
             if generation != self._generation or path not in self._full_wanted:
-                _emit(self._full_done, generation, path, QImage(), _CANCELLED)
+                emit_safely(self._full_done, generation, path, QImage(), _CANCELLED)
                 return
             image, _native, error = _decode(path, None)
-            _emit(self._full_done, generation, path, image, error)
+            emit_safely(self._full_done, generation, path, image, error)
 
         return job
 
@@ -307,7 +302,7 @@ class ImageLoader(QObject):
                 image, _native, _error = _decode(path, size)
                 if self._disk_thumbnails and state and not image.isNull():
                     self._disk_thumbnails.save(path, state, size, image)
-            _emit(self._thumbnail_done, generation, path, image, state)
+            emit_safely(self._thumbnail_done, generation, path, image, state)
 
         # Most recently requested first, so whatever is on screen now wins.
         self._thumbnail_pool.start(job, next(self._priority) % 2**30)

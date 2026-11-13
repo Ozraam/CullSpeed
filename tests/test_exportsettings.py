@@ -53,4 +53,5 @@ def test_exports_may_not_land_among_the_photos(tmp_path):
     assert ExportSettings(folder=".").problem(folder) is not None
     assert ExportSettings(folder="_KEEPS").problem(folder) is not None
     assert ExportSettings(folder=os.path.join(folder, "_REJECTS")).problem(folder) is not None
-    assert ExportSettings(folder="/elsewhere").dest_dir(folder) == "/elsewhere"
+    elsewhere = os.path.abspath(str(tmp_path.parent / "elsewhere"))  # absolute on any system
+    assert ExportSettings(folder=elsewhere).dest_dir(folder) == elsewhere

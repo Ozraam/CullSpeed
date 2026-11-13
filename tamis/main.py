@@ -6,6 +6,7 @@ from pathlib import Path
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
+from . import __version__
 from .app import TamisApp
 from .constants import APP_NAME
 from .migration import migrate_from_cullspeed
@@ -19,6 +20,7 @@ def main():
     app = QApplication(sys.argv)
     app.setOrganizationName(APP_NAME)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(__version__)
     app.setWindowIcon(QIcon(str(Path(__file__).parent / "resources" / "icon.svg")))
     apply_theme(app)
     migrate_from_cullspeed()

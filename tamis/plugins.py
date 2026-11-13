@@ -19,7 +19,7 @@ from PyQt6.QtCore import QObject, QTimer, QUrl
 from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import QMenu
 
-from . import develop, xmp
+from . import __version__, develop, xmp
 from .constants import KEEP, REJECT
 from .widgets import inform
 
@@ -135,6 +135,11 @@ class PluginApi:
         self._manager._handlers.setdefault(event, []).append((self._plugin, callback))
 
     # -- reading -----------------------------------------------------------
+
+    @property
+    def version(self):
+        """Tamis's version, such as "0.1.0" ("unknown" when run from a checkout that was never installed)."""
+        return __version__
 
     @property
     def folder(self):

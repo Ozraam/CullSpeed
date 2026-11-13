@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+from bisect import bisect_right
 from collections import Counter
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -14,11 +15,11 @@ from .constants import (
     KEEP,
     KEEP_DIR,
     LEGACY_SESSION_FILENAME,
-    RAW_EXTENSIONS,
     REJECT,
     REJECT_DIR,
     SESSION_FILENAME,
     SUPPORTED_EXTENSIONS,
+    is_raw,
 )
 
 STATUS_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -92,10 +93,6 @@ class Photo:
         return [self.path, *self.companions]
 
 
-def _is_raw(path):
-    return os.path.splitext(path)[1].lower() in RAW_EXTENSIONS
-
-
 def natural_key(name):
     """Sort key comparing runs of digits as numbers: IMG_9 comes before IMG_10.
 
@@ -147,7 +144,7 @@ def _pair(paths):
         groups.setdefault(os.path.splitext(os.path.basename(path))[0].casefold(), []).append(path)
     result = []
     for files in groups.values():
-        raws = [f for f in files if _is_raw(f)]
+        raws = [f for f in files if is_raw(f)]
         if len(raws) == 1 and len(files) > 1:
             result.append((raws[0], sorted(f for f in files if f != raws[0])))
         else:
@@ -164,26 +161,41 @@ def photo_files(folder):
     return {path for directory, _ in _photo_dirs(folder) for path in _list_dir(directory)[0]}
 
 
-def scan_folder(folder, fallback_dir=None, problems=None):
-    """Photos in `folder`, `_KEEPS` and `_REJECTS`, with their saved marks and ratings.
+def _groups(folder, progress=None):
+    """[(primary, companions, location)] of the photos in `folder`, `_KEEPS` and `_REJECTS`, and their listings.
 
-    `problems`, a list, receives the path of any damaged session, see load_session().
+    The listings are {directory: {lowercase name: name}}, for finding sidecars.
+    `progress(count)` is told how many photos were found so far.
+    """
+    groups, listings = [], {}
+    for directory, location in _photo_dirs(folder):
+        paths, listings[directory] = _list_dir(directory)
+        groups += [(primary, companions, location) for primary, companions in _pair(paths)]
+        if progress:
+            progress(len(groups))
+    return groups, listings
+
+
+def _read_saved(folder, groups, listings, fallback_dir, problems, all_names, progress=None):
+    """Photos for `groups`, with their marks, ratings, labels and edits from the session and the sidecars.
+
+    `all_names` are the names of every photo of the folder, for older sessions keyed by name.
     """
     photos = []
     from_sidecars = {}
-    for directory, location in _photo_dirs(folder):
-        paths, names = _list_dir(directory)
-        for primary, companions in _pair(paths):
-            photo = Photo(primary, location, location, companions=companions)
-            photos.append(photo)
-            stored = xmp.read(photo.files, names)
-            if stored is not None:
-                from_sidecars[primary] = stored
+    for done, (primary, companions, location) in enumerate(groups):
+        photo = Photo(primary, location, location, companions=companions)
+        photos.append(photo)
+        stored = xmp.read(photo.files, listings[os.path.dirname(primary)])
+        if stored is not None:
+            from_sidecars[primary] = stored
+        if progress and done % 200 == 0:
+            progress(done)
 
     # Saved marks win over folder location, so marks changed after the last
     # "Process Files" are not lost.
     session = load_session(folder, fallback_dir, problems)
-    name_counts = Counter(photo.name for photo in photos)
+    name_counts = Counter(all_names)
     for photo in photos:
         key = relative_key(folder, photo.path)
         entry = session.get(key)
@@ -201,9 +213,55 @@ def scan_folder(folder, fallback_dir=None, problems=None):
             rating, photo.label = from_sidecars[photo.path]
             if rating is not None:  # (None: the sidecar says "rejected", which is not a number of stars)
                 photo.rating = rating
+    return photos
 
+
+def scan_folder(folder, fallback_dir=None, problems=None, progress=None):
+    """Photos in `folder`, `_KEEPS` and `_REJECTS`, with their saved marks and ratings.
+
+    `problems`, a list, receives the path of any damaged session, see load_session().
+    `progress(count)` is told how many photos were listed, then read.
+    """
+    groups, listings = _groups(folder, progress)
+    names = [os.path.basename(primary) for primary, _companions, _location in groups]
+    photos = _read_saved(folder, groups, listings, fallback_dir, problems, names, progress)
     photos.sort(key=by_name)
     return photos
+
+
+@dataclass
+class FolderChanges:
+    """What changed in a folder since its photos were read, see scan_changes()."""
+
+    added: list = field(default_factory=list)  # new Photos, with what was saved of them
+    removed: set = field(default_factory=set)  # primary paths of photos that are gone (or now a companion)
+    regrouped: dict = field(default_factory=dict)  # primary path -> its companions, when they changed
+
+    def __bool__(self):
+        return bool(self.added or self.removed or self.regrouped)
+
+
+def scan_changes(folder, known, fallback_dir=None, problems=None):
+    """How the photos of `folder` differ from `known`, {primary path: companions}: the photos shown.
+
+    Only new photos have their session entry and sidecars read, so photos
+    already shown keep their marks, and this stays cheap on a slow disk.
+    """
+    groups, listings = _groups(folder)
+    changes = FolderChanges()
+    listed = set()
+    new = []
+    for primary, companions, location in groups:
+        listed.add(primary)
+        if primary not in known:
+            new.append((primary, companions, location))
+        elif list(known[primary]) != companions:
+            changes.regrouped[primary] = companions
+    changes.removed = set(known) - listed
+    if new:
+        names = [os.path.basename(primary) for primary, _companions, _location in groups]
+        changes.added = _read_saved(folder, new, listings, fallback_dir, problems, names)
+    return changes
 
 
 def relative_key(folder, path):
@@ -299,7 +357,7 @@ def _upgrade(data):
         if key == FORMAT_KEY:
             continue
         edit = value.get("edit") if isinstance(value, dict) else None
-        if _is_raw(key) and isinstance(edit, dict) and develop.clean(edit) and "process" not in edit:
+        if is_raw(key) and isinstance(edit, dict) and develop.clean(edit) and "process" not in edit:
             value = {**value, "edit": {**edit, "process": 1}}
         upgraded[key] = value
     return upgraded
@@ -426,7 +484,8 @@ class PhotoModel(QAbstractListModel):
         self._photos = []
         self._rows = {}
         # Kept up to date on every change so per-keystroke updates stay O(1).
-        self._keeps = self._rejects = self._unsorted = 0
+        self._keeps = self._rejects = 0
+        self.revision = 0  # counts changes of marks, ratings, labels and edits
         self._median_sharpness = None
         self._edit_thumbnails = None  # see set_edit_thumbnails()
         self._lut_path = None
@@ -492,7 +551,7 @@ class PhotoModel(QAbstractListModel):
         self.beginResetModel()
         self._photos = photos
         self._reindex()
-        self._keeps = self._rejects = self._unsorted = 0
+        self._keeps = self._rejects = 0
         for photo in photos:
             self._tally(photo, 1)
         self.endResetModel()
@@ -514,7 +573,50 @@ class PhotoModel(QAbstractListModel):
 
     def remove_paths(self, paths):
         """Forget the photos whose primary file is in `paths`: they are gone from the folder."""
-        self.set_photos([photo for photo in self._photos if photo.path not in paths])
+        self.update_photos(FolderChanges(removed=set(paths)), by_name)
+
+    def update_photos(self, changes, key):
+        """Apply FolderChanges, inserting new photos where `key` sorts them.
+
+        Rows are removed and inserted rather than the model reset, so views keep
+        their selection and scroll position. Returns the rows of the new photos.
+        """
+        regrouped = []
+        for row, photo in enumerate(self._photos):
+            if photo.path in changes.regrouped:
+                photo.companions = changes.regrouped[photo.path]
+                regrouped.append(row)
+        if regrouped:
+            self.dataChanged.emit(self.index(min(regrouped)), self.index(max(regrouped)), [Qt.ItemDataRole.ToolTipRole])
+
+        gone = [row for row, photo in enumerate(self._photos) if photo.path in changes.removed]
+        runs = [[row for _, row in run] for _, run in groupby(enumerate(gone), lambda item: item[1] - item[0])]
+        for run in reversed(runs):
+            self.beginRemoveRows(QModelIndex(), run[0], run[-1])
+            for photo in self._photos[run[0]:run[-1] + 1]:
+                self._tally(photo, -1)
+            del self._photos[run[0]:run[-1] + 1]
+            self._reindex()
+            self.endRemoveRows()
+
+        keys = [key(photo) for photo in self._photos]
+        added = []
+        for photo in sorted(changes.added, key=key):
+            if photo.path in self._rows:
+                continue
+            photo_key = key(photo)
+            row = bisect_right(keys, photo_key)
+            self.beginInsertRows(QModelIndex(), row, row)
+            self._photos.insert(row, photo)
+            keys.insert(row, photo_key)
+            self._tally(photo, 1)
+            self._reindex()
+            self.endInsertRows()
+            added.append(photo)
+        rows = sorted(self._rows[photo.path] for photo in added)
+        if rows or gone:
+            self.statuses_changed.emit(rows)
+        return rows
 
     def analysis_changed(self):
         """Sharpness or bursts changed: repaint, and filter again."""
@@ -575,10 +677,6 @@ class PhotoModel(QAbstractListModel):
     def counts(self):
         return self._keeps, self._rejects, len(self._photos) - self._keeps - self._rejects
 
-    def has_unsorted(self):
-        """Whether any photo is not in the folder its mark sends it to."""
-        return self._unsorted > 0
-
     def _set(self, photo, name, value):
         if name == "status":
             self._tally(photo, -1)
@@ -592,8 +690,6 @@ class PhotoModel(QAbstractListModel):
             self._keeps += sign
         elif photo.status == REJECT:
             self._rejects += sign
-        if photo.status != photo.location:
-            self._unsorted += sign
 
     def _reindex(self):
         self._rows = {photo.path: row for row, photo in enumerate(self._photos)}
@@ -601,6 +697,7 @@ class PhotoModel(QAbstractListModel):
     def _emit_changed(self, changes):
         if not changes:
             return
+        self.revision += 1
         for name in {name for _, name, _ in changes}:
             rows = sorted({self.row_of(path) for path, field_name, _ in changes if field_name == name})
             # One signal per run of consecutive rows: marking a big selection

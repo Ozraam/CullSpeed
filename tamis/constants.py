@@ -1,6 +1,13 @@
+import os
+
 RAW_EXTENSIONS = frozenset({'.arw', '.cr2', '.cr3', '.nef', '.dng', '.orf', '.raf', '.rw2'})
 STANDARD_EXTENSIONS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff', '.heic'})
 SUPPORTED_EXTENSIONS = RAW_EXTENSIONS | STANDARD_EXTENSIONS
+
+
+def is_raw(path):
+    return os.path.splitext(path)[1].lower() in RAW_EXTENSIONS
+
 
 KEEP = "keep"
 REJECT = "reject"

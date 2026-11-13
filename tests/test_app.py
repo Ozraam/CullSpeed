@@ -2,17 +2,21 @@
 import json
 import math
 import os
+import threading
+import time
 
 import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PyQt6.QtCore import QEvent, QPoint, QSettings, QSize, Qt  # noqa: E402
+from PyQt6.QtCore import QEvent, QPoint, QSettings, QSize, Qt, QTimer  # noqa: E402
 from PyQt6.QtGui import QColor, QImage, QKeySequence, QPixmap  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
-from PyQt6.QtWidgets import QApplication, QDialog  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QDialog, QProgressDialog, QPushButton  # noqa: E402
+from rawfiles import write_dng  # noqa: E402
 
-from tamis import develop, fileops, loader, shortcuts, tones, xmp  # noqa: E402
+import tamis  # noqa: E402
+from tamis import develop, fileops, loader, processing, scanning, shortcuts, tones, xmp  # noqa: E402
 from tamis.app import CULL_TAB, GALLERY_TAB, TamisApp  # noqa: E402
 from tamis.constants import KEEP, REJECT, SESSION_FILENAME  # noqa: E402
 from tamis.exportsettings import ExportSettings  # noqa: E402
@@ -52,11 +56,22 @@ def window(qapp, tmp_path, tmp_path_factory):
     win.resize(1200, 800)
     win.show()
     assert QTest.qWaitForWindowActive(win)
-    win.load_folder(str(tmp_path))
+    open_folder(win, str(tmp_path))
     wait_for_image(win)
     yield win
     win.close()
     win.deleteLater()
+
+
+def open_folder(win, folder, **kwargs):
+    """Open a folder and wait until it is read: the window reads folders in the background."""
+    win.load_folder(folder, **kwargs)
+    assert wait_until(lambda: not win.scanner.busy)
+
+
+def refresh(win, auto=False):
+    win.refresh(auto)
+    assert wait_until(lambda: not win.scanner.busy)
 
 
 def wait_for_image(win):
@@ -246,7 +261,7 @@ def test_opening_another_folder_ends_the_filter(window, tmp_path_factory):
     image = QImage(30, 20, QImage.Format.Format_RGB32)
     image.fill(QColor("red"))
     assert image.save(str(other / "A.jpg"))
-    window.load_folder(str(other))
+    open_folder(window, str(other))
     assert not window.keeps_only
     assert window.current_row == 0
     assert window.strip_proxy.rowCount() == 1
@@ -260,10 +275,127 @@ def test_keeps_only_survives_a_refresh(window, tmp_path):
     image.fill(QColor("red"))
     assert image.save(str(tmp_path / "IMG_9.jpg"))
     window.save_session()
-    window.refresh()
+    refresh(window)
     assert window.keeps_only
     assert window.model.photo(window.current_row).name == "IMG_3.jpg"
     assert window.strip_proxy.rowCount() == 2
+
+
+# -- reading folders -------------------------------------------------------------
+
+def save_jpeg(path, color="red"):
+    image = QImage(30, 20, QImage.Format.Format_RGB32)
+    image.fill(QColor(color))
+    assert image.save(str(path))
+
+
+def test_a_folder_is_read_in_the_background(window, tmp_path_factory):
+    other = tmp_path_factory.mktemp("other")
+    save_jpeg(other / "A.jpg")
+    window.load_folder(str(other))
+    assert window.scanner.busy and window.folder != str(other)  # not read yet: the open folder is still shown
+    assert wait_until(lambda: window.folder == str(other))
+    assert [photo.name for photo in window.model.photos] == ["A.jpg"]
+
+
+def test_a_folder_given_with_a_trailing_separator_opens(window, tmp_path_factory):
+    other = tmp_path_factory.mktemp("other")
+    save_jpeg(other / "A.jpg")
+    save_jpeg(other / "B.jpg")
+    open_folder(window, str(other) + os.sep)  # as a folder dropped on the window
+    assert window.folder == str(other)
+    assert [photo.name for photo in window.model.photos] == ["A.jpg", "B.jpg"]
+
+
+def test_opening_another_folder_while_one_is_read_supersedes_it(window, tmp_path_factory):
+    first, second = tmp_path_factory.mktemp("first"), tmp_path_factory.mktemp("second")
+    save_jpeg(first / "A.jpg")
+    save_jpeg(second / "B.jpg")
+    opened = []
+    window.plugins.emit = lambda event, *args: opened.append(args[0]) if event == "folder_opened" else None
+
+    window.load_folder(str(first))
+    open_folder(window, str(second))
+    QTest.qWait(100)
+
+    assert window.folder == str(second) and opened == [str(second)]
+
+
+def test_an_unreadable_folder_is_reported(window, tmp_path, monkeypatch):
+    told = []
+    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, text, details=None: told.append((title, text)))
+
+    def refuse(*_args):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("tamis.scanning.scan_folder", refuse)
+    open_folder(window, str(tmp_path / "locked"))
+    assert told == [("Cannot open folder", f"{tmp_path / 'locked'}: Permission denied")]
+    assert window.folder == str(tmp_path) and window.model.rowCount() == PHOTOS
+
+
+def test_marks_made_while_the_open_folder_is_read_again_are_kept(window, tmp_path):
+    window.load_folder(str(tmp_path), keep_state=True)
+    window.model.set_status([2], KEEP)  # before the read is done
+    assert wait_until(lambda: not window.scanner.busy)
+    assert window.model.photo(2).status == KEEP
+
+
+def test_a_refresh_adds_and_removes_rows_in_place(window, tmp_path):
+    resets = []
+    window.model.modelReset.connect(lambda: resets.append(True))
+    window.tabs.setCurrentIndex(GALLERY_TAB)
+    select_in_gallery(window, [3, 4])
+    window.go_to(3)
+    save_jpeg(tmp_path / "IMG_2b.jpg")
+    (tmp_path / "IMG_1.jpg").unlink()
+
+    refresh(window)
+
+    names = [photo.name for photo in window.model.photos]
+    assert names == ["IMG_0.jpg", "IMG_2.jpg", "IMG_2b.jpg", "IMG_3.jpg", "IMG_4.jpg", "IMG_5.jpg"]
+    assert not resets
+    selected = sorted(window.model.photo(window.proxy.mapToSource(index).row()).name
+                      for index in window.grid.selectionModel().selectedIndexes())
+    assert selected == ["IMG_3.jpg", "IMG_4.jpg"]
+    assert window.model.photo(window.current_row).name == "IMG_3.jpg"
+    assert window.toast.text() == "Folder updated · 1 new file(s), 1 gone"
+
+
+def test_a_refresh_keeps_marks_not_saved_yet(window, tmp_path):
+    window.model.set_field([0], "rating", 4)  # the session is saved a moment later
+    save_jpeg(tmp_path / "IMG_9.jpg")
+    refresh(window)
+    assert window.model.photo(0).rating == 4 and window.model.rowCount() == PHOTOS + 1
+
+
+def test_when_the_current_photo_goes_the_next_one_is_shown(window, tmp_path):
+    window.go_to(2)
+    window.model.set_status([1], KEEP)
+    undo = list(window.undo_stack)
+    (tmp_path / "IMG_2.jpg").unlink()
+    refresh(window)
+    assert window.model.photo(window.current_row).name == "IMG_3.jpg"
+    assert window.undo_stack == undo  # the undo of another photo stays
+
+
+def test_a_raw_landing_after_its_jpeg_joins_it_and_keeps_its_marks(window, tmp_path):
+    window.model.set_status([0], KEEP)
+    write_dng(tmp_path / "IMG_0.dng")
+    refresh(window)
+    photo = window.model.photo(0)
+    assert photo.name == "IMG_0.dng" and photo.companions == [str(tmp_path / "IMG_0.jpg")]
+    assert photo.status == KEEP and window.model.rowCount() == PHOTOS
+
+
+def test_saving_the_session_does_not_read_the_folder_at_once(window, tmp_path):
+    window.save_session()
+    window._on_directory_changed(str(tmp_path))  # what saving the session in the folder triggers
+    assert window.refresh_timer.interval() > 1000
+
+    window.saved_at = -math.inf
+    window._on_directory_changed(str(tmp_path))  # anything else: soon
+    assert window.refresh_timer.interval() < 1000
 
 
 # -- crop ----------------------------------------------------------------------
@@ -385,7 +517,7 @@ def test_zoom_is_off_while_cropping(window):
 def test_crop_is_saved_with_the_session(window, tmp_path):
     window.model.set_field([2], "edit", {"crop": [0.1, 0.2, 0.3, 0.4]})
     window.save_session()
-    window.load_folder(str(tmp_path))
+    open_folder(window, str(tmp_path))
     assert window.model.photo(2).edit == {"crop": [0.1, 0.2, 0.3, 0.4]}
 
 
@@ -451,8 +583,8 @@ def process_seeing_dialog(win, monkeypatch, export=True):
 def test_stop_during_a_move_stops_the_export_even_after_an_error(window, tmp_path, monkeypatch):
     errors = []
     statuses(window, keep=[0])
-    monkeypatch.setattr("tamis.app.execute_moves", lambda *_: MoveResult(errors=["IMG_0.jpg: boom"], cancelled=True))
-    monkeypatch.setattr("tamis.app.inform", lambda _parent, _title, _text, details=None: errors.extend(details))
+    monkeypatch.setattr("tamis.processing.execute_moves", lambda *_: MoveResult(errors=["IMG_0.jpg: boom"], cancelled=True))
+    monkeypatch.setattr("tamis.processing.inform", lambda _parent, _title, _text, details=None: errors.extend(details))
 
     process(window, monkeypatch, export=True)
 
@@ -494,7 +626,7 @@ def test_process_dialog_names_photos_without_a_jpeg(window, tmp_path, monkeypatc
     image = QImage(30, 20, QImage.Format.Format_RGB32)
     image.fill(QColor(90, 80, 120))
     assert image.save(str(tmp_path / "other.png"))
-    window.load_folder(str(tmp_path))
+    open_folder(window, str(tmp_path))
 
     _moves, exports = process_seeing_dialog(window, monkeypatch, export=False)
 
@@ -507,7 +639,7 @@ def test_photos_without_a_jpeg_are_mentioned_when_there_is_nothing_to_export(win
     for i in range(PHOTOS):
         (tmp_path / f"IMG_{i}.jpg").unlink()
     assert image.save(str(tmp_path / "other.png"))
-    window.load_folder(str(tmp_path))
+    open_folder(window, str(tmp_path))
 
     window.model.set_status([0], KEEP)
     moves, exports = process_seeing_dialog(window, monkeypatch)
@@ -602,7 +734,7 @@ def test_exports_follow_the_export_settings(window, tmp_path, monkeypatch):
 
 def test_exports_never_go_among_the_photos(window, tmp_path, monkeypatch):
     told = []
-    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, _text, details=None: told.append(title))
+    monkeypatch.setattr("tamis.processing.inform", lambda _parent, title, _text, details=None: told.append(title))
     window.export_settings = ExportSettings(folder=".", pattern="IMG_1")
     before = (tmp_path / "IMG_1.jpg").read_bytes()
 
@@ -642,8 +774,8 @@ def test_export_records_survive_reopening_the_folder(window, tmp_path, monkeypat
     window.export_photos()  # IMG_0, by the shortcut's way: not through Process Files
     assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").exists()
 
-    window.load_folder(str(tmp_path_factory.mktemp("other")))
-    window.load_folder(str(tmp_path))
+    open_folder(window, str(tmp_path_factory.mktemp("other")))
+    open_folder(window, str(tmp_path))
     window.model.set_status([0], REJECT)
     process_seeing_dialog(window, monkeypatch)
 
@@ -668,7 +800,7 @@ def test_photo_taking_over_a_removed_export_s_name_keeps_it(window, tmp_path, mo
     image = QImage(30, 20, QImage.Format.Format_RGB32)
     image.fill(QColor(90, 80, 120))
     assert image.save(str(tmp_path / "_REJECTS" / "IMG_0.jpg"))  # same name, in another folder
-    window.load_folder(str(tmp_path))
+    open_folder(window, str(tmp_path))
     first = window.model.row_of(str(tmp_path / "IMG_0.jpg"))
     other = window.model.row_of(str(tmp_path / "_REJECTS" / "IMG_0.jpg"))
     window.model.set_status([other], KEEP)
@@ -716,7 +848,7 @@ def test_failed_thumbnail_is_retried_when_the_file_changes(window, tmp_path, mon
 
 def test_failed_thumbnail_is_retried_by_a_refresh(window, tmp_path, monkeypatch):
     path = failed_thumbnail(window, tmp_path, monkeypatch)
-    window.refresh()
+    refresh(window)
     assert wait_until(lambda: window.loader.thumbnail(path) is not None)
     assert not window.loader.thumbnail_error(path)
 
@@ -833,12 +965,12 @@ def register(tamis):
     assert seen == [("edited", [None]), ("photo", "IMG_1.jpg")]  # undo goes back to the photo
     seen.clear()
 
-    window.load_folder(window.folder)
+    open_folder(window, window.folder)
     assert seen[-1] == ("opened", window.folder)
     assert not any(entry[0] == "edited" for entry in seen)  # loading photos is not editing them
     seen.clear()
 
-    window.load_folder(window.folder, keep_state=True)
+    open_folder(window, window.folder, keep_state=True)
     assert seen[-1] == ("refreshed", window.folder)
     seen.clear()
 
@@ -986,7 +1118,7 @@ def test_export_renders_an_unedited_photo_without_a_jpeg(window, tmp_path):
     image = QImage(30, 20, QImage.Format.Format_RGB32)
     image.fill(QColor(90, 80, 120))
     assert image.save(str(tmp_path / "other.png"))
-    window.load_folder(str(tmp_path), select="other.png")
+    open_folder(window, str(tmp_path), select="other.png")
 
     window.export_photos()
 
@@ -996,11 +1128,100 @@ def test_export_renders_an_unedited_photo_without_a_jpeg(window, tmp_path):
 
 def test_export_uses_the_jpeg_of_an_unedited_pair(window, tmp_path):
     (tmp_path / "IMG_0.CR2").write_bytes(b"not developed: the JPEG is what gets copied")
-    window.load_folder(str(tmp_path), select="IMG_0.CR2")
+    open_folder(window, str(tmp_path), select="IMG_0.CR2")
 
     window.export_photos()
 
     assert (tmp_path / "_EXPORTS" / "IMG_0.jpg").read_bytes() == (tmp_path / "IMG_0.jpg").read_bytes()
+
+
+def select_in_gallery(win, rows):
+    win.tabs.setCurrentIndex(GALLERY_TAB)
+    selection = win.grid.selectionModel()
+    selection.clearSelection()
+    for row in rows:
+        selection.select(win.proxy.index(row, 0), selection.SelectionFlag.Select)
+
+
+def test_export_takes_the_gallery_selection_edited_or_not(window, tmp_path):
+    window.model.set_field([1], "edit", {"exposure": 1.0})
+    select_in_gallery(window, [1, 3, 4])
+
+    window.export_photos()
+
+    assert sorted(os.listdir(tmp_path / "_EXPORTS")) == ["IMG_1.jpg", "IMG_3.jpg", "IMG_4.jpg"]
+    assert (tmp_path / "_EXPORTS" / "IMG_3.jpg").read_bytes() == (tmp_path / "IMG_3.jpg").read_bytes()
+    assert (tmp_path / "_EXPORTS" / "IMG_1.jpg").read_bytes() != (tmp_path / "IMG_1.jpg").read_bytes()
+    assert window.toast.text() == "Exported 3 photo(s) to _EXPORTS"
+    assert [record["name"] for record in window.model.photo(3).exports] == ["IMG_3.jpg"]
+
+
+def test_export_errors_are_reported_and_the_others_exported(window, tmp_path, monkeypatch):
+    told = []
+    monkeypatch.setattr("tamis.processing.inform", lambda _parent, title, _text, details=None: told.append((title, details)))
+    real_export = processing.export_photo
+
+    def export(path, *args, **kwargs):
+        if path.endswith("IMG_2.jpg"):
+            raise OSError("disk full")
+        return real_export(path, *args, **kwargs)
+
+    monkeypatch.setattr(processing, "export_photo", export)
+    window.model.set_field([0, 1, 2], "edit", {"contrast": 20})
+    select_in_gallery(window, [0, 1, 2])
+
+    window.export_photos()
+
+    assert told == [("Some photos were not exported", ["IMG_2.jpg: disk full"])]
+    assert sorted(os.listdir(tmp_path / "_EXPORTS")) == ["IMG_0.jpg", "IMG_1.jpg"]
+
+
+def test_stop_ends_an_export_after_the_photo_being_written(window, tmp_path, monkeypatch):
+    release = threading.Event()
+    real_export = processing.export_photo
+
+    def slow_export(*args, **kwargs):
+        release.wait(5)
+        return real_export(*args, **kwargs)
+
+    def press_stop():
+        dialogs = [w for w in QApplication.topLevelWidgets() if isinstance(w, QProgressDialog) and w.isVisible()]
+        assert dialogs
+        stop = [button for button in dialogs[0].findChildren(QPushButton) if button.text() == "Stop"]
+        stop[0].click()
+        release.set()
+
+    monkeypatch.setattr(processing, "export_photo", slow_export)
+    window.model.set_field(list(range(PHOTOS)), "edit", {"contrast": 20})
+    select_in_gallery(window, range(PHOTOS))
+    QTimer.singleShot(100, press_stop)
+
+    window.export_photos()
+
+    assert os.listdir(tmp_path / "_EXPORTS") == ["IMG_0.jpg"]
+    assert window.toast.text() == f"Stopped: exported 1 of {PHOTOS} photo(s) to _EXPORTS"
+    assert not window.moving
+
+
+def test_exporting_a_pair_again_gives_free_names(window, tmp_path):
+    write_dng(tmp_path / "IMG_0.dng")  # IMG_0.jpg is now its JPEG
+    open_folder(window, str(tmp_path), select="IMG_0.dng")
+    window.model.set_field([window.current_row], "edit", {"exposure": 0.5})
+
+    window.export_photos()
+    window.export_photos()
+
+    assert sorted(os.listdir(tmp_path / "_EXPORTS")) == ["IMG_0 (1).jpg", "IMG_0.jpg"]
+    rendered = image_to_array(QImage(str(tmp_path / "_EXPORTS" / "IMG_0.jpg")))
+    assert rendered.shape == (48, 64, 3)  # developed from the DNG, not the 300×200 JPEG
+
+
+def test_a_raw_is_shown_from_its_development(window, tmp_path):
+    write_dng(tmp_path / "shot.dng")
+    open_folder(window, str(tmp_path), select="shot.dng")
+    assert window.model.photo(window.current_row).name == "shot.dng"
+    wait_for_image(window)
+    assert window.loader.preview_error(window.model.photo(window.current_row).path) is None
 
 
 # -- sessions ------------------------------------------------------------------
@@ -1026,11 +1247,11 @@ def test_photo_taken_out_of_the_folder_gets_its_edit_back(window, tmp_path):
     window.save_session()
 
     (tmp_path / "IMG_1.jpg").rename(tmp_path.parent / f"{tmp_path.name}_IMG_1.jpg")
-    window.refresh()
+    refresh(window)
     window.model.set_status([0], KEEP)
     window.save_session()
     (tmp_path.parent / f"{tmp_path.name}_IMG_1.jpg").rename(tmp_path / "IMG_1.jpg")
-    window.refresh()
+    refresh(window)
 
     assert window.model.photo(1).edit == {"contrast": 30}
 
@@ -1040,7 +1261,7 @@ def test_damaged_session_is_reported_once_and_kept(window, tmp_path, monkeypatch
     monkeypatch.setattr("tamis.app.inform", lambda _parent, title, _text, details=None: shown.append((title, details)))
     (tmp_path / SESSION_FILENAME).write_text("{not json")
 
-    window.load_folder(str(tmp_path))
+    open_folder(window, str(tmp_path))
 
     kept = tmp_path / "tamis_session.corrupt.json"
     assert wait_until(lambda: shown)
@@ -1050,8 +1271,8 @@ def test_damaged_session_is_reported_once_and_kept(window, tmp_path, monkeypatch
 
 def test_rating_that_cannot_reach_the_sidecar_survives_and_is_written_later(window, tmp_path, monkeypatch):
     sidecar = tmp_path / "IMG_0.jpg.xmp"
-    sidecar.write_text(xmp.update(xmp._TEMPLATE, 2, None))
-    window.load_folder(str(tmp_path))
+    sidecar.write_text(xmp.update(xmp._TEMPLATE, 2, None), encoding="utf-8")
+    open_folder(window, str(tmp_path))
     real_write = xmp.write
 
     def fail(*_args):
@@ -1063,19 +1284,19 @@ def test_rating_that_cannot_reach_the_sidecar_survives_and_is_written_later(wind
     assert window.model.photo(0).xmp_pending
     assert stored_session(tmp_path)["IMG_0.jpg"]["xmp_pending"] is True
 
-    window.load_folder(str(tmp_path))  # still failing: the session's value is what counts
+    open_folder(window, str(tmp_path))  # still failing: the session's value is what counts
     assert window.model.photo(0).rating == 5
 
     monkeypatch.setattr(xmp, "write", real_write)
     window.save_session()  # tried again without any new change
     assert not window.model.photo(0).xmp_pending
-    assert xmp.parse(sidecar.read_text())[0] == 5
+    assert xmp.parse(sidecar.read_text(encoding="utf-8"))[0] == 5
     assert "xmp_pending" not in stored_session(tmp_path)["IMG_0.jpg"]
 
 
 def test_rating_still_waiting_for_its_sidecar_follows_a_move(window, tmp_path, monkeypatch):
-    (tmp_path / "IMG_0.jpg.xmp").write_text(xmp.update(xmp._TEMPLATE, 2, None))
-    window.load_folder(str(tmp_path))
+    (tmp_path / "IMG_0.jpg.xmp").write_text(xmp.update(xmp._TEMPLATE, 2, None), encoding="utf-8")
+    open_folder(window, str(tmp_path))
     real_write = xmp.write
 
     def fail(*_args):
@@ -1090,7 +1311,7 @@ def test_rating_still_waiting_for_its_sidecar_follows_a_move(window, tmp_path, m
 
     monkeypatch.setattr(xmp, "write", real_write)
     window.save_session()
-    assert xmp.parse((tmp_path / "_KEEPS" / "IMG_0.jpg.xmp").read_text())[0] == 5
+    assert xmp.parse((tmp_path / "_KEEPS" / "IMG_0.jpg.xmp").read_text(encoding="utf-8"))[0] == 5
 
 
 # -- filters by stars and labels -------------------------------------------------
@@ -1198,8 +1419,8 @@ def test_the_sort_order_applies_to_the_next_folder_opened(window, tmp_path):
     window.set_sort_order("date")
     assert wait_until(lambda: not window.analyzer._pending)
     os.utime(tmp_path / "IMG_3.jpg", (1_000_000_000, 1_000_000_000))
-    window.refresh()
-    window.load_folder(str(tmp_path), keep_state=True)
+    refresh(window)
+    open_folder(window, str(tmp_path), keep_state=True)
     assert wait_until(lambda: window.model.photo(0).name == "IMG_3.jpg")
 
 
@@ -1310,9 +1531,13 @@ def test_thumbnails_come_back_from_disk_without_decoding(window, tmp_path, monke
     assert wait_until(lambda: any(files for _, _, files in os.walk(window.loader._disk_thumbnails.directory)))
 
     window.loader.reset()
-    monkeypatch.setattr(loader, "_decode", lambda *_: pytest.fail("decoded again"))
+    # Recorded, not failed on the spot: this runs in a worker, where pytest.fail() (a BaseException) aborts Qt.
+    decoded = []
+    real_decode = loader._decode
+    monkeypatch.setattr(loader, "_decode", lambda source, size: decoded.append((source, size)) or real_decode(source, size))
     window.loader.thumbnail(path)
     assert wait_until(lambda: window.loader._thumbnails.get(path) is not None)
+    assert (path, loader.thumbnail_decode_size()) not in decoded
 
 
 # -- the Trash -------------------------------------------------------------------
@@ -1346,7 +1571,7 @@ def test_trash_moves_rejects_and_everything_follows(window, tmp_path, monkeypatc
     seen = confirm_dialogs(monkeypatch)
     statuses(window, keep=[0], reject=[1, 2])
     process(window, monkeypatch, export=False)
-    (tmp_path / "_REJECTS" / "IMG_1.jpg.xmp").write_text("<x/>")
+    (tmp_path / "_REJECTS" / "IMG_1.jpg.xmp").write_text("<x/>", encoding="utf-8")
     window.go_to(window.model.row_of(str(tmp_path / "_REJECTS" / "IMG_1.jpg")))
     window.model.set_status([window.model.row_of(str(tmp_path / "IMG_3.jpg"))], REJECT)  # not in _REJECTS: stays
     events = []
@@ -1414,7 +1639,7 @@ def test_import_copies_a_card_and_opens_the_destination(window, tmp_path_factory
 
     monkeypatch.setattr(ImportDialog, "exec", fill)
     press(window, Qt.Key.Key_I, CTRL)
-    assert window.folder == str(destination)
+    assert wait_until(lambda: window.folder == str(destination))
     assert [p.name for p in window.model.photos] == ["A.jpg"]
     assert (backup / "A.jpg").exists()
     assert (card / "DCIM" / "100CANON" / "A.jpg").exists()
@@ -1433,7 +1658,7 @@ def test_import_dialog_refuses_a_destination_on_the_card(qapp, tmp_path, window)
 def test_a_card_opened_directly_points_to_import(window, tmp_path_factory):
     card = tmp_path_factory.mktemp("card")
     (card / "DCIM").mkdir()
-    window.load_folder(str(card))
+    open_folder(window, str(card))
     assert "Import" in window.image_view._message
 
 
@@ -1445,27 +1670,27 @@ def raw_window_photo(tmp_path):
 
 def test_rejects_as_rating_minus_one_keep_the_stars_in_tamis(window, tmp_path):
     raw_window_photo(tmp_path)
-    window.load_folder(str(tmp_path), keep_state=True)
+    open_folder(window, str(tmp_path), keep_state=True)
     row = window.model.row_of(str(tmp_path / "RAW_1.cr2"))
     sidecar = tmp_path / "RAW_1.xmp"
     window.xmp_mark_actions["rating"].trigger()
     window.model.set_field([row], "rating", 3)
     window.model.set_status([row], REJECT)
     window.save_session()
-    assert 'xmp:Rating="-1"' in sidecar.read_text()
+    assert 'xmp:Rating="-1"' in sidecar.read_text(encoding="utf-8")
 
-    window.load_folder(str(tmp_path), keep_state=True)  # the -1 isn't taken for stars
+    open_folder(window, str(tmp_path), keep_state=True)  # the -1 isn't taken for stars
     row = window.model.row_of(str(tmp_path / "RAW_1.cr2"))
     assert window.model.photo(row).rating == 3
 
     window.model.set_status([row], KEEP)
     window.save_session()
-    assert 'xmp:Rating="3"' in sidecar.read_text()
+    assert 'xmp:Rating="3"' in sidecar.read_text(encoding="utf-8")
 
 
 def test_marks_touch_no_sidecar_by_default(window, tmp_path):
     raw_window_photo(tmp_path)
-    window.load_folder(str(tmp_path), keep_state=True)
+    open_folder(window, str(tmp_path), keep_state=True)
     window.model.set_status([window.model.row_of(str(tmp_path / "RAW_1.cr2"))], REJECT)
     window.save_session()
     assert not (tmp_path / "RAW_1.xmp").exists()
@@ -1592,7 +1817,7 @@ def test_rotation_is_kept_in_the_session(window):
     window.save_session()
     with open(os.path.join(window.folder, SESSION_FILENAME), encoding="utf-8") as file:
         assert '"rotate": 90' in file.read()
-    window.load_folder(window.folder)
+    open_folder(window, window.folder)
     assert window.model.photo(0).edit == {"rotate": 90}
 
 
@@ -1933,7 +2158,7 @@ def raw_photo(window, tmp_path, monkeypatch, level=3000):
     pixels = np.full((200, 300, 3), level, dtype=np.uint16)
     monkeypatch.setattr(editing, "_source", lambda path, max_size, process=2: (pixels, "raw16" if process >= 2 else "linear16"))
     (tmp_path / "shot.CR2").write_bytes(b"no embedded preview: culling can't show it")
-    window.load_folder(str(tmp_path), select="shot.CR2")
+    open_folder(window, str(tmp_path), select="shot.CR2")
     row = window.model.row_of(str(tmp_path / "shot.CR2"))
     assert window.current_row == row
     return row
@@ -1980,3 +2205,36 @@ def test_the_raw_note_is_only_for_raws(window):
     if not window.edit_panel.isVisible():
         window.toggle_edit_panel()
     assert not window.edit_panel._raw_box.isVisibleTo(window.edit_panel)
+
+
+# -- version -------------------------------------------------------------------
+
+def test_about_shows_the_version(window, monkeypatch):
+    shown = []
+    monkeypatch.setattr("tamis.app.inform", lambda _parent, title, text, details=None: shown.append((title, text)))
+    about = [action for action in window.options_button.menu().actions() if action.text() == "About Tamis…"]
+    about[0].trigger()
+    assert shown and shown[0][0] == "Tamis"
+    assert f"Version <b>{tamis.__version__}</b>" in shown[0][1]
+
+
+def test_plugins_can_check_the_version(window):
+    assert tamis.__version__ != "unknown"  # read from the installed package (pip install -e)
+    assert PluginApi(window.plugins, Plugin("test", "test", "test")).version == tamis.__version__
+
+
+def test_a_slow_folder_says_how_far_its_reading_got(window, tmp_path, monkeypatch):
+    real_scan = scanning.scan_folder
+
+    def slow_scan(folder, fallback_dir, problems, progress):
+        def late_progress(count):
+            time.sleep(0.35)
+            progress(count)
+
+        return real_scan(folder, fallback_dir, problems, late_progress)
+
+    monkeypatch.setattr(scanning, "scan_folder", slow_scan)
+    seen = []
+    window.toast.show_message = lambda text, *_args: seen.append(text)
+    open_folder(window, str(tmp_path))
+    assert f"Reading {tmp_path.name}… {PHOTOS} photo(s)" in seen

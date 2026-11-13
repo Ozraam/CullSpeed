@@ -16,7 +16,6 @@ import threading
 import zlib
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
 from itertools import count
 
 import numpy as np
@@ -25,10 +24,11 @@ from PyQt6.QtCore import QBuffer, QIODevice, QObject, Qt, QThread, QThreadPool, 
 from PyQt6.QtGui import QColorSpace, QImage, QImageReader, QPixmap
 
 from . import develop, exif, lut
-from .constants import THUMBNAIL_CACHE_BYTES
+from .constants import THUMBNAIL_CACHE_BYTES, is_raw
 from .fileops import atomic_write, free_name
-from .imaging import array_to_image, image_to_array, is_raw, resize_array, to_srgb
+from .imaging import array_to_image, image_to_array, resize_array, to_srgb
 from .loader import file_state, pixmap_bytes, thumbnail_decode_size
+from .workers import emit_safely
 
 EDIT_PREVIEW_SIZE = 2048  # longest edge of the image edits are previewed on
 _STRIP_THREADS = max(1, min(8, (os.cpu_count() or 2)))
@@ -189,11 +189,6 @@ def export_photo(path, edit, lut_path, dest_dir, tables=None, quality=92, name=N
 
 # -- live previews ---------------------------------------------------------------
 
-def _emit(signal, *args):
-    with suppress(RuntimeError):  # renderer destroyed during shutdown
-        signal.emit(*args)
-
-
 class EditRenderer(QObject):
     """Renders edited previews in the background; results arrive as `rendered(path)`."""
 
@@ -243,9 +238,6 @@ class EditRenderer(QObject):
             return None
         return current[2]
 
-    def error(self, path):
-        return path in self._errors
-
     def keep_requests(self, paths):
         """Drop the requests not rendered yet of photos other than `paths`: they are no longer shown."""
         with self._lock:
@@ -279,7 +271,7 @@ class EditRenderer(QObject):
                     error = ""
                 except Exception as exc:  # a bad photo or LUT must not kill the worker
                     image, error = QImage(), str(exc) or type(exc).__name__
-                _emit(self._done, generation, path, key + ("#quick" if quick else ""), image, error)
+                emit_safely(self._done, generation, path, key + ("#quick" if quick else ""), image, error)
                 with self._lock:
                     if self._wanted.get(path) == wanted:
                         del self._wanted[path]
@@ -455,8 +447,7 @@ class EditThumbnails(QObject):
                     image = self._render(path, *wanted)
                 except Exception:  # a bad photo or LUT must not kill the worker; it keeps the original's thumbnail
                     image = QImage()
-                with suppress(RuntimeError):  # destroyed during shutdown
-                    self._done.emit(generation, path, wanted[0], image)
+                emit_safely(self._done, generation, path, wanted[0], image)
                 with self._lock:
                     if self._wanted.get(path) == wanted:
                         del self._wanted[path]
